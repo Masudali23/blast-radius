@@ -31,7 +31,7 @@ MAX_WORKERS = 8
 # tests slower than this (recorded seconds) are never run blindly by us
 HEAVY = float(os.environ.get("BR_HEAVY", "2.6"))
 # machine factor: scoring-machine CPU per CPU ms measured when the maps were built
-CAL = float(os.environ.get("BR_CAL", "1.0"))
+CAL = float(os.environ.get("BR_CAL", "1.25"))
 # a candidate set is "broad" when running it all costs more than this share of selecting it all
 BROAD_FRAC = float(os.environ.get("BR_BROAD_FRAC", "0.75"))
 BROAD_MIN = float(os.environ.get("BR_BROAD_MIN", "2.0"))
@@ -46,13 +46,15 @@ P_PASS_FAILED = float(os.environ.get("BR_P_PASS_FAILED", "0.7"))
 # CPU seconds one commit may spend running tests, whatever was planned
 COMMIT_CPU = float(os.environ.get("BR_COMMIT_CPU", "25"))
 # seconds of a slow sliced test to sample before deciding about it
-SLICE_PROBE = float(os.environ.get("BR_SLICE_PROBE", "1.0"))
+SLICE_PROBE = float(os.environ.get("BR_SLICE_PROBE", "0.4"))
 # slow tests still unverified after a clean sample: "keep" them selected, or "drop" them
 HEAVY_CLEAN = os.environ.get("BR_HEAVY_CLEAN", "drop")
-# slow sliced tests left unverified when other tests fail / in a broad set: "keep" them
-# selected, or "probe" (sample them and drop the ones whose sample passes)
-HEAVY_FAILED = os.environ.get("BR_HEAVY_FAILED", "keep")
-HEAVY_BROAD = os.environ.get("BR_HEAVY_BROAD", "keep")
+# a slow test left unverified while other tests fail: "keep" it selected, or decide from its
+# "related" tests (dropped only when enough of them ran and all passed, few tests fail overall,
+# and a sample of the slow test itself passes)
+HEAVY_FAILED = os.environ.get("BR_HEAVY_FAILED", "related")
+MIN_RELATED = int(os.environ.get("BR_MIN_RELATED", "5"))
+MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
 T0 = time.monotonic()
@@ -106,6 +108,7 @@ class Selector:
             cal = self.maps.cpu_ms[idx] if idx is not None and idx < len(self.maps.cpu_ms) else None
             self.cpu[n] = (cal * CAL) if cal is not None else self.ms[n] * 0.85
         self.lane = None
+        self._related = {}
         self.debug = {}
 
     def numbers(self, mask):
@@ -245,7 +248,7 @@ class Selector:
             return likely, "unseen"
 
         lane = self.get_lane()
-        st = {"mode": "bare" if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0}
+        st = {"mode": "bare" if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}}
 
         def install():
             lane.ensure(st["mode"])
@@ -289,6 +292,9 @@ class Selector:
                 else:
                     st["ran"] += 1
                     st["cpu"] += r[1]
+                    st["outcome"][n] = r[0]
+                    if DEBUG:
+                        dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1)))
                     st["evals"] += r[2]
                     st["differ"] += r[3]
                     if r[0] == "F":
@@ -342,11 +348,27 @@ class Selector:
                     else:
                         unverified = keep
                         how = "heavy-kept"
-                elif keep and failed and HEAVY_FAILED == "probe":
-                    # something else fails: sample the remaining slow tests as well, and drop
-                    # the ones whose sample is clean
-                    keep, hit = self.probe_slow(plan, keep, run, dbg)
-                    failed = failed + hit
+                elif keep and failed and HEAVY_FAILED == "related":
+                    # Something else fails.  A slow test we could not afford to run stays
+                    # selected unless the tests closest to it (same test file, or reading the
+                    # same fixture file) were run and all passed, and the breakage is small.
+                    slow = {it[0] for it in deferred}
+                    maybe = []
+                    if len(failed) < MANY_FAILED:
+                        for n in keep:
+                            if n not in slow:
+                                continue  # cheap to keep selected: not worth any risk
+                            rel_pass, rel_fail = self.related_outcomes(n, st["outcome"])
+                            if rel_fail == 0 and rel_pass >= MIN_RELATED:
+                                maybe.append(n)
+                    probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in maybe) if pv is not None]
+                    if probes:
+                        hit, unseen = run(probes, False)
+                        hit = hit + unseen
+                        dropped = [n for n, _, _ in probes if n not in hit]
+                        failed = failed + hit
+                        dbg["related_dropped"] = dropped
+                        keep = [n for n in keep if n not in dropped]
                 selected = failed + [n for n in keep if n not in failed]
                 if failed:
                     unverified = [n for n in keep if n not in failed]
@@ -379,15 +401,8 @@ class Selector:
                 to_run.append(by_n[n])
                 keep.discard(n)
         dbg["broad"] = len(everything)
-        probes = []
-        if HEAVY_BROAD == "probe":
-            for n in sorted(keep, key=lambda n: -ms[n])[:8]:
-                if by_n[n][2] > HEAVY * 1000:
-                    pn, pv, pe = self.slice_probe(plan, n)
-                    if pv is not None:
-                        probes.append((pn, pv, pe))
         dbg["unverified"] = sorted(keep)
-        if not to_run and not probes:
+        if not to_run:
             return sorted(keep) + likely, "broad-blind"
         lane = self.get_lane()
         mode = "bare" if plan.fresh else "full"
@@ -396,7 +411,7 @@ class Selector:
         try:
             for rel, content in plan.files.items():
                 lane.overlay.set_file(rel, content)
-            to_run = sorted(to_run + probes, key=lambda it: it[0])
+            to_run.sort(key=lambda it: it[0])
             jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
             results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
@@ -408,14 +423,10 @@ class Selector:
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
                 results, err = lane.run(mode, jobs, deadline=60.0, cpu_budget=COMMIT_CPU)
-            probed = {n for n, _, _ in probes}
             for i, (n, v, e) in enumerate(to_run):
                 r = results.get(i)
                 if r is None or r[0] in ("F", "U"):
                     back.append(n)  # fails, or could not be checked: stays selected
-                elif n in probed:
-                    keep.discard(n)  # a clean sample of a slow test: drop it
-                    dbg.setdefault("probe_dropped", []).append(n)
             dbg["ran"] = len(results)
             dbg["cpu_ms"] = sum(r[1] for r in results.values())
             dbg["mode"] = mode
@@ -423,17 +434,34 @@ class Selector:
             lane.overlay.restore()
         return sorted(keep) + back + likely, "broad-blind"
 
-    def probe_slow(self, plan, keep, run, dbg):
-        """Sample each sliced slow test in `keep`.  Returns (tests still kept, tests seen failing)."""
-        probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
-        if not probes:
-            return keep, []
-        hit, unseen = run(probes, False)
-        hit = hit + unseen
-        probed = {n for n, _, _ in probes}
-        dbg["probe_hit"] = hit
-        dbg["probe_dropped"] = sorted(probed - set(hit))
-        return [n for n in keep if n not in probed], hit
+    def related_outcomes(self, n, outcome):
+        """(passed, failed) among the tests that ran and are close to test n: same test file,
+        or reading one of the fixture files n reads."""
+        idx = self.idx_of.get(n)
+        if idx is None:
+            return 0, 0
+        mask = self._related.get(n)
+        if mask is None:
+            mask = 0
+            path = self.id_of[n].split("::")[0]
+            for m, tid in self.id_of.items():
+                if tid.startswith(path + "::"):
+                    j = self.idx_of.get(m)
+                    if j is not None:
+                        mask |= 1 << j
+            for f, readers in self.maps.opened.items():
+                if f.startswith(FIXTURES) and (readers >> idx) & 1:
+                    mask |= readers
+            self._related[n] = mask
+        passed = failed = 0
+        for m, o in outcome.items():
+            j = self.idx_of.get(m)
+            if m != n and j is not None and (mask >> j) & 1:
+                if o == "F":
+                    failed += 1
+                elif o == "P":
+                    passed += 1
+        return passed, failed
 
     def slice_probe(self, plan, n):
         """A cheap sample of a sliced test: its least expensive fixture entries."""

@@ -1,4 +1,7 @@
-"""Trace every test in tests.json in its own process. Usage: trace_all.py <repo_root> <tests.json> <out_dir> [jobs]"""
+"""Trace every test in tests.json in its own process.
+
+Usage: trace_all.py <repo_root> <tests.json> <out_dir> [jobs]
+Set BR_INSTRUMENT=1 for the pass that records class and dict usage (see trace_one.py)."""
 import json
 import os
 import subprocess

@@ -1,6 +1,9 @@
 """Compile per-test traces into compact per-file maps.
 
-Usage: build_maps.py <trace_dir> <tests.json> <import_trace.json> <out_dir>
+Usage: build_maps.py <trace_dir> <tests.json> <import_trace.json> <out_dir> [slices_dir] [calib.json] [usage_trace_dir]
+
+<trace_dir> holds plain runs (line coverage, files); <usage_trace_dir> the instrumented runs
+(classes instantiated, dict entries looked up / invoked).  Without it both come from <trace_dir>.
 
 Output (all zlib-compressed pickles of plain dicts; bitmasks are Python ints, bit i = test index i):
   index.pkl          {"ids": [test ids in index order], "files": {src_path: blob_name}, "opened": {path: mask},
@@ -22,6 +25,7 @@ mod = {}
 opened = {}
 imports = {}
 spawn = 0
+usage_dir = sys.argv[7] if len(sys.argv) > 7 else None
 class_users = {}  # "file:line" of a class -> tests that instantiate it or a subclass
 tracked = set()  # classes whose instantiation we can observe
 dict_users = {}  # "NAME\tkey" -> tests that look that key up in a class-level dict called NAME
@@ -51,6 +55,11 @@ for i, t in enumerate(tests):
         imports[f] = imports.get(f, 0) | bit
     if d["spawn"]:
         spawn |= bit
+    if usage_dir:
+        u = json.load(open(os.path.join(usage_dir, "%d.json" % t["number"])))
+        if u["outcome"] != "pass":
+            bad.append((t["id"], "usage:" + u["outcome"], u["detail"][-200:]))
+        d = u
     for k in d.get("dict_keys", ()):
         dict_users[k] = dict_users.get(k, 0) | bit
     for k in d.get("dict_calls", ()):

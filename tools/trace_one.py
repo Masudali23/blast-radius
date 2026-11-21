@@ -171,6 +171,21 @@ def main():
     CALLABLES = (types.FunctionType, types.MethodType, functools.partial)
 
     def recording(value, owner, keyr):
+        if isinstance(value, types.MethodType):
+            # keep it a bound method (callers look at __self__)
+            inner = value.__func__
+
+            @functools.wraps(inner)
+            def call_m(*a, **k):
+                if importing[0]:
+                    derived.add("%s\t%s" % (owner, keyr))
+                else:
+                    dict_calls.add((owner, keyr))
+                return inner(*a, **k)
+
+            call_m._br_w = True
+            return types.MethodType(call_m, value.__self__)
+
         @functools.wraps(value)
         def call(*a, **k):
             if importing[0]:
@@ -196,7 +211,7 @@ def main():
                         except Exception:
                             continue
                         callable_keys.add((attr, kr))
-                        if not getattr(v, "_br_w", False):
+                        if not getattr(getattr(v, "__func__", v), "_br_w", False):
                             dict.__setitem__(t, k, recording(v, attr, kr))
                 try:
                     setattr(cls, attr, t)
@@ -213,7 +228,6 @@ def main():
         finally:
             importing[0] -= 1
 
-    builtins.__import__ = tracking_import
     import importlib
 
     orig_import_module = importlib.import_module
@@ -225,7 +239,12 @@ def main():
         finally:
             importing[0] -= 1
 
-    importlib.import_module = tracking_import_module
+    # Wrapping classes and their dicts can nudge execution down other paths, so line coverage
+    # is taken from plain runs and only class / dict usage from instrumented ones.
+    INSTRUMENT = os.environ.get("BR_INSTRUMENT") == "1"
+    if INSTRUMENT:
+        builtins.__import__ = tracking_import
+        importlib.import_module = tracking_import_module
 
     def build_class(func, name, *bases, **kw):
         importing[0] += 1
@@ -257,7 +276,8 @@ def main():
             pass
         return cls
 
-    builtins.__build_class__ = build_class
+    if INSTRUMENT:
+        builtins.__build_class__ = build_class
 
     mon = sys.monitoring
     tool = mon.COVERAGE_ID
@@ -341,6 +361,7 @@ def main():
                 "imports": sorted(loaded),
                 "dirs": sorted(listed),
                 "spawn": state["spawn"],
+                "instrumented": INSTRUMENT,
                 "classes": sorted(used_keys),
                 "tracked": tracked,
                 "dict_keys": sorted("%s\t%s" % kv for kv in dict_keys),
