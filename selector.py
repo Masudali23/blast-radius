@@ -110,6 +110,7 @@ class Selector:
             cal = self.maps.cpu_ms[idx] if idx is not None and idx < len(self.maps.cpu_ms) else None
             self.cpu[n] = (cal * CAL) if cal is not None else self.ms[n] * 0.85
         self.lane = None
+        self.failed_specs = []
         self._related = {}
         self.debug = {}
 
@@ -302,6 +303,7 @@ class Selector:
                     if r[0] == "F":
                         failed.append(n)
                         dbg.setdefault("failed", []).append(self.id_of[n])
+                        self.failed_specs.append((n, v, e))
             return failed, unseen
 
         def cost_of(numbers):
@@ -594,6 +596,49 @@ class Selector:
         d["diag"] = tag
         return workers, cost + tag
 
+    def baseline_telemetry(self, lines):
+        """Diagnostic build only: re-run every test that failed under some patch on the pristine
+        checkout.  A test failing there too is an artifact of this environment, not of a patch.
+        Their number is reported as +8192 ms each on the busiest worker of one commit."""
+        seen, jobs = set(), []
+        for n, v, e in self.failed_specs:
+            key = (n, json.dumps(v, sort_keys=True))
+            if key in seen or (v and "changed" in v):
+                continue
+            seen.add(key)
+            jobs.append((n, v, e))
+        if not jobs or time.monotonic() > self.stop_at:
+            return
+        lane = self.get_lane()
+        lane.ensure("full")
+        specs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in jobs]
+        results, err = lane.run("full", specs, deadline=60.0, cpu_budget=20.0)
+        broken = {jobs[i][0] for i, r in results.items() if r[0] == "F"}
+        self.debug["_baseline"] = {"checked": len(jobs), "broken": sorted(self.id_of[n] for n in broken)}
+        log("baseline check: %d specs, failing on pristine code: %s" % (len(jobs), sorted(self.id_of[n] for n in broken)))
+        tag = 8192 * min(len(broken), 5)
+        if not tag:
+            return
+        ms = self.ms
+        for item in lines:
+            workers = item[1]
+            if not workers:
+                continue
+            chosen = {n for w in workers for n in w}
+            extra, left = [], tag
+            for n in sorted((n for n in self.all_numbers if n not in chosen and 0 < ms[n] <= tag), key=lambda n: -ms[n]):
+                if ms[n] <= left:
+                    extra.append(n)
+                    left -= ms[n]
+                    if not left:
+                        break
+            if left:
+                continue
+            loads = [sum(ms[n] for n in w) for w in workers]
+            i = loads.index(max(loads))
+            workers[i] = list(workers[i]) + extra
+            return
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -601,6 +646,7 @@ class Selector:
         # tests well before that and select candidates unseen for whatever is left
         hard = 180.0 + 90.0 * min(1.0, max(0.0, (len(patches) - 40) / 20.0))
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str(0.55 * hard)))
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -616,6 +662,13 @@ class Selector:
                 workers, cost = self.diagnose(commit, selected, workers, cost)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.baseline_telemetry(lines)
+            except Exception as e:
+                log("telemetry failed: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         if self.lane is not None:
