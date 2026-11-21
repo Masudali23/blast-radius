@@ -3,7 +3,8 @@
 Usage: trace_rel_one.py <repo_root> <test_id> <out_json>
 
 Records the comparisons (file|line:col:end_line:end_col:operator) at which the operator and its
-partner disagreed at least once during the test (see br/relations.py), and every distinct
+partner disagreed at least once during the test (see br/relations.py), every comparison that
+was evaluated at all, and every distinct
 evaluation of every and/or condition (see br/boolrel.py).  Written to <out_json>.gz.  With "@import" in
 place of a test id: during what the warm worker loads before any test runs.
 """
@@ -32,9 +33,10 @@ def main():
 
     inlinepool.install()
     hits = set()
-    busy = [0]
-    setattr(builtins, relations.HELPER, relations.make_helper(hits, busy))
-    formulas = boolrel.Recorder(busy)
+    active = []
+    seen = set()
+    setattr(builtins, relations.HELPER, relations.make_helper(hits, active, seen))
+    formulas = boolrel.Recorder(active)
     setattr(builtins, boolrel.START, formulas.start)
     setattr(builtins, boolrel.ATOM, formulas.atom)
     setattr(builtins, boolrel.END, formulas.end)
@@ -83,6 +85,7 @@ def main():
 
     def save(record):
         record["hits"] = sorted(hits)
+        record["seen"] = sorted(seen)
         record["bools"] = sorted([site, kind, list(vec)] for site, kind, vec in formulas.seen)
         record["aborted"] = formulas.aborted()
         with gzip.open(out + ".gz", "wt") as fh:

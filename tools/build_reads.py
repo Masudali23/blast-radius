@@ -64,6 +64,45 @@ for rel, tree in trees.items():
         if name in bound:
             lines = reads.setdefault(name, {}).setdefault(rel, set())
             lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+# Names read outside any function body, i.e. while modules load and classes are built
+# (`TIME_FORMAT = MySQL.TIME_FORMAT` in another class, a sibling statement of the same class
+# body, a decorator argument, a default value).  A copy made there keeps the value for good,
+# so the tests that later read the original definition say nothing about who sees a change.
+outer_reads = set()
+
+
+def outside_functions(node, inside=False):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        # decorators, defaults and annotations run where the def statement runs
+        for sub in node.decorator_list + node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+            outside_functions(sub, inside)
+        for sub in node.body:
+            outside_functions(sub, True)
+        return
+    if isinstance(node, ast.Lambda):
+        for sub in node.args.defaults + [d for d in node.args.kw_defaults if d is not None]:
+            outside_functions(sub, inside)
+        outside_functions(node.body, True)
+        return
+    if isinstance(node, ast.ClassDef):
+        # a class body runs when its statement runs: at load time unless inside a function
+        for sub in node.decorator_list + node.bases + [k.value for k in node.keywords] + node.body:
+            outside_functions(sub, inside)
+        return
+    if not inside:
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            outer_reads.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            outer_reads.add(node.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            outer_reads.add(node.value)  # getattr(cls, "NAME"), vars()["NAME"]
+    for sub in ast.iter_child_nodes(node):
+        outside_functions(sub, inside)
+
+
+for rel, tree in trees.items():
+    if rel.startswith("sqlglot/"):
+        outside_functions(tree)
 # names read inside metaclass methods and __init_subclass__: whatever those derive from a class
 # attribute at class creation cannot be observed afterwards
 meta_reads = set()
@@ -84,6 +123,6 @@ for rel, tree in trees.items():
                 elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     meta_reads.add(sub.value)
 packed = {n: {f: sorted(ls) for f, ls in per.items()} for n, per in reads.items()}
-blob = zlib.compress(pickle.dumps({"bound": sorted(bound), "reads": packed, "meta_reads": sorted(meta_reads & bound)}, protocol=5), 6)
+blob = zlib.compress(pickle.dumps({"bound": sorted(bound), "reads": packed, "meta_reads": sorted(meta_reads & bound), "outer_reads": sorted(outer_reads & bound)}, protocol=5), 6)
 open(os.path.join(out_dir, "reads.pkl"), "wb").write(blob)
-print("names bound at class/module level:", len(bound), "with reads:", len(packed), "read by metaclasses:", len(meta_reads & bound), "bytes", len(blob))
+print("names bound at class/module level:", len(bound), "with reads:", len(packed), "read by metaclasses:", len(meta_reads & bound), "read while loading:", len(outer_reads & bound), "bytes", len(blob))

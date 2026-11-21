@@ -3,6 +3,7 @@
 sample
 tools/*
 !tools/fetch_sqlglot.py
+!tools/build_tables.py
 output.jsonl
 *.md
 __pycache__

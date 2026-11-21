@@ -212,11 +212,14 @@ def _changed(plan, rel, old, new, base, maps, opts):
         return
     shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
     hot = True
-    swap = regroup = None
-    if REFINE_RELATIONS and len(changes) == 1 and changes[0].level == "func" and analyze.TREES:
+    swap = regroup = operand = None
+    if REFINE_RELATIONS and changes and all(c.level == "func" for c in changes) and analyze.TREES:
+        # (each of these establishes by itself that the two modules differ in nothing else)
         swap = relations.swapped(analyze.TREES[0], analyze.TREES[1])
         if swap is None:
             regroup = boolrel.swapped(analyze.TREES[0], analyze.TREES[1])
+        if swap is None and regroup is None:
+            operand = boolrel.one_operand(analyze.TREES[0], analyze.TREES[1])
     for c in changes:
         if c.level == "func":
             plan.kinds.add("func")
@@ -246,11 +249,26 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     if maps.ran_at_import(rel, slo, shi):
                         hot = False  # as above: objects made while loading hold the old code
                     continue
+            if operand:
+                asked = _asked(maps, rel, operand)
+                if asked is not None:
+                    # the edit sits inside one operand of a condition: a test in which the
+                    # condition never got as far as that operand runs as before
+                    mask = maps.func(rel, lo, hi)
+                    plan.notes.append("operand-narrowed %s %s[%d]: %d -> %d" % (rel, boolrel.site_key(operand[0]), operand[2], bin(mask).count("1"), bin(mask & asked).count("1")))
+                    plan.add("func", rel, lo, hi, mask & asked)
+                    if maps.ran_at_import(rel, slo, shi):
+                        hot = False
+                    continue
             plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
             if maps.ran_at_import(rel, slo, shi):
                 hot = False
-                # anything built at import time from this function may differ
-                plan.add("mod", rel, slo, shi, maps.func(rel, slo, shi))
+                # The function ran while modules were loading, so objects made then hold its
+                # old code: import afresh.  What was BUILT then can only differ if the changed
+                # statement itself ran then; otherwise the tests that reach the statement are
+                # the only ones in play.
+                if c.coarse or not shapes_ok or maps.ran_at_import(rel, lo, hi):
+                    plan.add("mod", rel, slo, shi, maps.func(rel, slo, shi))
         else:
             plan.kinds.add("mod")
             hot = False
@@ -322,6 +340,22 @@ def _regrouped(maps, rel, regroup, old_tree):
     mask = keep
     for (kind, vec), tests in vectors.items():
         if boolrel.differs(old, new, kind, vec, impure, truth_only):
+            mask |= tests
+    return mask
+
+
+def _asked(maps, rel, operand):
+    """Tests in which the condition ever evaluated the edited operand; None when unknown."""
+    node, struct, index = operand
+    seen = maps.formula(rel, boolrel.site_key(node))
+    if seen is None:
+        return None
+    vectors, keep, warm = seen
+    if any(boolrel.asks_for(struct, kind, vec, index) for kind, vec in warm):
+        return None  # evaluated while the worker loaded: its old value is baked in
+    mask = keep
+    for (kind, vec), tests in vectors.items():
+        if boolrel.asks_for(struct, kind, vec, index):
             mask |= tests
     return mask
 

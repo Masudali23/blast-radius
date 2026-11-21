@@ -59,72 +59,60 @@ class Instrument(ast.NodeTransformer):
         return ast.copy_location(call, node)
 
 
-def make_helper(hits, busy=None):
-    """The function HELPER is bound to while tracing; `hits` collects sites that disagreed.
-    `busy` (a one-element list) is non-zero while code runs that the real program would not."""
-    busy = busy if busy is not None else [0]
+def _plain(op, a, b):
+    if op == "is":
+        return a is b
+    if op == "==":
+        return a == b
+    if op == "is not":
+        return a is not b
+    if op == "!=":
+        return a != b
+    if op == "<":
+        return a < b
+    if op == "<=":
+        return a <= b
+    if op == ">":
+        return a > b
+    return a >= b
+
+
+_OTHER = {"is": "==", "==": "is", "is not": "!=", "!=": "is not", "<": "<=", "<=": "<", ">": ">=", ">=": ">"}
+
+
+def make_helper(hits, active=None, seen=None):
+    """The function HELPER is bound to while tracing; `hits` collects sites that disagreed,
+    `seen` every site that was evaluated at all.
+
+    `active` (a list shared with the condition recorder) holds the sites whose other operator
+    is being evaluated right now.  Whatever that evaluation runs is recorded like anything
+    else: it is what the patched program would run at that point, and anything it leaves
+    behind (a cached hash, say) may keep the real program from running the same code later."""
+    active = active if active is not None else []
+    seen = seen if seen is not None else set()
 
     def helper(site, a, b, op):
-        if busy[0]:
-            # we are inside the other way of some comparison: not a step of the real run
-            if op == "is":
-                return a is b
-            if op == "==":
-                return a == b
-            if op == "is not":
-                return a is not b
-            if op == "!=":
-                return a != b
-            if op == "<":
-                return a < b
-            if op == "<=":
-                return a <= b
-            if op == ">":
-                return a > b
-            return a >= b
+        seen.add(site)
+        if site in active:
+            # The other operator of this very comparison is being evaluated, and evaluating
+            # it came back to the comparison (an `is` inside its own __eq__, for instance).
+            # In the patched program the inner evaluation would use the other operator again,
+            # possibly without end: no record can stand for that.
+            hits.add(site)
+            return _plain(op, a, b)
         try:
-            if op == "is":
-                r = a is b
-            elif op == "==":
-                r = a == b
-            elif op == "is not":
-                r = a is not b
-            elif op == "!=":
-                r = a != b
-            elif op == "<":
-                r = a < b
-            elif op == "<=":
-                r = a <= b
-            elif op == ">":
-                r = a > b
-            else:
-                r = a >= b
+            r = _plain(op, a, b)
         except BaseException:
             hits.add(site)  # the partner might not have raised
             raise
-        busy[0] += 1
+        active.append(site)
         try:
-            if op == "is":
-                alt = a == b
-            elif op == "==":
-                alt = a is b
-            elif op == "is not":
-                alt = a != b
-            elif op == "!=":
-                alt = a is not b
-            elif op == "<":
-                alt = a <= b
-            elif op == "<=":
-                alt = a < b
-            elif op == ">":
-                alt = a >= b
-            else:
-                alt = a > b
+            alt = _plain(_OTHER[op], a, b)
         except BaseException:
             hits.add(site)
             return r
         finally:
-            busy[0] -= 1
+            active.pop()
         # True and False are single objects, so "the same answer" is identity; anything else a
         # comparison returns (an array, NotImplemented, ...) counts as a disagreement
         if alt is not r or (r is not True and r is not False):

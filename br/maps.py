@@ -34,6 +34,7 @@ class Maps:
         self._slices = {}
         self._reads = None
         self.meta_reads = set()
+        self.outer_reads = None  # names read while modules load (None: not recorded)
         self._relations = None
         self._memo = None
         self._cache = {}
@@ -113,6 +114,7 @@ class Maps:
                     d = pickle.loads(zlib.decompress(fh.read()))
                 self._reads = (set(d["bound"]), d["reads"])
                 self.meta_reads = set(d.get("meta_reads", ()))
+                self.outer_reads = set(d["outer_reads"]) if "outer_reads" in d else None
             else:
                 self._reads = (set(), {})
         bound, table = self._reads
@@ -182,10 +184,14 @@ class Maps:
                 d["warm_vectors"] = per
             self._relations = d
         d = self._relations
-        if key not in d["sites"].get(rel, ()):
+        if key not in d["sites"].get(rel, ()) or "seen" not in d:
             return None, False
         site = rel + "|" + key
-        return d["hits"].get(site, 0) | d["always"], site in d["warm"]
+        # A test the tracer never saw evaluate the comparison is not vouched for: whatever
+        # made the traced run skip it (a value cached by the tracer's own extra work, say)
+        # need not hold in a real run.
+        unseen = self.all & ~d["seen"].get(site, 0)
+        return d["hits"].get(site, 0) | d["always"] | unseen, site in d["warm"]
 
     def formula(self, rel, key):
         """Recorded evaluations of the condition at `key` (see br/boolrel.py):
@@ -198,7 +204,12 @@ class Maps:
         site = rel + "|" + key
         if site in d["warm_aborted"]:
             return None
-        return d["vectors"].get(site, {}), d["aborted"].get(site, 0) | d["always"], d["warm_vectors"].get(site, ())
+        vectors = d["vectors"].get(site, {})
+        observed = d["aborted"].get(site, 0)
+        for tests in vectors.values():
+            observed |= tests
+        # (tests the tracer never saw evaluate the condition are not vouched for)
+        return vectors, d["aborted"].get(site, 0) | d["always"] | (self.all & ~observed), d["warm_vectors"].get(site, ())
 
     def memo(self, test_id):
         """Hand-over fingerprints of an executor test (see br/memo.py), or None."""
@@ -219,7 +230,9 @@ class Maps:
         while classes were being built (by a metaclass, or by any function reading it then)."""
         d = self._dicts()
         self.reads("")  # loads meta_reads
-        if name in self.meta_reads:
+        if name in self.meta_reads or self.outer_reads is None or name in self.outer_reads:
+            # read while classes are built or modules load: copies of the value exist that
+            # the recorded reads of this definition know nothing about
             return None
         mask, seen = 0, False
         for ck in cls_keys:

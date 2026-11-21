@@ -22,7 +22,7 @@ import time
 import types
 import unittest
 
-from br import infect, memo, variants
+from br import infect, memo, tables, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
@@ -270,7 +270,7 @@ class Runner:
             try:
                 setup = getattr(cls, "setUpClass", None)
                 if setup is not None:
-                    setup()
+                    _class_setup(cls, setup)
             except unittest.SkipTest:
                 ok = "skip"
             except TestTimeout:
@@ -370,6 +370,43 @@ class Runner:
                     pass
 
 
+def _unpatched(rel):
+    """Is `rel` (a file, or a directory when it ends with "/") the pinned one in this child?"""
+    overlay, base = PLACE["overlay"], PLACE["base"]
+    if not overlay or not base:
+        return False
+    here = os.path.join(overlay, rel.rstrip("/"))
+    there = os.path.realpath(os.path.join(base, rel.rstrip("/")))
+    if os.path.realpath(here) == there:
+        return True  # reached through links only: nothing was written in its place
+    if not rel.endswith("/") or not os.path.isdir(here) or os.path.islink(here):
+        return False
+    try:
+        names = sorted(os.listdir(here))
+        if names != sorted(os.listdir(there)):
+            return False
+        return all(os.path.realpath(os.path.join(here, n)) == os.path.realpath(os.path.join(there, n)) for n in names)
+    except OSError:
+        return False
+
+
+def _class_setup(cls, setup):
+    """Run a class set-up; the executor class takes its tables from the store and opens DuckDB
+    only when a test first asks for it, provided the patch leaves alone everything the set-up
+    reads.  (Its CREATE VIEW statements are plain text over the fixture files: they cannot
+    start failing because of a patch to sqlglot.)"""
+    if tables.usable(cls) and all(_unpatched(rel) for rel in tables.DEPENDS):
+        LAZY["on"] = True
+        try:
+            tables.setup(cls)
+            return
+        except tables.Mismatch:
+            pass
+        finally:
+            LAZY["on"] = False
+    setup()
+
+
 def _on_alarm(signum, frame):
     raise TestTimeout()
 
@@ -417,6 +454,7 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
     signal.signal(signal.SIGALRM, _on_alarm)
     signal.signal(signal.SIGPROF, _on_alarm)
     variants.SL.base_fixtures = os.path.join(base, "tests", "fixtures")
+    PLACE["overlay"], PLACE["base"] = overlay, base
 
     for name in job.get("imports", ()):
         # does the patched module still import?  (asked before its candidates were narrowed)
@@ -520,7 +558,7 @@ class LazyConn:
 
     def execute(self, *args, **kwargs):
         st = self._lz
-        if st[4] is None and os.getpid() == st[5]:
+        if st[4] is None and (PRERUN["on"] or LAZY["on"]):
             st[3].append((args, kwargs))
             return self
         return self._conn().execute(*args, **kwargs)
@@ -537,6 +575,10 @@ class LazyConn:
 # test modules the full zygote leaves for the child to import (heavy imports, rarely needed)
 LAZY_MODULES = ("tests.test_sqlglotc",)
 PRERUN = {"on": False}
+# set while a class set-up runs in a child that may defer its DuckDB work (see _class_setup)
+LAZY = {"on": False}
+# where the patched tree and the pinned checkout are, for asking "is this file patched?"
+PLACE = {"overlay": None, "base": None}
 PRESET = {}  # test classes whose setUpClass already ran in the zygote
 PRERUN_CLASSES = (("tests.test_executor", "TestExecutor"),)
 
@@ -550,7 +592,13 @@ def prerun_class_setup():
                 cls = getattr(sys.modules[mod_name], cls_name)
                 if getattr(cls, "__unittest_skip__", False):
                     continue
-                cls.setUpClass()
+                if tables.usable(cls):
+                    try:
+                        tables.setup(cls)
+                    except tables.Mismatch:
+                        cls.setUpClass()
+                else:
+                    cls.setUpClass()
                 PRESET[cls] = True
             except BaseException:
                 pass
@@ -571,7 +619,7 @@ def _limit_duckdb_threads():
         config = dict(kwargs.get("config") or {})
         config.setdefault("threads", 1)
         kwargs["config"] = config
-        if PRERUN["on"]:
+        if PRERUN["on"] or LAZY["on"]:
             return LazyConn(original, args, kwargs)
         return original(*args, **kwargs)
 

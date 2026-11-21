@@ -7,6 +7,9 @@ Usage: build_relations.py <trace_dir>[,<trace_dir>...] <tests.json> <repo_root> 
 
   sites   {source file: [site keys]}   every comparison that was evaluated both ways
   hits    {"file|site key": mask}      tests in which the two ways disagreed
+  seen    {"file|site key": mask}      tests in which the comparison was evaluated at all while
+          traced; a test that runs the line without the tracer having seen the comparison
+          stays a candidate
   always  mask of tests whose trace is unusable (they did not pass while being traced):
           they stay candidates for every comparison
   warm    comparisons that disagreed while the warm worker loaded: whatever was built from
@@ -28,6 +31,7 @@ with open(os.path.join(out_dir, "index.pkl"), "rb") as fh:
     ids = pickle.loads(zlib.decompress(fh.read()))["ids"]
 index = {tid: i for i, tid in enumerate(ids)}
 hits = {}
+seen = {}  # comparison site -> tests in which the tracer saw it evaluated at all
 always = 0
 bad = []
 vectors = {}  # formula site -> {(kind, vector): mask}   (see br/boolrel.py)
@@ -63,6 +67,8 @@ for t in tests:
             continue
         for site in d["hits"]:
             hits[site] = hits.get(site, 0) | (1 << i)
+        for site in d.get("seen", ()):
+            seen[site] = seen.get(site, 0) | (1 << i)
         for site, kind, vec in d.get("bools", ()):
             per = vectors.setdefault(site, {})
             k = (kind, tuple(vec))
@@ -95,7 +101,7 @@ for one in import_trace.split(","):
             imp["aborted"] = sorted(set(imp.get("aborted", ())) | set(d.get("aborted", ())))
 warm = sorted(imp["hits"])
 have_bools = "bools" in imp
-packed = {"sites": sites, "hits": hits, "always": always, "warm": warm}
+packed = {"sites": sites, "hits": hits, "seen": seen, "always": always, "warm": warm}
 if have_bools:
     packed.update(
         formulas=formulas,

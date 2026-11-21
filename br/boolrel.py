@@ -224,31 +224,36 @@ def instrument(tree, rel):
 class Recorder:
     """The three helpers the rewritten code calls, and what they collect."""
 
-    def __init__(self, busy):
-        self.busy = busy  # shared one-element list: non-zero while skipped operands are tried
+    def __init__(self, active):
+        # shared list: what is being evaluated right now only because the tracer asked for it
+        # (skipped operands here, the other operator of a comparison in br/relations.py)
+        self.active = active
         self.seen = set()  # (site, kind, vector)
         self.started = {}
         self.finished = {}
+        self.reentered = set()
 
     def start(self, site):
-        if self.busy[0]:
-            return None
+        # Evaluations made while the tracer tries skipped operands are recorded like any other:
+        # the patched formula may make them for real, and what they leave behind (caches) can
+        # keep the real program from making them later.
         self.started[site] = self.started.get(site, 0) + 1
+        if ("formula", site) in self.active:
+            # a skipped operand of this formula evaluates the formula again: in the patched
+            # program that inner evaluation would use the regrouped formula
+            self.reentered.add(site)
         return [site]
 
     def atom(self, t, i, value):
-        if t is not None:
-            # (the formula itself may never ask this operand for its truth - the last one of
-            # an `x = a or b` is just handed on - so asking must not be able to break anything)
-            try:
-                t.append(i if value else ~i)
-            except BaseException:
-                t.append(i + UNSURE)
+        # (the formula itself may never ask this operand for its truth - the last one of an
+        # `x = a or b` is just handed on - so asking must not be able to break anything)
+        try:
+            t.append(i if value else ~i)
+        except BaseException:
+            t.append(i + UNSURE)
         return value
 
     def end(self, t, result, thunks):
-        if t is None:
-            return result
         site = t[0]
         self.finished[site] = self.finished.get(site, 0) + 1
         if thunks is None:
@@ -261,7 +266,7 @@ class Recorder:
             else:
                 known[x if x >= 0 else ~x] = 1 if x >= 0 else 0
         full = []
-        self.busy[0] += 1
+        self.active.append(("formula", site))
         try:
             for i, thunk in enumerate(thunks):
                 if i in known:
@@ -272,14 +277,15 @@ class Recorder:
                 except BaseException:
                     full.append(RAISES)
         finally:
-            self.busy[0] -= 1
+            self.active.pop()
         # also keep which operands really ran: needed to know which value the formula returned
         self.seen.add((site, "f", tuple(full)))
         return result
 
     def aborted(self):
-        """Sites with an evaluation that never reached its end (an operand raised)."""
-        return sorted(s for s, n in self.started.items() if self.finished.get(s, 0) != n)
+        """Sites with an evaluation that never reached its end (an operand raised), or that
+        was entered again from its own skipped operands."""
+        return sorted({s for s, n in self.started.items() if self.finished.get(s, 0) != n} | self.reentered)
 
 
 # ---------------------------------------------------------------------------- deciding
@@ -386,3 +392,62 @@ def swapped(old_tree, new_tree):
     if len(found) == 1 and found[0] is not None:
         return found[0]
     return None
+
+
+def one_operand(old_tree, new_tree):
+    """If two modules differ only inside ONE operand of one formula (same and/or structure,
+    every other operand textually unchanged), return (old formula node, structure, index of
+    that operand); otherwise None."""
+    found = []
+
+    def walk(o, n):
+        if len(found) > 1:
+            return
+        if is_formula(o) or is_formula(n):
+            if not (isinstance(o, ast.AST) and isinstance(n, ast.AST)):
+                found.append(None)
+                return
+            ao, an = [], []
+            so, sn = structure(o, ao), structure(n, an)
+            if so != sn or len(ao) != len(an):
+                found.append(None)
+                return
+            changed = [i for i, (a, b) in enumerate(zip(ao, an)) if ast.dump(a) != ast.dump(b)]
+            if len(changed) == 1:
+                found.append((o, so, changed[0]))
+            elif changed:
+                found.append(None)
+            return
+        if type(o) is not type(n):
+            found.append(None)
+            return
+        if isinstance(o, list):
+            if len(o) != len(n):
+                found.append(None)
+                return
+            for a, b in zip(o, n):
+                walk(a, b)
+            return
+        if not isinstance(o, ast.AST):
+            if o != n:
+                found.append(None)
+            return
+        for f in o._fields:
+            walk(getattr(o, f, None), getattr(n, f, None))
+
+    walk(old_tree, new_tree)
+    if len(found) == 1 and found[0] is not None:
+        return found[0]
+    return None
+
+
+def asks_for(struct, kind, vector, index):
+    """Did the original formula evaluate operand `index` in this recorded evaluation?"""
+    if kind == "e":
+        return any(x == index or x == ~index or x == index + UNSURE for x in vector)
+    order = []
+    try:
+        _run(struct, lambda i: bool(vector[i]) if vector[i] != RAISES else True, order)
+    except Exception:
+        return True
+    return index in order

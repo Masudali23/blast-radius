@@ -19,6 +19,11 @@ COPY br /app/br
 COPY selector.py /app/selector.py
 COPY maps /app/maps
 
+# The executor tests' fixture tables, parsed once from the pinned checkout (br/tables.py).
+# Optional: without the file the tests' own set-up parses them at run time.
+COPY tools/build_tables.py /app/tools/build_tables.py
+RUN python /app/tools/build_tables.py /app/repo /app/tables.pkl || true
+
 # Byte-compile once: the run-time disk is read-only.
 RUN python -m compileall -q /app/repo/sqlglot /app/repo/tests /app/repo/sqlglotc /app/br /app/selector.py \
     && chmod -R a+rX /app

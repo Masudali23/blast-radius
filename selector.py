@@ -63,7 +63,7 @@ MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
 # seconds to wait for the stand-alone import check of a patched module
 IMPORT_WAIT = 45.0
 # recognise unchanged hand-overs to the slow half of the executor's TPC-DS test
-MEMO = os.environ.get("BR_MEMO", "1") == "1"
+MEMO = os.environ.get("BR_MEMO", "0") == "1"
 # ... and entries whose hand-over changed are run for real while their estimated CPU stays
 # under this share of the test's recorded time
 MEMO_BUDGET = float(os.environ.get("BR_MEMO_BUDGET", "0.3"))
