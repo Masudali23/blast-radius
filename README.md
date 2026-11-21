@@ -135,11 +135,12 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **A slow fixture-driven test next to real failures**: when other tests already fail and the
   slowest such test is still unchecked, its cheapest entries are run in a few short parts. On
   the labelled commits a failing run of that test fails on most of its entries, so a failure
-  shows on the first part. If the first part passes and some of its entries were handed
-  exactly what the pinned commit handed over, the patch changes the hand-over of only some
-  entries: then the quick halves of all the other entries are run, which tells which of them
-  are handed something new, and when running those costs no more than the rest of the sample
-  would have, they are all run. The verdict is then that of the whole test, not of a sample.
+  shows on the first part. If the first part passes and every one of its entries was handed
+  exactly what the pinned commit handed over, the patch reaches the test through few entries
+  and the cheapest ones say little: then the quick halves of all the other entries are run,
+  which tells which of them are handed something new, and when running those costs no more
+  than about a third of the test, they are all run. The verdict is then that of the whole
+  test, not of a sample.
   Otherwise the cheapest entries stand in for the rest, and if every one of them passes the
   test is let go: a measured trade, since a sample is not the whole test. Each entry runs on
   its own short leash of CPU time, so an entry that hangs is cut off at once and the test

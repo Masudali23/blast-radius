@@ -104,6 +104,7 @@ SAMPLE_PARTS = 4
 SETTLE = os.environ.get("BR_SETTLE", "1") == "1"
 # ... as long as running them costs no more than this share of the test
 WEIGHED_SHARE = float(os.environ.get("BR_WEIGHED_SHARE", "0.3"))
+WEIGH_MIXED = os.environ.get("BR_WEIGH_MIXED", "0") == "1"
 # for measuring only: select nothing that was not seen to fail
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -828,10 +829,13 @@ class Selector:
                     return "F"
                 if u3:
                     return "U"
-                recognised = st["note"].get(n, "").partition("/")[0]
-                if k == 0 and rest is not None and recognised.isdigit() and int(recognised) > 0:
-                    # some of these entries are handed what they were always handed: weigh
-                    # the others instead of going on entry by entry
+                recognised, _, new = st["note"].get(n, "").partition("/")
+                if k == 0:
+                    dbg.setdefault("first_part", []).append((n, st["note"].get(n, "")))
+                if k == 0 and rest is not None and recognised.isdigit() and int(recognised) > 0 and (new == "0" or WEIGH_MIXED):
+                    # every entry of the first part is handed what it was always handed, so
+                    # the patch reaches the test through few entries and a sample of the
+                    # cheapest tells little: weigh the others instead
                     st["planned"] += rest[1] / 1000.0
                     f3, u3 = run([(n, rest[0], rest[1])], False, patience=1.8)
                     dbg.setdefault("weighed", []).append((n, "F" if f3 else "U" if u3 else "P", st["note"].get(n, "")))
