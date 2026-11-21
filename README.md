@@ -104,7 +104,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   The class-usage recording (which classes are instantiated, which constants read, which dict
   entries looked up) is taken per entry as well, so an edited class constant, dict entry or
   default value also reaches only the entries that use it. Whatever the class set-up runs,
-  reads or evaluates before the first entry counts for every entry.
+  reads or evaluates before the first entry counts for every entry. When an edit can only be
+  noticed by an entry that meets several such conditions at once (it uses the edited class and
+  looks up the edited dict key, say) and each condition is met by some entries but no entry
+  meets them all, the test is run with no entries: only what it does outside its fixture loop.
 - **Unchanged hand-over** (`br/memo.py`): the executor's TPC-DS test is by far the slowest test,
   and nearly all of its time goes into a pure-Python query engine and into comparing the result
   with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed

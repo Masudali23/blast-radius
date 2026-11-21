@@ -594,6 +594,12 @@ class Selector:
                 entries = plan.entry.get((rel, lo, hi)) if ENTRY_NARROW and kind == "mod" else None
                 reach = entries(tid) if entries is not None else None
                 if not reach:
+                    explained = getattr(entries, "explained", None)
+                    if reach == 0 and explained is not None and explained(tid):
+                        # Several conditions, each met by some entries, but by no entry all at
+                        # once: no entry can notice the edit.  What the test does outside its
+                        # fixture loop still runs.
+                        continue
                     return None, 1.0
                 allow |= reach
                 if allow == full:

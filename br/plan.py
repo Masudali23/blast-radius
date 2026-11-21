@@ -744,6 +744,14 @@ def _all_of(factors):
                 mask = m if mask is None else mask & m
         return mask
 
+    def explained(test_id):
+        """Does every narrowing that says something name at least one entry?  Then entries
+        account for the test under each of them, and an empty intersection means that no
+        single entry meets them all (one uses the class, another looks up the key)."""
+        said = [m for m in (f(test_id) for f in factors) if m is not None]
+        return len(said) > 1 and all(said)
+
+    entries.explained = explained
     return entries
 
 
