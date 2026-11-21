@@ -12,13 +12,94 @@ For each test in memo.TESTS, run at the pinned commit:
   costs    {sql key: CPU ms of that entry's slow half}
 
 With a third argument (a maps directory) the result is also stored there as memo.pkl.
+
+`back` is taken twice.  During the test itself the slow half follows the quick half in the
+same process, so anything the quick half already computed and cached is not computed again
+and its lines would be missing.  Every hand-over is therefore also replayed in a process that
+never ran the quick half (one forked child per entry, straight after loading the modules):
+the lines the slow half runs there are added.
 """
 import importlib
 import json
 import os
+import pickle
+import subprocess
 import sys
 import time
 import unittest
+
+
+COLD = r"""
+import os, pickle, sys
+root, handed, out = sys.argv[1:4]
+os.chdir(root)
+sys.path.insert(0, root)
+import unittest  # sqlglot checks more when a test library is loaded
+import sqlglot.executor
+from sqlglot.executor.python import PythonExecutor
+prefix = root + os.sep
+mon = sys.monitoring
+tool = mon.COVERAGE_ID
+mon.use_tool_id(tool, "memo-cold")
+seen = set()
+def note(code, line):
+    fn = code.co_filename
+    if fn.startswith(prefix):
+        seen.add((fn[len(prefix):], line))
+def on_line(code, line):
+    note(code, line)
+    return mon.DISABLE
+def on_start(code, offset):
+    note(code, code.co_firstlineno)
+    return mon.DISABLE
+mon.register_callback(tool, mon.events.LINE, on_line)
+mon.register_callback(tool, mon.events.PY_START, on_start)
+total = {}
+count = 0
+with open(handed, "rb") as fh:
+    while True:
+        try:
+            start = fh.tell()
+            plan, tables = pickle.load(fh)
+        except EOFError:
+            break
+        count += 1
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            # this child has loaded the modules and one hand-over, nothing else
+            os.close(r)
+            seen.clear()
+            mon.restart_events()
+            mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
+            try:
+                PythonExecutor(tables=tables).execute(plan)
+            except BaseException:
+                pass
+            mon.set_events(tool, 0)
+            with os.fdopen(w, "wb") as out_fh:
+                pickle.dump(sorted(seen), out_fh)
+            os._exit(0)
+        os.close(w)
+        with os.fdopen(r, "rb") as in_fh:
+            data = in_fh.read()
+        os.waitpid(pid, 0)
+        for rel, line in (pickle.loads(data) if data else ()):
+            total.setdefault(rel, set()).add(line)
+with open(out, "wb") as fh:
+    pickle.dump((total, count), fh)
+"""
+
+
+def cold_back(root, handed):
+    """Lines the slow half runs when each recorded hand-over is executed in a process that has
+    only loaded the modules: ({file: lines}, number of hand-overs replayed)."""
+    out = handed + ".cold"
+    subprocess.run([sys.executable, "-c", COLD, root, handed, out], stdin=subprocess.DEVNULL, check=True)
+    with open(out, "rb") as fh:
+        total, count = pickle.load(fh)
+    os.unlink(out)
+    return total, count
 
 
 def main():
@@ -71,12 +152,25 @@ def main():
             record = {}
             result = unittest.TestResult()
             t0 = time.process_time()
-            with memo.Session(module, cls, memo.TESTS[tid], record=record, phase=phase) as recording:
-                cls(meth).run(result)
+            handed = os.path.join(os.path.dirname(out_path), "memo_handed_%d.bin" % os.getpid())
+            with open(handed, "wb") as store:
+
+                def capture(plan, tables):
+                    pickle.dump((plan, tables), store, protocol=5)
+
+                with memo.Session(module, cls, memo.TESTS[tid], record=record, phase=phase, capture=capture) as recording:
+                    cls(meth).run(result)
             full = time.process_time() - t0
             costs = dict(recording.cost_record)
             phase(False)
             ok = result.wasSuccessful() and result.testsRun == 1
+            phase(False)
+            warm = sum(len(ls) for ls in back.values())
+            cold_lines, replayed = cold_back(root, handed)
+            os.unlink(handed)
+            for rel, ls in cold_lines.items():
+                back.setdefault(rel, set()).update(ls)
+            sys.stderr.write("slow-half lines: %d in the test's own process, %d after replaying %d hand-overs cold\n" % (warm, sum(len(ls) for ls in back.values()), replayed))
             lines = {rel: sorted(ls) for rel, ls in back.items()}
             # how much is left when every entry is recognised
             result2 = unittest.TestResult()
@@ -102,7 +196,6 @@ def main():
     with open(out_path, "w") as fh:
         json.dump(out, fh)
     if len(sys.argv) > 3:
-        import pickle
         import zlib
 
         packed = {
@@ -120,4 +213,5 @@ def main():
             fh.write(zlib.compress(pickle.dumps(packed, protocol=5), 6))
 
 
-main()
+if __name__ == "__main__":
+    main()

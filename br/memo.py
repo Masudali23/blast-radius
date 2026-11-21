@@ -190,7 +190,7 @@ class Session:
     After a strict session gave up, `gave_up` is set and the test's outcome means nothing.
     """
 
-    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0):
+    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0, capture=None):
         self.module = module
         self.cls = cls
         self.attr = attr
@@ -198,6 +198,7 @@ class Session:
         self.plans = {v[0] for v in self.known.values()}
         self.record = record
         self.phase = phase  # callable(bool): tells the tracer when the slow half runs
+        self.capture = capture  # map building: callable(plan, tables), given every hand-over
         self.pending = {}
         # strict: on the first entry that is not recognised, stop doing work and report so
         self.strict = strict
@@ -247,6 +248,8 @@ class Session:
                 # hand back a stand-in; the helper decides whether the real thing is needed
                 session.pending[key] = (executor, plan)
                 return Unchanged(key)
+            if session.capture is not None:
+                session.capture(plan, executor.tables)
             t0 = time.process_time()
             table = slow(real_execute, executor, plan)
             if session.record is not None:
