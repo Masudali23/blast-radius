@@ -1,9 +1,11 @@
 """Turn one patch into a plan: which tests could possibly be affected, and how to check them."""
 import ast
 import importlib.util
+import io
 import os
 import re
 import sys
+import tokenize
 
 from . import analyze, boolrel, infect, patch, relations
 
@@ -247,9 +249,15 @@ def _changed(plan, rel, old, new, base, maps, opts):
     if status != "syntax" and new.split(b"\n", 2)[:2] != old.split(b"\n", 2)[:2]:
         # the first two lines may carry an encoding declaration: a "comment" that decides
         # whether the file can be read at all
+        # ... and what its text says: under another encoding the same bytes are other characters.
+        # Unless those all sit in comments and documentation, the file is handled like one
+        # that cannot be read: every test that imports it.
         try:
-            ast.parse(new)
-        except (SyntaxError, ValueError):
+            if ast.dump(ast.parse(new)) != ast.dump(ast.parse(new_t)):
+                real = new.decode(tokenize.detect_encoding(io.BytesIO(new).readline)[0])
+                if status == "diff" or analyze.diff_python(new_t, real)[0] not in ("same", "doc"):
+                    status = "syntax"
+        except (SyntaxError, ValueError, LookupError, RecursionError):
             status = "syntax"
     plan.add("data", rel, 0, 0, readers)  # tests that read this source file as data see any textual change
     if status in ("same", "doc"):

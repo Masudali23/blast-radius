@@ -161,6 +161,11 @@ class Differ:
             self.stmt(o, n, ctx_scope, cls)
 
     def stmt(self, o, n, scope, cls):
+        if _bare_text(o) and _bare_text(n):
+            # two strings that stand alone as statements: evaluating either does nothing, and
+            # whichever comes first in a module is only its documentation (as for the
+            # documentation of functions and classes, which is not compared at all)
+            return
         ctx = _Ctx(scope, o, cls=cls, new=n)
         if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # name / decorators / defaults / annotations are evaluated in the enclosing scope
@@ -394,6 +399,10 @@ def _defaults_only(o, n):
 
 def _no_iter(g, i):
     return ast.comprehension(target=g.target, iter=ast.Constant(value=None) if i == 0 else g.iter, ifs=g.ifs, is_async=g.is_async)
+
+
+def _bare_text(node):
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
 
 
 def _strip_doc(body):
