@@ -21,6 +21,8 @@ import hashlib
 import sys
 import time
 
+from br import inlinepool
+
 TESTS = {
     # test id -> (class attribute with the fixture entries, is_tpch flag value)
     "tests/test_executor.py::TestExecutor::test_execute_tpcds": "tpcds_sqls",
@@ -212,6 +214,8 @@ class Session:
         self.cost_record = {}  # map building: CPU ms of each entry's slow half
         self.depth = 0
         self.fronts = []  # plan fingerprint of every hand-over, in the order they were made
+        self.looked = 0  # entries decided so far (strict sessions)
+        self.total = 0
         self.weighed = False
         self.duckdb_text = {}
         self.skipped = 0
@@ -306,6 +310,7 @@ class Session:
                 # running any: the caller keeps the test.
                 session.weighed = True
                 ran = [e for e in entries if e[0].get("execute")]
+                session.total = len(ran)
                 if len(ran) == len(session.fronts):
                     need = 0.0
                     for (_, text, *_rest), key in zip(ran, session.fronts):
@@ -315,6 +320,7 @@ class Session:
                     if need > session.budget:
                         session.gave_up = True
                         return None
+            session.looked += 1
             if isinstance(table, Unchanged):
                 executor, plan = session.pending.pop(table.key)
                 same = unchanged(skey, sql, table.key)
@@ -326,6 +332,10 @@ class Session:
                     # otherwise stop here and let the caller keep the test
                     cost = session.costs.get(skey)
                     if cost is None or session.spent + cost > session.budget:
+                        session.gave_up = True
+                        return None
+                    if session.looked >= 8 and session.total and (session.spent + cost) * session.total / (session.looked + 1) > session.budget:
+                        # at this rate the allowance will not cover the test: stop now
                         session.gave_up = True
                         return None
                     session.spent += cost
@@ -363,6 +373,10 @@ class Session:
             mp_execute.__qualname__ = real_mp.__qualname__
             mp_execute.__name__ = real_mp.__name__
             self._patch(self.module, "mp_execute", mp_execute)
+        if self.strict and getattr(self.module, "ProcessPoolExecutor", None) is inlinepool.InlinePool:
+            # look at each entry as soon as its quick half is done: a slow half that fails
+            # then ends the test before the other entries have cost anything
+            self._patch(self.module, "ProcessPoolExecutor", inlinepool.LazyPool)
         self._patch(py.PythonExecutor, "execute", execute)
         self._patch(self.cls, "subtestHelper", helper)
         return self
