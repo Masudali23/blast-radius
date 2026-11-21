@@ -502,6 +502,75 @@ def code_shapes(src, filename="<x>"):
     return out
 
 
+def _changed_members(olist, nlist, same, chain, out):
+    """Collect into `out` the (old, new, enclosing class names) statements of two bodies that
+    are not written identically, looking inside classes whose header is unchanged.  False when
+    the bodies do not pair up or a statement decides how the whole module is compiled."""
+    if len(olist) != len(nlist):
+        return False
+    for o, n in zip(olist, nlist):
+        if type(o) is not type(n):
+            return False
+        if same(o, n):
+            continue
+        if isinstance(o, ast.ImportFrom) and "__future__" in (o.module, n.module):
+            return False
+        if (
+            isinstance(o, ast.ClassDef)
+            and o.name == n.name
+            and not getattr(o, "type_params", None)
+            and not getattr(n, "type_params", None)
+            and all(ast.dump(ast.Tuple(elts=list(getattr(o, f)), ctx=ast.Load())) == ast.dump(ast.Tuple(elts=list(getattr(n, f)), ctx=ast.Load())) for f in ("bases", "decorator_list"))
+            and [ast.dump(k) for k in o.keywords] == [ast.dump(k) for k in n.keywords]
+        ):
+            if not _changed_members(o.body, n.body, same, chain + (o.name,), out):
+                return False
+            continue
+        out.append((o, n, chain))
+    return True
+
+
+def _member_shapes(stmt, chain, out):
+    """Add the code-object shapes of one statement, compiled inside classes named as the ones
+    that enclose it (their names decide qualified names, private names and `__class__`)."""
+    import types
+
+    node = stmt
+    for name in reversed(chain):
+        node = ast.ClassDef(name=name, bases=[], keywords=[], body=[node], decorator_list=[])
+        if "type_params" in ast.ClassDef._fields:
+            node.type_params = []
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    stack = [compile(module, "<x>", "exec", dont_inherit=True)]
+    while stack:
+        c = stack.pop()
+        key = (c.co_qualname, c.co_varnames, c.co_freevars, c.co_cellvars, c.co_flags, c.co_argcount, c.co_kwonlyargcount)
+        out[key] = out.get(key, 0) + 1
+        for k in c.co_consts:
+            if isinstance(k, types.CodeType):
+                stack.append(k)
+
+
+def shapes_same(old_src, new_src):
+    """code_shapes(old_src) == code_shapes(new_src) for the two sources of the last diff_python
+    call that found differences.  Statements written identically give the same code objects in
+    both, so only the others are compiled, each by itself."""
+    same = SAME[0]
+    if same is not None and TREES:
+        pairs = []
+        if _changed_members(TREES[0].body, TREES[1].body, same, (), pairs):
+            old_shapes, new_shapes = {}, {}
+            try:
+                for o, n, chain in pairs:
+                    _member_shapes(o, chain, old_shapes)
+                    _member_shapes(n, chain, new_shapes)
+                return old_shapes == new_shapes
+            except Exception:
+                pass  # (a statement that does not compile: let the whole files decide)
+    return code_shapes(old_src) == code_shapes(new_src)
+
+
 def _key_text(node):
     """The tracer's text form (see br/keys.py) of a dict key written in source, or None."""
     if isinstance(node, ast.Constant):

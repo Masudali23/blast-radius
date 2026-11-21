@@ -261,7 +261,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
         plan.syntax = True
         plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | maps.any_line(rel))
         return
-    shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
+    shapes = []  # worked out only when a function-level change asks
+
+    def shapes_ok():
+        if not shapes:
+            shapes.append(analyze.shapes_same(old_t, new_t))
+        return shapes[0]
+
     given = False  # the file's one change is a class constant handed to the warm worker
     plan.code_files += 1
     hot = True
@@ -278,7 +284,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
         if c.level == "func":
             plan.kinds.add("func")
             lo, hi = c.lines
-            if not shapes_ok or c.coarse:
+            if c.coarse or not shapes_ok():
                 lo, hi = c.scope_span
             slo, shi = c.scope_span
             # Objects made while modules loaded (closures, lambdas stored in class dicts) hold
@@ -330,7 +336,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 # old code: import afresh.  What was BUILT then can only differ if the changed
                 # statement itself ran then; otherwise the tests that reach the statement are
                 # the only ones in play.
-                if c.coarse or not shapes_ok or maps.ran_at_import(rel, lo, hi):
+                if c.coarse or not shapes_ok() or maps.ran_at_import(rel, lo, hi):
                     plan.add("mod", rel, slo, shi, maps.func(rel, slo, shi))
         else:
             plan.kinds.add("mod")
@@ -426,7 +432,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
         pass  # no function changes and nothing to import afresh
     elif hot:
         plan.swaps.append(rel)
-        if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
+        if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok() and analyze.TREES:
             if infect.applicable(analyze.TREES[0], analyze.TREES[1]):
                 plan.probe.append(rel)
     else:
