@@ -76,8 +76,7 @@ def main():
     # helper) reads a dict then, something else was derived from it and the name is marked.
     importing = [0]
     dict_keys = set()  # (attribute name, key) looked up at run time; key "*" = read as a whole
-    derived = set()  # "name\tkey" (key "*" = whole) read by function code at import time
-    where = set()
+    derived = set()  # "name\tkey\tclass" (key "*" = whole) read by function code at import time
     SKIP_DICTS = {"arg_types", "__annotations__", "__dict__"}
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -86,12 +85,11 @@ def main():
     DEBUG_WHOLE = os.environ.get("BR_DEBUG_WHOLE")
     debug_done = []
 
-    def note(owner, k):
+    def note(owner, k, who=""):
         if importing[0]:
             caller = sys._getframe(2).f_code
             if caller.co_flags & 1:
-                derived.add("%s\t%s" % (owner, "*" if k is None else key_repr(k)))
-                where.add("%s\t%s:%d" % (owner, caller.co_filename[len(prefix):], caller.co_firstlineno))
+                derived.add("%s\t%s\t%s" % (owner, "*" if k is None else key_repr(k), who))
         else:
             if k is None and owner == DEBUG_WHOLE and not debug_done:
                 import traceback
@@ -101,66 +99,66 @@ def main():
             dict_keys.add((owner, "*" if k is None else key_repr(k)))
 
     class TDict(dict):
-        __slots__ = ("_br",)
+        __slots__ = ("_br", "_brc")
 
         def __getitem__(self, k):
-            note(self._br, k)
+            note(self._br, k, self._brc)
             return dict.__getitem__(self, k)
 
         def get(self, k, default=None):
-            note(self._br, k)
+            note(self._br, k, self._brc)
             return dict.get(self, k, default)
 
         def __contains__(self, k):
-            note(self._br, k)
+            note(self._br, k, self._brc)
             return dict.__contains__(self, k)
 
         def setdefault(self, k, default=None):
-            note(self._br, k)
+            note(self._br, k, self._brc)
             return dict.setdefault(self, k, default)
 
         def pop(self, k, *default):
-            note(self._br, k)
+            note(self._br, k, self._brc)
             return dict.pop(self, k, *default)
 
         def __iter__(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__iter__(self)
 
         def keys(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.keys(self)
 
         def values(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.values(self)
 
         def items(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.items(self)
 
         def copy(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.copy(self)
 
         def __eq__(self, other):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__eq__(self, other)
 
         def __ne__(self, other):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__ne__(self, other)
 
         def __or__(self, other):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__or__(self, other)
 
         def __ror__(self, other):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__ror__(self, other)
 
         def __reversed__(self):
-            note(self._br, None)
+            note(self._br, None, self._brc)
             return dict.__reversed__(self)
 
         __hash__ = None
@@ -170,7 +168,7 @@ def main():
     callable_keys = set()  # (attribute name, key) entries that hold a callable
     CALLABLES = (types.FunctionType, types.MethodType, functools.partial)
 
-    def recording(value, owner, keyr):
+    def recording(value, owner, keyr, who=""):
         if isinstance(value, types.MethodType):
             # keep it a bound method (callers look at __self__)
             inner = value.__func__
@@ -178,7 +176,7 @@ def main():
             @functools.wraps(inner)
             def call_m(*a, **k):
                 if importing[0]:
-                    derived.add("%s\t%s" % (owner, keyr))
+                    derived.add("%s\t%s\t%s" % (owner, keyr, who))
                 else:
                     dict_calls.add((owner, keyr))
                 return inner(*a, **k)
@@ -197,11 +195,12 @@ def main():
         call._br_w = True
         return call
 
-    def wrap_dicts(cls):
+    def wrap_dicts(cls, cls_key):
         for attr, value in list(cls.__dict__.items()):
             if type(value) is dict and attr not in SKIP_DICTS and not attr.startswith("__"):
                 t = TDict(value)
                 t._br = attr
+                t._brc = cls_key
                 # entries holding a callable also record when that callable is invoked, so that
                 # copies of the dict (dispatch tables and the like) are still accounted for
                 for k, v in list(dict.items(t)):
@@ -212,7 +211,7 @@ def main():
                             continue
                         callable_keys.add((attr, kr))
                         if not getattr(getattr(v, "__func__", v), "_br_w", False):
-                            dict.__setitem__(t, k, recording(v, attr, kr))
+                            dict.__setitem__(t, k, recording(v, attr, kr, cls_key))
                 try:
                     setattr(cls, attr, t)
                     tracked_dicts.add(attr)
@@ -246,18 +245,61 @@ def main():
         builtins.__import__ = tracking_import
         importlib.import_module = tracking_import_module
 
+    def wrap_namespace(ns, cls_key):
+        """Wrap the dicts of a class body before its metaclass sees them, so that whatever the
+        metaclass derives from them at class creation is observed too."""
+        for attr, value in list(ns.items()):
+            if type(value) is dict and attr not in SKIP_DICTS and not attr.startswith("__"):
+                t = TDict(value)
+                t._br = attr
+                t._brc = cls_key
+                for k, v in list(dict.items(t)):
+                    if isinstance(v, CALLABLES):
+                        try:
+                            kr = key_repr(k)
+                        except Exception:
+                            continue
+                        callable_keys.add((attr, kr))
+                        if not getattr(getattr(v, "__func__", v), "_br_w", False):
+                            dict.__setitem__(t, k, recording(v, attr, kr, cls_key))
+                ns[attr] = t
+                tracked_dicts.add(attr)
+
+    def real_metaclass(bases, kw):
+        meta = kw.get("metaclass")
+        if meta is None:
+            meta = type
+            for b in bases:
+                bm = type(b)
+                if issubclass(bm, meta):
+                    meta = bm
+        return meta
+
     def build_class(func, name, *bases, **kw):
+        code = func.__code__
+        ours = code.co_filename.startswith(prefix + "sqlglot" + os.sep)
+        if ours:
+            try:
+                meta = real_metaclass(bases, kw)
+                cls_key = "%s:%d" % (code.co_filename[len(prefix):], code.co_firstlineno)
+                if isinstance(meta, type):
+
+                    def proxy(cname, cbases, ns, **ckw):
+                        try:
+                            wrap_namespace(ns, cls_key)
+                        except Exception:
+                            pass
+                        return meta(cname, cbases, ns, **ckw)
+
+                    proxy.__prepare__ = getattr(meta, "__prepare__")
+                    kw = dict(kw, metaclass=proxy)
+            except Exception:
+                pass
         importing[0] += 1
         try:
             cls = orig_build(func, name, *bases, **kw)
         finally:
             importing[0] -= 1
-        try:
-            code = func.__code__
-            if code.co_filename.startswith(prefix + "sqlglot" + os.sep):
-                wrap_dicts(cls)
-        except Exception:
-            pass
         try:
             code = func.__code__
             if code.co_filename.startswith(prefix):
@@ -347,6 +389,9 @@ def main():
             k = key_of.get(b)
             if k:
                 used_keys.add(k)
+    ancestry = {}
+    for cls in key_of:
+        ancestry[key_of[cls]] = sorted({key_of[b] for b in cls.__mro__ if b in key_of})
     rel = lambda d: {k[len(prefix):]: sorted(v) for k, v in d.items()}
     with open(out, "w") as fh:
         json.dump(
@@ -368,7 +413,7 @@ def main():
                 "dict_calls": sorted("%s\t%s" % kv for kv in dict_calls),
                 "dict_callable": sorted("%s\t%s" % kv for kv in callable_keys),
                 "dict_derived": sorted(derived),
-                "dict_derived_where": sorted(where),
+                "ancestry": ancestry,
                 "dict_names": sorted(tracked_dicts),
             },
             fh,

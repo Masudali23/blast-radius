@@ -17,7 +17,12 @@ class Maps:
         self.import_func = {k: set(v) for k, v in idx["import_func"].items()}
         self.import_files = set(idx.get("import_files", ()))  # data read while the zygote warms up
         self.extra = idx.get("extra", {})
-        self.dict_derived = set(idx.get("dict_derived", ()))
+        # "NAME\tkey\tclass": entries read by function code while `class` was being built
+        self.dict_derived = {}
+        for entry in idx.get("dict_derived", ()):
+            parts = entry.split("\t")
+            self.dict_derived.setdefault((parts[0], parts[1]), set()).add(parts[2] if len(parts) > 2 else "")
+        self.ancestry = idx.get("ancestry", {})
         self.dict_names = set(idx.get("dict_names", ()))
         self.dict_all_keys = idx.get("dict_all_keys", {})
         self._dict_users = None
@@ -135,3 +140,16 @@ class Maps:
         if k not in d["callable"]:
             return None
         return d["calls"].get(k, 0)
+
+    def derived(self, name, key, cls_keys):
+        """Was entry `key` of dict `name` read at import time in the class `cls_keys` or a subclass?"""
+        owners = self.dict_derived.get((name, key))
+        if not owners:
+            return False
+        want = set(cls_keys)
+        for owner in owners:
+            if not owner:
+                return True  # recorded without its class: assume the worst
+            if want & set(self.ancestry.get(owner, (owner,))):
+                return True
+        return False

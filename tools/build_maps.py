@@ -33,6 +33,7 @@ dict_calls = {}  # "NAME\tkey" -> tests that invoke the callable stored under th
 dict_callable = set()  # "NAME\tkey" entries holding a callable
 dict_derived = set()  # "NAME\tkey" read (or called) by function code while classes are being built
 dict_names = set()  # class-level dict attributes that were observed
+ancestry = {}  # class -> the classes (itself included) it inherits from
 bad = []
 for i, t in enumerate(tests):
     p = os.path.join(trace_dir, "%d.json" % t["number"])
@@ -66,6 +67,8 @@ for i, t in enumerate(tests):
         dict_calls[k] = dict_calls.get(k, 0) | bit
     dict_callable.update(d.get("dict_callable", ()))
     dict_derived.update(d.get("dict_derived", ()))
+    for k, v in d.get("ancestry", {}).items():
+        ancestry.setdefault(k, set()).update(v)
     dict_names.update(d.get("dict_names", ()))
     for k in d.get("classes", ()):
         class_users[k] = class_users.get(k, 0) | bit
@@ -105,6 +108,7 @@ index = {
     "sliced": sliced,
     "class_users": class_users,
     "dict_derived": sorted(dict_derived),
+    "ancestry": {k: sorted(v) for k, v in ancestry.items()},
     "dict_names": sorted(dict_names),
     "tracked": sorted(tracked),
     "ids": ids,

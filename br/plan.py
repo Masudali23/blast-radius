@@ -232,7 +232,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                         plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
                         mask &= cu
                 if mask and c.cls and REFINE_KEYS and len(c.names) == 1:
-                    ku = _key_users(maps, c)
+                    ku = _key_users(maps, c, rel)
                     if ku is not None:
                         plan.notes.append("key-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & ku).count("1")))
                         mask &= ku
@@ -249,7 +249,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
 FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
 
 
-def _key_users(maps, c):
+def _key_users(maps, c, rel):
     """Tests that look up one of the dict entries a class-level `NAME = {...}` edit touches.
 
     Entries are found by name and key in any class's dict of that name, so copies inherited by
@@ -266,8 +266,9 @@ def _key_users(maps, c):
     if not keys:
         return None
     known = set(maps.dict_all_keys.get(name, ()))
+    cls_keys = ["%s:%d" % (rel, line) for line in c.cls_lines]
     for k in keys:
-        if "%s\t%s" % (name, k) in maps.dict_derived:
+        if maps.derived(name, k, cls_keys):
             return None
         if k in old_keys and k not in known:
             return None  # the key as written does not match what the dict really holds
@@ -283,7 +284,7 @@ def _key_users(maps, c):
             mask |= callers
         if mask is not None:
             return mask
-    if "%s\t*" % name in maps.dict_derived:
+    if maps.derived(name, "*", cls_keys):
         return None
     mask = maps.dict_users(name, "*")
     for k in keys:
