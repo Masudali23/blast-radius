@@ -54,7 +54,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   otherwise (`tools/check_instantiating.py`).
 - **Executor tables**: the executor tests load the TPC tables from CSV in their class setup.
   The image build stores the loaded tables once (`tools/build_tables.py`), and DuckDB
-  connections are opened only when a test first uses one.
+  connections are opened only when a test first uses one. The build also stores the frame
+  DuckDB returns for every SQL text those tests send it: over the same fixture files the same
+  text always gets the same answer, so a test that sends an unchanged text is handed the stored
+  frame, and any other text goes to DuckDB.
 - **Swapped comparison operators** (`br/relations.py`): `a is b` and `a == b` give the same
   answer unless an object equals something it is not; `a < b` and `a <= b` unless the two are
   equal. While the maps are built, every such comparison in sqlglot is evaluated both ways each

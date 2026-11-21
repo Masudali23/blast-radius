@@ -7,6 +7,11 @@ changes: the rows depend only on the fixture files and on the set-up code in the
 set-up runs as written, except that the CSV reader stops after the header line; each table is
 then built again by the same constructor call from the stored rows.
 
+The store also keeps DuckDB's answers.  The executor tests hand DuckDB a SQL text and compare
+what comes back with their own result; over the same fixture files the same text always gets
+the same answer, whatever sqlglot does.  `answer` returns the stored frame for a text that was
+run when the image was built, and the caller asks DuckDB itself for any other text.
+
 Not used when the patch touches anything the rows depend on (DEPENDS).
 """
 import csv
@@ -15,6 +20,9 @@ import pickle
 
 OWNER = ("tests.test_executor", "TestExecutor")
 ATTRS = ("tpch_tables", "tpcds_tables")
+# the class's DuckDB connections, and for each the fixture queries its answers are stored for
+CONNS = {"tpch_conn": "tpch_sqls", "tpcds_conn": "tpcds_sqls"}
+ANSWERS = "duckdb answers"
 # files (or directory prefixes) that decide what the rows are
 DEPENDS = ("tests/test_executor.py", "tests/helpers.py", "tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
 PATH = os.environ.get("BR_TABLES", "/app/tables.pkl")
@@ -73,3 +81,12 @@ def setup(cls, stored=None):
                 raise Mismatch(name)
             # the same call the set-up makes, now with the rows
             tables[name] = type(table)(columns=table.columns, rows=rows)
+
+
+def answer(conn_name, sql):
+    """The frame DuckDB returned for `sql` on that connection when the store was built, or None."""
+    stored = load()
+    if stored is None:
+        return None
+    frame = stored.get(ANSWERS, {}).get(conn_name, {}).get(sql)
+    return None if frame is None else frame.copy(deep=True)

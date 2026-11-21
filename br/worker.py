@@ -390,15 +390,39 @@ def _unpatched(rel):
         return False
 
 
+def _rows_unpatched():
+    """Is everything the stored rows and DuckDB answers depend on the pinned one?  The fixture
+    queries (*.sql) next to the table files do not count: they are read afresh either way."""
+    overlay, base = PLACE["overlay"], PLACE["base"]
+    for rel in tables.DEPENDS:
+        if _unpatched(rel):
+            continue
+        if not rel.endswith("/"):
+            return False
+        here = os.path.join(overlay, rel.rstrip("/"))
+        there = os.path.realpath(os.path.join(base, rel.rstrip("/")))
+        try:
+            names = sorted(os.listdir(here))
+            if names != sorted(os.listdir(there)):
+                return False
+            for n in names:
+                if not n.endswith(".sql") and os.path.realpath(os.path.join(here, n)) != os.path.realpath(os.path.join(there, n)):
+                    return False
+        except OSError:
+            return False
+    return True
+
+
 def _class_setup(cls, setup):
     """Run a class set-up; the executor class takes its tables from the store and opens DuckDB
     only when a test first asks for it, provided the patch leaves alone everything the set-up
     reads.  (Its CREATE VIEW statements are plain text over the fixture files: they cannot
     start failing because of a patch to sqlglot.)"""
-    if tables.usable(cls) and all(_unpatched(rel) for rel in tables.DEPENDS):
+    if tables.usable(cls) and _rows_unpatched():
         LAZY["on"] = True
         try:
             tables.setup(cls)
+            _name_connections(cls)
             return
         except tables.Mismatch:
             pass
@@ -547,6 +571,7 @@ class LazyConn:
 
     def __init__(self, factory, args, kwargs):
         self.__dict__["_lz"] = [factory, args, kwargs, [], None, os.getpid()]
+        self.__dict__["_name"] = None  # which of the class's connections this is, once known
 
     def _conn(self):
         st = self._lz
@@ -561,6 +586,10 @@ class LazyConn:
         if st[4] is None and (PRERUN["on"] or LAZY["on"]):
             st[3].append((args, kwargs))
             return self
+        if self._name and len(args) == 1 and not kwargs and type(args[0]) is str and STORE_OK():
+            frame = tables.answer(self._name, args[0])
+            if frame is not None:
+                return StoredAnswer(self, args[0], frame)
         return self._conn().execute(*args, **kwargs)
 
     def close(self):
@@ -570,6 +599,45 @@ class LazyConn:
 
     def __getattr__(self, name):
         return getattr(self._conn(), name)
+
+
+class StoredAnswer:
+    """What `execute` hands back for a SQL text whose DuckDB answer is in the store: the frame
+    for `fetchdf`, and DuckDB itself for anything else that is asked of it."""
+
+    def __init__(self, conn, sql, frame):
+        self.__dict__["_sa"] = (conn, sql, frame)
+
+    def fetchdf(self, *args, **kwargs):
+        conn, sql, frame = self._sa
+        if args or kwargs:
+            return conn._conn().execute(sql).fetchdf(*args, **kwargs)
+        return frame
+
+    def __getattr__(self, name):
+        conn, sql, _ = self._sa
+        return getattr(conn._conn().execute(sql), name)
+
+
+_store_ok = {}
+
+
+def STORE_OK():
+    """May stored DuckDB answers be used in this process?  Only while nothing they depend on is
+    patched (asked once per process: a child serves one commit)."""
+    pid = os.getpid()
+    if pid not in _store_ok:
+        _store_ok.clear()
+        _store_ok[pid] = _rows_unpatched()
+    return _store_ok[pid]
+
+
+def _name_connections(cls):
+    """Tell the executor class's lazy connections which one each is (for stored answers)."""
+    for name in tables.CONNS:
+        conn = cls.__dict__.get(name)
+        if isinstance(conn, LazyConn):
+            conn.__dict__["_name"] = name
 
 
 # test modules the full zygote leaves for the child to import (heavy imports, rarely needed)
@@ -595,6 +663,7 @@ def prerun_class_setup():
                 if tables.usable(cls):
                     try:
                         tables.setup(cls)
+                        _name_connections(cls)
                     except tables.Mismatch:
                         cls.setUpClass()
                 else:
