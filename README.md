@@ -42,6 +42,9 @@ CPU time is part of the score, so the selector avoids running what it can decide
   where each name is read and a record of which classes each test instantiates. For an edited
   entry of a class-level dict, the tests that look that key up (or invoke the callable stored
   under it) are known too; entries read while classes are being built are never narrowed.
+  A dict that is only walked for its keys while modules load (to build a lookup trie from
+  them, say) can still be narrowed when an edit changes a value and leaves the keys alone:
+  what was built from the keys is the same.
   Plain constants of the dialect, tokenizer, parser, generator and expression classes are
   followed more closely: while the maps are built each one sits behind a descriptor that
   records which tests read it from that very definition.

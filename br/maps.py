@@ -39,6 +39,7 @@ class Maps:
         self.meta_reads = set()
         self.outer_reads = None  # names read while modules load (None: not recorded)
         self.outer_recv = None  # name -> classes it is read through while loading, to feed something else
+        self.outer_recv_vals = None  # ... not counting reads that only walk a dict's keys
         self.class_anc = {}  # class name -> names of its ancestors
         self.classlike = {}  # name -> {file: {line: what the class is known to be}}, read off a class object
         self.derives = {}  # name -> names a class-creation hook stores from it
@@ -123,6 +124,7 @@ class Maps:
                 self.meta_reads = set(d.get("meta_reads", ()))
                 self.outer_reads = set(d["outer_reads"]) if "outer_reads" in d else None
                 self.outer_recv = {n: set(r) for n, r in d["outer_recv"].items()} if "outer_recv" in d else None
+                self.outer_recv_vals = {n: set(r) for n, r in d["outer_recv_vals"].items()} if "outer_recv_vals" in d else None
                 self.class_anc = {c: set(a) for c, a in d.get("class_anc", {}).items()}
                 self.classlike = d.get("classlike", {})
                 self.derives = d.get("derives", {})
@@ -350,14 +352,18 @@ class Maps:
                     d["use_by"] = {k: {f: frozenset(items) for f, items in per.items()} for k, per in d.get("use_by", {}).items()}
         return self._memo.get(test_id)
 
-    def feeds_elsewhere(self, name, cls):
+    def feeds_elsewhere(self, name, cls, values_only=False):
         """Is class `cls`'s attribute `name` read while modules load, other than to build the
         attribute of the same name?  Then something stored elsewhere holds (a piece of) its
-        value and readers of `name` do not tell who is affected."""
+        value and readers of `name` do not tell who is affected.  With `values_only` (a dict
+        whose keys stay as they are), reads that only walk the dict's keys do not count."""
         self.reads("")
-        if self.outer_recv is None:
+        table = self.outer_recv
+        if values_only and self.outer_recv_vals is not None:
+            table = self.outer_recv_vals
+        if table is None:
             return True
-        for r in self.outer_recv.get(name, ()):
+        for r in table.get(name, ()):
             if r == "*" or r == cls or cls in self.class_anc.get(r, ()):
                 return True
         return False

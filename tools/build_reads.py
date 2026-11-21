@@ -76,6 +76,21 @@ outer_reads = set()
 # copies are recorded under that name anyway).  What is listed here feeds something stored
 # under ANOTHER name, or is used in some other way while loading.
 outer_recv = {}
+# ... the same, leaving out reads that only walk a dict's keys (`for k in NAME`, `k in NAME`,
+# `NAME.keys()`): what is built from the keys alone does not change when a value is edited
+outer_recv_vals = {}
+KEYS_ONLY = set()  # id() of the expressions in such positions
+
+
+def keys_only_positions(tree):
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.comprehension, ast.For, ast.AsyncFor)):
+            KEYS_ONLY.add(id(node.iter))
+        elif isinstance(node, ast.Compare) and all(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
+            for comparator in node.comparators:
+                KEYS_ONLY.add(id(comparator))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "keys" and not node.args and not node.keywords:
+            KEYS_ONLY.add(id(node.func.value))
 # class name -> names of the classes it inherits from (by name, over the whole package)
 class_bases = {}
 # Function-level lines that read a name off what looks like a class object rather than an
@@ -282,7 +297,10 @@ def outside_functions(node, rel, inside=False, cls=None, target=None, fn=None, o
         outer_reads.add(name)
         if name != target:
             r = recv if recv is not None else "*"
-            outer_recv.setdefault(name, set()).add(r[1:] if r[:1] in "=<" and len(r) > 1 else r)
+            r = r[1:] if r[:1] in "=<" and len(r) > 1 else r
+            outer_recv.setdefault(name, set()).add(r)
+            if id(node) not in KEYS_ONLY:
+                outer_recv_vals.setdefault(name, set()).add(r)
     elif name is not None and classy:
         if fn is not None and fn.kind == "build":
             # what this statement stores was worked out from `name`; when the read is not in a
@@ -297,6 +315,7 @@ def outside_functions(node, rel, inside=False, cls=None, target=None, fn=None, o
 
 
 for rel, tree in trees.items():
+    keys_only_positions(tree)
     outside_functions(tree, rel)
 
 
@@ -329,6 +348,6 @@ for rel, tree in trees.items():
                 elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                     meta_reads.add(sub.value)
 packed = {n: {f: sorted(ls) for f, ls in per.items()} for n, per in reads.items()}
-blob = zlib.compress(pickle.dumps({"bound": sorted(bound), "reads": packed, "meta_reads": sorted(meta_reads & bound), "outer_reads": sorted(outer_reads & bound), "outer_recv": {n: sorted(r) for n, r in outer_recv.items() if n in bound}, "class_anc": {c: sorted(ancestors(c)) for c in class_names}, "classlike": {n: {f: {line: sorted(r) for line, r in ls.items()} for f, ls in per.items()} for n, per in classlike.items() if n in bound}, "derives": {n: sorted(d - {n}) for n, d in derives.items() if n in bound}}, protocol=5), 6)
+blob = zlib.compress(pickle.dumps({"bound": sorted(bound), "reads": packed, "meta_reads": sorted(meta_reads & bound), "outer_reads": sorted(outer_reads & bound), "outer_recv": {n: sorted(r) for n, r in outer_recv.items() if n in bound}, "outer_recv_vals": {n: sorted(outer_recv_vals.get(n, ())) for n in outer_recv if n in bound}, "class_anc": {c: sorted(ancestors(c)) for c in class_names}, "classlike": {n: {f: {line: sorted(r) for line, r in ls.items()} for f, ls in per.items()} for n, per in classlike.items() if n in bound}, "derives": {n: sorted(d - {n}) for n, d in derives.items() if n in bound}}, protocol=5), 6)
 open(os.path.join(out_dir, "reads.pkl"), "wb").write(blob)
 print("names bound at class/module level:", len(bound), "with reads:", len(packed), "read by metaclasses:", len(meta_reads & bound), "read while loading:", len(outer_reads & bound), "bytes", len(blob))

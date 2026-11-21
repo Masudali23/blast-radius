@@ -623,14 +623,15 @@ def _key_users(maps, c, rel, how=None):
     name = c.names[0]
     if name not in maps.dict_names:
         return None
-    if maps.feeds_elsewhere(name, c.cls):
-        return None  # e.g. `TYPE_MAPPING = {..., **STRING_TYPE_MAPPING}`: looked up under another name
     res = analyze.changed_dict_keys(c)
     if res is None:
         return None
     keys, old_keys = res[0], res[1]
     if not keys:
         return None
+    # (an edit that leaves the keys alone cannot reach what was built from the keys only)
+    if maps.feeds_elsewhere(name, c.cls, values_only=keys <= old_keys and res[2]):
+        return None  # e.g. `TYPE_MAPPING = {..., **STRING_TYPE_MAPPING}`: looked up under another name
     known = set(maps.dict_all_keys.get(name, ()))
     cls_keys = ["%s:%d" % (rel, line) for line in c.cls_lines]
     for k in keys:
