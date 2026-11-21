@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import sys
+import threading
 import time
 
 APP = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +67,9 @@ MEMO = os.environ.get("BR_MEMO", "1") == "1"
 # ... and entries whose hand-over changed are run for real while their estimated CPU stays
 # under this share of the test's recorded time
 MEMO_BUDGET = float(os.environ.get("BR_MEMO_BUDGET", "0.3"))
+# reference policy: run every candidate, keep nothing on an estimate (see verify_all)
+EXACT = os.environ.get("BR_EXACT", "0") == "1"
+EXACT_CAP = float(os.environ.get("BR_EXACT_CAP", "15"))
 # stop the cheap candidates at the first failure and weigh the rest: run or leave selected
 STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -121,6 +125,7 @@ class Selector:
             cal = self.maps.cpu_ms[idx] if idx is not None and idx < len(self.maps.cpu_ms) else None
             self.cpu[n] = (cal * CAL) if cal is not None else self.ms[n] * 0.85
         self.lane = None
+        self.lane2 = None
         self._related = {}
         self.debug = {}
 
@@ -137,10 +142,28 @@ class Selector:
             mask ^= low
         return out
 
+    def cheapest_first(self, patches):
+        """Order commits by the estimated CPU of checking them, so that if time runs out it is
+        the most expensive ones that fall back to being selected unseen."""
+        cost = {}
+        for path in patches:
+            try:
+                with open(path, "rb") as fh:
+                    plan = planner.make_plan(os.path.basename(path), fh.read(), BASE, self.maps)
+                cost[path] = 1e12 if plan.unknown else sum(min(self.cpu[n], EXACT_CAP * 1000) for n in self.numbers(plan.cand))
+            except Exception:
+                cost[path] = 1e12
+        return sorted(patches, key=lambda p: (cost[p], p))
+
     def get_lane(self):
         if self.lane is None:
             self.lane = Lane(BASE, TMP, APP, log)
         return self.lane
+
+    def get_second_lane(self):
+        if self.lane2 is None:
+            self.lane2 = Lane(BASE, TMP + "_2", APP, log)
+        return self.lane2
 
     # ------------------------------------------------------------------ one commit
     def decide(self, commit, data):
@@ -171,9 +194,84 @@ class Selector:
         if time.monotonic() > self.stop_at:
             dbg["how"] = "out-of-time"
             return sorted(cand | sure)
-        selected, how = self.check(plan, cand, dbg)
+        selected, how = self.verify_all(plan, cand, dbg) if EXACT else self.check(plan, cand, dbg)
         dbg["how"] = how
         return sorted(set(selected) | sure)
+
+    def verify_all(self, plan, cand, dbg):
+        """The plain policy, for reference: run every candidate and select exactly what fails.
+
+        Nothing is left selected on an estimate and nothing is let go on a sample.  Tests whose
+        run would take longer than EXACT_CAP seconds are settled by their unchanged hand-over
+        when that applies and stay selected otherwise.  Two workers run side by side."""
+        items, keep = [], []
+        for n in sorted(cand):
+            v, share = self.plain_variant(plan, n)
+            est = self.cpu[n] * share
+            if est > EXACT_CAP * 1000:
+                sv = self.short_variant(plan, n)
+                if sv is None:
+                    keep.append(n)
+                    continue
+                v, est = sv
+            items.append((n, v, est))
+        halves, loads = [[], []], [0.0, 0.0]
+        for it in sorted(items, key=lambda it: -it[2]):
+            i = 0 if loads[0] <= loads[1] else 1
+            halves[i].append(it)
+            loads[i] += it[2]
+        halves = [sorted(h, key=lambda it: it[0]) for h in halves if h]
+        lanes = [self.get_lane(), self.get_second_lane()][: len(halves)]
+        mode = lanes[0].fresh_mode(plan.files) if (lanes and plan.fresh) else "full"
+        outcomes = [None] * len(halves)
+
+        def work(i):
+            lane, part = lanes[i], halves[i]
+            m = lane.fresh_mode(plan.files) if plan.fresh else "full"
+            jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in part]
+            wait = max(10.0, self.stop_at + 30.0 - time.monotonic())
+            cpu = max(30.0, 5.0 + 2.5 * sum(e for _, _, e in part) / 1000.0)
+            lane.ensure(m)
+            try:
+                for rel, content in plan.files.items():
+                    lane.overlay.set_file(rel, content)
+                full = m == "full"
+                results, err = lane.run(m, jobs, swap=plan.swaps if full else (), deadline=wait, cpu_budget=cpu)
+                if err and full and not results:
+                    lane.overlay.restore()
+                    m = lane.fresh_mode(plan.files)
+                    lane.ensure(m)
+                    for rel, content in plan.files.items():
+                        lane.overlay.set_file(rel, content)
+                    results, err = lane.run(m, jobs, deadline=wait, cpu_budget=cpu)
+                outcomes[i] = results
+            except Exception as e:  # this half could not be checked: it stays selected
+                log("verify_all: %r" % (e,))
+                outcomes[i] = {}
+            finally:
+                lane.overlay.restore()
+
+        threads = [threading.Thread(target=work, args=(i,)) for i in range(len(halves))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        selected, ran, cpu_ms = list(keep), 0, 0
+        for part, results in zip(halves, outcomes):
+            for i, (n, v, e) in enumerate(part):
+                r = (results or {}).get(i)
+                if r is None or r[0] in ("F", "U"):
+                    selected.append(n)
+                if r is not None:
+                    ran += 1
+                    cpu_ms += r[1]
+                    if DEBUG:
+                        dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], -1))
+        dbg["mode"] = mode
+        dbg["ran"] = ran
+        dbg["cpu_ms"] = cpu_ms
+        dbg["unverified"] = keep
+        return selected, "verified"
 
     def unimportable(self, plan):
         """Import the patched modules on their own in a fresh child; return those that fail."""
@@ -698,7 +796,9 @@ class Selector:
         # the batch has 3 minutes (4.5 in the final, with about 1.5x the commits): stop running
         # tests well before that and select candidates unseen for whatever is left
         hard = 180.0 + 90.0 * min(1.0, max(0.0, (len(patches) - 40) / 20.0))
-        self.stop_at = T0 + float(os.environ.get("BR_SOFT", str(0.55 * hard)))
+        self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
+        if EXACT:
+            patches = self.cheapest_first(patches)
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -714,8 +814,9 @@ class Selector:
             self.debug[commit]["selected"] = len(selected)
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
-        if self.lane is not None:
-            self.lane.close()
+        for lane in (self.lane, self.lane2):
+            if lane is not None:
+                lane.close()
         if DEBUG:
             with open(DEBUG, "w") as fh:
                 json.dump(self.debug, fh, indent=1)
