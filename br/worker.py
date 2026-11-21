@@ -23,7 +23,7 @@ import time
 import types
 import unittest
 
-from br import infect, memo, tables, variants
+from br import answers, infect, memo, tables, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
@@ -741,11 +741,17 @@ def _limit_duckdb_threads():
     original = duckdb.connect
 
     def connect(*args, **kwargs):
+        plain = not args and not kwargs  # an in-memory database with default settings
         config = dict(kwargs.get("config") or {})
         config.setdefault("threads", 1)
         kwargs["config"] = config
         if PRERUN["on"] or LAZY["on"]:
             return LazyConn(original, args, kwargs)
+        if plain:
+            store = answers.load()
+            if store is not None:
+                # opened only if a test asks something the store has no answer to (br/answers.py)
+                return answers.StoreConn(original, args, kwargs, store)
         return original(*args, **kwargs)
 
     duckdb.connect = connect
@@ -849,6 +855,9 @@ def main():
         except Exception:
             pass
     _limit_duckdb_threads()
+    # the stores are read once, before anything is forked
+    answers.load()
+    tables.load()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     serve("bare", overlay, base, in_fd, out_fd, spares)
 

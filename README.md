@@ -65,6 +65,18 @@ CPU time is part of the score, so the selector avoids running what it can decide
   DuckDB returns for every SQL text those tests send it: over the same fixture files the same
   text always gets the same answer, so a test that sends an unchanged text is handed the stored
   frame, and any other text goes to DuckDB.
+- **Optimizer queries** (`br/answers.py`): many optimizer tests ask DuckDB for the rows of a
+  query before and after sqlglot rewrote it. What DuckDB answers depends on the statements run
+  on that connection so far and on the text asked, not on sqlglot. The image build runs those
+  tests once (`tools/build_answers.py`) and stores, per state of a connection and per query
+  text, what came back; a text is kept only if a new connection given the same statements
+  answers the same again from an empty directory. At run time such a connection is opened only
+  when a test asks something that is not stored, so a rewritten query that differs from every
+  text seen at the pinned commit is always run by DuckDB itself. Statements that could depend
+  on a file, the clock, chance or a setting are never stored.
+- **Edited fixtures**: a sliced test that the patch reaches only through edited fixture files
+  runs the entries of those files that differ from the pinned ones, and none of the entries of
+  its other fixture files.
 - **Swapped comparison operators** (`br/relations.py`): `a is b` and `a == b` give the same
   answer unless an object equals something it is not; `a < b` and `a <= b` unless the two are
   equal. While the maps are built, every such comparison in sqlglot is evaluated both ways each

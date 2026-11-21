@@ -24,8 +24,14 @@ COPY maps /app/maps
 COPY tools/build_tables.py /app/tools/build_tables.py
 RUN python /app/tools/build_tables.py /app/repo /app/tables.pkl || true
 
+# What DuckDB answers to the optimizer tests' queries at the pinned commit (br/answers.py).
+# Optional: without the file every query goes to DuckDB.
+COPY tools/build_answers.py /app/tools/build_answers.py
+RUN python /app/tools/build_answers.py /app/repo /app/answers.pkl || true
+
 # Byte-compile once: the run-time disk is read-only.
 RUN python -m compileall -q /app/repo/sqlglot /app/repo/tests /app/repo/sqlglotc /app/br /app/selector.py \
+    && (python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" || true) \
     && chmod -R a+rX /app
 
 WORKDIR /app
