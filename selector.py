@@ -59,6 +59,10 @@ MIN_RELATED = int(os.environ.get("BR_MIN_RELATED", "5"))
 # the slow test weighs in the selection
 RELATED_RUN = float(os.environ.get("BR_RELATED_RUN", "0.5"))
 MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
+# seconds to wait for the stand-alone import check of a patched module
+IMPORT_WAIT = 45.0
+# stop the cheap candidates at the first failure and weigh the rest: run or leave selected
+STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
 T0 = time.monotonic()
@@ -147,6 +151,15 @@ class Selector:
         sure = set(self.numbers(plan.sure))
         cand -= sure
         dbg["ncand"] = len(cand)
+        if plan.imports:
+            # candidates were narrowed on the understanding that the patched module still
+            # imports; if it does not, every test that imports it fails
+            late = time.monotonic() > self.stop_at
+            bad = None if late else self.unimportable(plan)
+            if late or bad:
+                dbg["how"] = "out-of-time" if late else "import-error"
+                dbg["unimportable"] = bad
+                return sorted(cand | sure | set(self.numbers(plan.wide)))
         if not cand:
             dbg["how"] = "none" if not sure else "sure"
             return sorted(sure)
@@ -156,6 +169,26 @@ class Selector:
         selected, how = self.check(plan, cand, dbg)
         dbg["how"] = how
         return sorted(set(selected) | sure)
+
+    def unimportable(self, plan):
+        """Import the patched modules on their own in a fresh child; return those that fail."""
+        lane = self.get_lane()
+        mode = lane.fresh_mode(plan.files)
+        lane.ensure(mode)
+        names = []
+        for rel in plan.imports:
+            name = rel[:-3].replace("/", ".")
+            names.append(name[:-9] if name.endswith(".__init__") else name)
+        try:
+            for rel, content in plan.files.items():
+                lane.overlay.set_file(rel, content)
+            _, err = lane.run(mode, [], deadline=IMPORT_WAIT, imports=names)
+            bad = list(lane.unimportable)
+            if err:
+                bad.append(err)  # the child died or could not start: treat as not importable
+        finally:
+            lane.overlay.restore()
+        return bad
 
     def variant_for(self, plan, n):
         """How to run test n for this plan: (variant or None, share of its recorded time)."""
@@ -314,14 +347,37 @@ class Selector:
         try:
             install()
             failed = []
+            kept = []  # cheap candidates left selected without being run
             if cheap:
-                failed, unseen = run(cheap, False)
-                failed = failed + unseen
+                failed, rest = run(cheap, STOP_FIRST)
+                if rest and (st["cut"] or not failed or not STOP_FIRST):
+                    failed = failed + rest  # could not be checked
+                elif rest:
+                    # One test fails, so the commit pays for a worker whatever the others do.
+                    # From here a test is only run when that costs less CPU than the seconds
+                    # it would add to the selection if left in unchecked.
+                    by = {it[0]: it for it in cheap}
+                    kept = list(rest)
+                    again = []
+                    current = cost_of(failed + kept)
+                    for n in sorted(rest, key=lambda n: -ms[n])[:12]:
+                        without = cost_of(failed + [m for m in kept if m != n])
+                        if by[n][2] < P_PASS_FAILED * (current - without):
+                            again.append(by[n])
+                            kept.remove(n)
+                            current = without
+                    if kept and sum(by[n][2] for n in kept) < P_PASS_FAILED * (current - cost_of(failed)):
+                        again.extend(by[n] for n in kept)
+                        kept = []
+                    if again:
+                        again.sort(key=lambda it: it[0])
+                        f2, u2 = run(again, False)
+                        failed = failed + f2 + u2
             later = costly + deferred
             if later:
                 # for each remaining test: is running it cheaper than just selecting it?
                 p_pass = P_PASS_FAILED if failed else P_PASS_CLEAN
-                base = list(failed)
+                base = failed + kept
                 run_list, keep = [], []
                 for item in sorted(later, key=lambda it: it[2]):
                     n, v, est = item
@@ -334,6 +390,7 @@ class Selector:
                     run_list.sort(key=lambda it: it[0])
                     failed2, unseen2 = run(run_list, False)
                     failed = failed + failed2 + unseen2
+                keep = kept + keep
                 if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
                     probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
@@ -358,7 +415,7 @@ class Selector:
                     # selected unless the tests closest to it (same test file, or reading the
                     # same fixture file) were run and all passed, and the breakage is small.
                     slow = {it[0] for it in deferred}
-                    by_n = {it[0]: it for it in later}
+                    by_n = {it[0]: it for it in cheap + later}
                     maybe = []
                     if len(failed) < MANY_FAILED:
                         for n in sorted((n for n in keep if n in slow), key=lambda n: -ms[n]):
@@ -393,7 +450,8 @@ class Selector:
                 if failed:
                     unverified = [n for n in keep if n not in failed]
             else:
-                selected = failed
+                selected = failed + kept
+                unverified = kept
             if how is None:
                 how = "fail" if failed else "clean"
         finally:

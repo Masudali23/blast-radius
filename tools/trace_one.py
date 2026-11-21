@@ -265,6 +265,60 @@ def main():
                 ns[attr] = t
                 tracked_dicts.add(attr)
 
+    # --- which tests read a class-level constant, and from which class's definition?
+    # Plain constants of the dialect / tokenizer / parser / generator / expression families are
+    # replaced (once their class exists) by a descriptor that notes every read.  A read that
+    # resolves to class C's own definition is recorded under C, whatever subclass it went through.
+    import enum
+
+    attr_reads = set()  # "class\tNAME" read at run time
+    attr_derived = set()  # "class\tNAME" read by function code while classes are being built
+    attr_tracked = set()
+    FAMILY_BASES = {
+        ("sqlglot.dialects.dialect", "Dialect"),
+        ("sqlglot.tokens", "Tokenizer"),
+        ("sqlglot.parser", "Parser"),
+        ("sqlglot.generator", "Generator"),
+        ("sqlglot.expressions.core", "Expr"),
+    }
+    PLAIN = (bool, int, float, str, bytes, tuple, frozenset, set, list, type(None))
+
+    class Rec:
+        __slots__ = ("v", "k")
+
+        def __init__(self, v, k):
+            self.v = v
+            self.k = k
+
+        def __get__(self, obj, objtype=None):
+            if importing[0]:
+                if sys._getframe(1).f_code.co_flags & 1:
+                    attr_derived.add(self.k)
+            else:
+                attr_reads.add(self.k)
+            return self.v
+
+    def in_family(cls):
+        if issubclass(cls, enum.Enum):
+            return False
+        for b in cls.__mro__:
+            if (getattr(b, "__module__", None), b.__name__) in FAMILY_BASES:
+                return True
+        return False
+
+    def wrap_attrs(cls, cls_key):
+        if not in_family(cls):
+            return
+        for attr, value in list(cls.__dict__.items()):
+            if attr.startswith("__") or attr in ("_abc_impl",):
+                continue
+            if type(value) in PLAIN or isinstance(value, enum.Enum):
+                try:
+                    type.__setattr__(cls, attr, Rec(value, "%s\t%s" % (cls_key, attr)))
+                    attr_tracked.add("%s\t%s" % (cls_key, attr))
+                except Exception:
+                    pass
+
     def real_metaclass(bases, kw):
         meta = kw.get("metaclass")
         if meta is None:
@@ -300,6 +354,11 @@ def main():
             cls = orig_build(func, name, *bases, **kw)
         finally:
             importing[0] -= 1
+        if ours:
+            try:
+                wrap_attrs(cls, "%s:%d" % (code.co_filename[len(prefix):], code.co_firstlineno))
+            except Exception:
+                pass
         try:
             code = func.__code__
             if code.co_filename.startswith(prefix):
@@ -411,6 +470,9 @@ def main():
                 "tracked": tracked,
                 "dict_keys": sorted("%s\t%s" % kv for kv in dict_keys),
                 "dict_calls": sorted("%s\t%s" % kv for kv in dict_calls),
+                "attr_reads": sorted(attr_reads),
+                "attr_derived": sorted(attr_derived),
+                "attr_tracked": sorted(attr_tracked),
                 "dict_callable": sorted("%s\t%s" % kv for kv in callable_keys),
                 "dict_derived": sorted(derived),
                 "ancestry": ancestry,

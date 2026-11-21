@@ -10,6 +10,10 @@ from . import analyze, infect, patch
 # "family" (instances of any class of the same dialect)
 REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 
+# an edited literal default value of a function is in play only for tests that call the function
+REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
+# narrow an edited class-level constant to the tests that read it from that class
+REFINE_ATTRS = os.environ.get("BR_REFINE_ATTRS", "1") == "1"
 # narrow an edited class-level dict entry to the tests that look that entry up
 REFINE_KEYS = os.environ.get("BR_REFINE_KEYS", "1") == "1"
 # use the index of real reads of a name (rather than any textual mention) to find its users
@@ -23,7 +27,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide")
 
     def __init__(self, commit):
         self.commit = commit
@@ -40,6 +44,10 @@ class Plan:
         # why each test is a candidate: (kind, path, lo, hi, mask) with kind in func / mod / data
         self.parts = []
         self.probe = []  # python files whose single changed expression can be evaluated both ways
+        # modules whose candidates were narrowed although the changed statement could raise
+        # while importing; if one does not import any more, every test in `wide` is in play
+        self.imports = []
+        self.wide = 0
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -224,6 +232,24 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 if not mask and not maps.known(rel):
                     # imported, but nothing in it was ever traced (an empty __init__.py, say)
                     mask = maps.imports.get(rel, 0)
+            everyone = mask
+            if mask and c.calls and REFINE_DEFAULTS:
+                flo, fhi = c.calls
+                if not maps.ran_at_import(rel, flo, fhi):
+                    # nothing called the function while modules were loading, so the default is
+                    # first used by a test that calls it
+                    callers = maps.func(rel, flo, fhi)
+                    plan.notes.append("default-narrowed %s:%d: %d -> %d" % (rel, flo, bin(mask).count("1"), bin(callers).count("1")))
+                    plan.add("mod", rel, lo, hi, callers)
+                    continue
+            if mask and c.names and not c.coarse and c.cls and len(c.names) == 1 and REFINE_ATTRS:
+                readers = maps.attr_readers(["%s:%d" % (rel, line) for line in c.cls_lines], c.names[0])
+                if readers is not None:
+                    # every read of this constant from this class's definition was observed
+                    plan.notes.append("attr-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & readers).count("1")))
+                    plan.add("mod", rel, lo, hi, mask & readers)
+                    _import_guard(plan, rel, c, everyone, mask & readers)
+                    continue
             if mask and c.names and not c.coarse and opts.get("refine_names", True):
                 mask &= _users(c.names, base, maps, rel, c.lines)
                 if mask and c.cls and REFINE_CLASS != "off":
@@ -237,6 +263,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                         plan.notes.append("key-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & ku).count("1")))
                         mask &= ku
             plan.add("mod", rel, lo, hi, mask)
+            _import_guard(plan, rel, c, everyone, mask)
     if hot:
         plan.swaps.append(rel)
         if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
@@ -244,6 +271,16 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 plan.probe.append(rel)
     else:
         plan.fresh = True
+
+
+def _import_guard(plan, rel, change, everyone, narrowed):
+    """Narrowing assumes the module still imports.  Unless the edit plainly cannot raise, have
+    the import checked; should it fail, everyone who runs that statement is in play."""
+    if narrowed == everyone or analyze.harmless_at_import(change):
+        return
+    if rel not in plan.imports:
+        plan.imports.append(rel)
+    plan.wide |= everyone
 
 
 FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")

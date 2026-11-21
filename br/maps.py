@@ -33,6 +33,7 @@ class Maps:
         self.sliced = idx.get("sliced", {})  # test id -> blob with per-fixture-entry coverage
         self._slices = {}
         self._reads = None
+        self.meta_reads = set()
         self._cache = {}
         self.all = (1 << len(self.ids)) - 1
 
@@ -109,6 +110,7 @@ class Maps:
                 with open(path, "rb") as fh:
                     d = pickle.loads(zlib.decompress(fh.read()))
                 self._reads = (set(d["bound"]), d["reads"])
+                self.meta_reads = set(d.get("meta_reads", ()))
             else:
                 self._reads = (set(), {})
         bound, table = self._reads
@@ -126,6 +128,9 @@ class Maps:
             if "users" not in d:
                 d = {"users": d, "calls": {}, "callable": []}
             d["callable"] = set(d["callable"])
+            d["attr_tracked"] = set(d.get("attr_tracked", ()))
+            d["attr_derived"] = set(d.get("attr_derived", ()))
+            d.setdefault("attr_readers", {})
             self._dict_users = d
         return self._dict_users
 
@@ -153,3 +158,22 @@ class Maps:
             if want & set(self.ancestry.get(owner, (owner,))):
                 return True
         return False
+
+    def attr_readers(self, cls_keys, name):
+        """Tests that read constant `name` from the definition in one of `cls_keys`.
+
+        None when those reads were not observed, or when something was derived from the value
+        while classes were being built (by a metaclass, or by any function reading it then)."""
+        d = self._dicts()
+        self.reads("")  # loads meta_reads
+        if name in self.meta_reads:
+            return None
+        mask, seen = 0, False
+        for ck in cls_keys:
+            k = "%s\t%s" % (ck, name)
+            if k in d["attr_derived"]:
+                return None
+            if k in d["attr_tracked"]:
+                seen = True
+                mask |= d["attr_readers"].get(k, 0)
+        return mask if seen else None

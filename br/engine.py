@@ -175,6 +175,8 @@ class Lane:
                 results[int(parts[1])] = (parts[2].decode(), int(parts[3]), int(parts[4]), int(parts[5]))
             elif line.startswith(b"I "):
                 self.probed = True
+            elif line.startswith(b"M "):
+                self.unimportable.append(line[2:].decode("utf-8", "replace").strip())
             elif line.startswith(b"B "):
                 self.cut = line[2:].decode().strip()  # the child stopped early (budget / timeout)
             elif line.startswith(b"S"):
@@ -187,7 +189,7 @@ class Lane:
                     error = "child exit status %d" % status
                 return results, error, False
 
-    def run(self, mode, tests, swap=(), stop_on_fail=False, deadline=60.0, probe=(), stages=False, cpu_budget=None):
+    def run(self, mode, tests, swap=(), stop_on_fail=False, deadline=60.0, probe=(), stages=False, cpu_budget=None, imports=()):
         """Run tests [(test_id, limit_seconds[, variant])] in a fresh child of the `mode` worker.
 
         Returns (results, error): results maps index -> (outcome, cpu_ms, evals, differ) for the
@@ -201,7 +203,8 @@ class Lane:
         self._open = False
         self._deadline = deadline
         self.cut = None
-        self._send(p, {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget})
+        self.unimportable = []
+        self._send(p, {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget, "imports": list(imports)})
         results, error, alive = self._collect(p, mode)
         self._open = alive
         return results, error

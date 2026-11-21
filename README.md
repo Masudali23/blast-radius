@@ -42,9 +42,19 @@ CPU time is part of the score, so the selector avoids running what it can decide
   where each name is read and a record of which classes each test instantiates. For an edited
   entry of a class-level dict, the tests that look that key up (or invoke the callable stored
   under it) are known too; entries read while classes are being built are never narrowed.
-- **Cost-based staging**: cheap candidates run first; a slower candidate is run only when that is
-  expected to cost less than simply selecting it. When a change reaches so many tests that
-  running them would cost more than selecting them, they are selected unseen.
+  Plain constants of the dialect, tokenizer, parser, generator and expression classes are
+  followed more closely: while the maps are built each one sits behind a descriptor that
+  records which tests read it from that very definition.
+- **Default values**: a different literal default in a function signature can only be seen by a
+  call of that function, so the candidates are the tests that enter it (unless something called
+  it while modules were still loading).
+- **Import check**: narrowing a module or class level edit assumes the module still imports.
+  Unless the edit plainly cannot raise (a constant swapped inside a literal), the patched module
+  is first imported on its own; if that fails, every test that imports it is selected.
+- **Cost-based staging**: cheap candidates run first, up to the first failure. From then on the
+  commit pays for a worker anyway, so a remaining candidate is run only when that is expected
+  to cost less than the seconds it adds if simply left selected. When a change reaches so many
+  tests that running them would cost more than selecting them, they are selected unseen.
 - **Slow tests**: a test too slow to run in full is selected, unless everything else passes
   (or, when something fails, the tests closest to it — same test file or same fixture — all
   pass) and a sample of its own fixture entries passes too.
@@ -58,7 +68,7 @@ changed expression side by side while tests run.
 
 - per source file: line → tests executing it (call time and import time separately),
 - files each test opens, modules it imports, classes it instantiates,
-- class-level dict entries each test looks up or invokes,
+- class-level dict entries each test looks up or invokes, class-level constants each test reads,
 - where each class/module level name is read,
 - per fixture entry coverage for fixture-driven tests,
 - the lines that already run while the workers warm up, and each test's measured cost.

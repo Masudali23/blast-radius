@@ -29,6 +29,9 @@ usage_dir = sys.argv[7] if len(sys.argv) > 7 else None
 class_users = {}  # "file:line" of a class -> tests that instantiate it or a subclass
 tracked = set()  # classes whose instantiation we can observe
 dict_users = {}  # "NAME\tkey" -> tests that look that key up in a class-level dict called NAME
+attr_readers = {}  # "class\tNAME" -> tests reading that class-level constant from that class
+attr_derived = set()  # "class\tNAME" read by function code while classes are being built
+attr_tracked = set()  # constants whose reads were observed
 dict_calls = {}  # "NAME\tkey" -> tests that invoke the callable stored under that key
 dict_callable = set()  # "NAME\tkey" entries holding a callable
 dict_derived = set()  # "NAME\tkey" read (or called) by function code while classes are being built
@@ -63,6 +66,10 @@ for i, t in enumerate(tests):
         d = u
     for k in d.get("dict_keys", ()):
         dict_users[k] = dict_users.get(k, 0) | bit
+    for k in d.get("attr_reads", ()):
+        attr_readers[k] = attr_readers.get(k, 0) | bit
+    attr_derived.update(d.get("attr_derived", ()))
+    attr_tracked.update(d.get("attr_tracked", ()))
     for k in d.get("dict_calls", ()):
         dict_calls[k] = dict_calls.get(k, 0) | bit
     dict_callable.update(d.get("dict_callable", ()))
@@ -120,7 +127,7 @@ index = {
     "dict_all_keys": json.load(open(import_trace)).get("__dict_keys__", {}),
     "import_files": json.load(open(import_trace)).get("__files__", []),
 }
-dblob = zlib.compress(pickle.dumps({"users": dict_users, "calls": dict_calls, "callable": sorted(dict_callable)}, protocol=5), 6)
+dblob = zlib.compress(pickle.dumps({"users": dict_users, "calls": dict_calls, "callable": sorted(dict_callable), "attr_readers": attr_readers, "attr_derived": sorted(attr_derived), "attr_tracked": sorted(attr_tracked)}, protocol=5), 6)
 open(os.path.join(out_dir, "dictkeys.pkl"), "wb").write(dblob)
 total += len(dblob)
 blob = zlib.compress(pickle.dumps(index, protocol=5), 6)

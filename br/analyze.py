@@ -21,10 +21,13 @@ class Change:
     cls:    name of the enclosing class for class-body changes (or None)
     """
 
-    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what", "stmts")
+    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what", "stmts", "calls")
 
     def __init__(self, level, lines, coarse=False, names=None, scope_span=None, cls=None, what="", stmts=None):
         self.stmts = stmts  # (old statement, new statement) for a module / class level change
+        # span of the function whose literal default value is all that changed (else None):
+        # such a change is only ever seen by a call of that function
+        self.calls = None
         self.level = level
         self.lines = lines
         self.coarse = coarse
@@ -160,8 +163,13 @@ class Differ:
             if o.name != n.name:
                 self._report(ctx, what="def-name")
             hctx = _Ctx(scope, o, header=True, cls=cls)
+            before = len(self.changes)
             for f in ("decorator_list", "args", "returns", "type_params"):
                 self.generic(getattr(o, f, None), getattr(n, f, None), hctx)
+            if len(self.changes) > before and not isinstance(scope, FUNC_SCOPES) and o.name == n.name and _defaults_only(o, n):
+                for ch in self.changes[before:]:
+                    if ch.level == "mod" and not ch.coarse:
+                        ch.calls = _span(o)
             self.stmts(_strip_doc(o.body), _strip_doc(n.body), o, None)
             return
         if isinstance(o, ast.ClassDef):
@@ -281,6 +289,98 @@ class Differ:
             if key not in self._seen:
                 self._seen.add(key)
                 self.changes.append(ch)
+
+
+def _number(e):
+    return isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)) and isinstance(e.operand, ast.Constant) and type(e.operand.value) in (int, float)
+
+
+def _hashable(e):
+    return isinstance(e, ast.Constant) or _number(e) or (isinstance(e, ast.Tuple) and all(_hashable(x) for x in e.elts))
+
+
+def _literal(e):
+    """An expression whose evaluation cannot fail or do anything: constants and displays of them."""
+    if isinstance(e, ast.Constant) or _number(e):
+        return True
+    if isinstance(e, (ast.Tuple, ast.List)):
+        return all(_literal(x) for x in e.elts)
+    if isinstance(e, ast.Set):
+        return all(_hashable(x) for x in e.elts)
+    if isinstance(e, ast.Dict):
+        return all(k is not None and _hashable(k) for k in e.keys) and all(_literal(v) for v in e.values)
+    return False
+
+
+def _same_but_constants(o, n, display):
+    """Are two expressions the same apart from constants that sit directly in displays?
+
+    A constant held by a dict / tuple / list / set display is only stored, so swapping it for
+    another constant cannot make the statement raise.  A constant handed to a call, an operator
+    or a subscript can."""
+    if isinstance(o, ast.Constant) and isinstance(n, ast.Constant):
+        return (o.value == n.value and type(o.value) is type(n.value)) or display
+    if _number(o) and _number(n):
+        return ast.dump(o) == ast.dump(n) or display
+    if type(o) is not type(n):
+        return False
+    if isinstance(o, (ast.Tuple, ast.List, ast.Set)):
+        return len(o.elts) == len(n.elts) and all(_same_but_constants(a, b, display) for a, b in zip(o.elts, n.elts))
+    if isinstance(o, ast.Dict):
+        if len(o.keys) != len(n.keys):
+            return False
+        for a, b in zip(o.keys, n.keys):
+            if (a is None) != (b is None) or (a is not None and not _same_but_constants(a, b, display)):
+                return False
+        return all(_same_but_constants(a, b, display and k is not None) for a, b, k in zip(o.values, n.values, o.keys))
+    return ast.dump(o) == ast.dump(n)
+
+
+def harmless_at_import(change):
+    """True when a module / class level change cannot make its statement raise while importing:
+    a plain assignment whose value differs only in constants stored by displays."""
+    if not change.stmts:
+        return False
+    o, n = change.stmts
+    if change.calls:
+        return True  # literal default values (see _defaults_only)
+    if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
+        return False
+    if o.value is None or n.value is None:
+        return False
+    targets_o = o.targets if isinstance(o, ast.Assign) else [o.target]
+    targets_n = n.targets if isinstance(n, ast.Assign) else [n.target]
+    if [ast.dump(t) for t in targets_o] != [ast.dump(t) for t in targets_n] or not all(isinstance(t, ast.Name) for t in targets_o):
+        return False
+    if isinstance(o, ast.AnnAssign) and ast.dump(o.annotation) != ast.dump(n.annotation):
+        return False
+    return _same_but_constants(o.value, n.value, True)
+
+
+def _defaults_only(o, n):
+    """Do two versions of a def differ, outside the body, only in literal default values?"""
+    for f in ("decorator_list", "returns", "type_params"):
+        if ast.dump(ast.Tuple(elts=list(getattr(o, f, None) or []) if isinstance(getattr(o, f, None), list) else [getattr(o, f, None) or ast.Constant(value=None)], ctx=ast.Load())) != ast.dump(
+            ast.Tuple(elts=list(getattr(n, f, None) or []) if isinstance(getattr(n, f, None), list) else [getattr(n, f, None) or ast.Constant(value=None)], ctx=ast.Load())
+        ):
+            return False
+    oa, na = o.args, n.args
+    if len(oa.defaults) != len(na.defaults) or len(oa.kw_defaults) != len(na.kw_defaults):
+        return False
+    for f in ("posonlyargs", "args", "vararg", "kwonlyargs", "kwarg"):
+        ov, nv = getattr(oa, f), getattr(na, f)
+        if ast.dump(ast.Tuple(elts=ov if isinstance(ov, list) else [ov] if ov else [], ctx=ast.Load())) != ast.dump(ast.Tuple(elts=nv if isinstance(nv, list) else [nv] if nv else [], ctx=ast.Load())):
+            return False
+    differ = 0
+    for a, b in list(zip(oa.defaults, na.defaults)) + list(zip(oa.kw_defaults, na.kw_defaults)):
+        if (a is None) != (b is None):
+            return False
+        if a is None or ast.dump(a) == ast.dump(b):
+            continue
+        if not (_literal(a) and _literal(b)):
+            return False
+        differ += 1
+    return differ > 0
 
 
 def _no_iter(g, i):

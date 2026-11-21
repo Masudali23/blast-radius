@@ -26,6 +26,7 @@ from br import infect, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
+IMPORT_LIMIT = 30.0  # seconds allowed for importing one patched module on its own
 
 
 class TestTimeout(KeyboardInterrupt):
@@ -398,6 +399,16 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
     signal.signal(signal.SIGPROF, _on_alarm)
     variants.SL.base_fixtures = os.path.join(base, "tests", "fixtures")
 
+    for name in job.get("imports", ()):
+        # does the patched module still import?  (asked before its candidates were narrowed)
+        arm(IMPORT_LIMIT)
+        try:
+            importlib.import_module(name)
+        except BaseException as e:
+            runner.emit("M %s %s" % (name, type(e).__name__))
+        finally:
+            disarm()
+
     if mode == "full":
         for rel in job.get("swap", ()):
             path = os.path.join(overlay, rel)
@@ -448,11 +459,11 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
             finally:
                 disarm()
             runner.emit("T %d %s %d %d %d" % (index, outcome, int((time.process_time() - t0) * 1000), infect.STATS[0] - e0, infect.STATS[1] - i0))
-            if outcome == "F" and stop_on_fail:
-                break
             if timed_out:
                 # a change that makes one test hang usually makes many hang: stop paying for it
                 runner.emit("B timeout")
+                break
+            if outcome == "F" and stop_on_fail:
                 break
         if not job.get("stages"):
             break
