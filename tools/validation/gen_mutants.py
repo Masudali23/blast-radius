@@ -1,7 +1,7 @@
 """Generate synthetic patches against the pinned sqlglot checkout for local validation.
 
 Usage: gen_mutants.py <repo_root> <out_dir> <count> <seed> [kinds...]
-Kinds: code comment fixture multi exotic testedit
+Kinds: code comment fixture multi exotic testedit classlevel structure
 These are only used to measure the selector locally; nothing derived from them ships.
 """
 import ast
@@ -319,6 +319,98 @@ def mutate_testedit():
     raise RuntimeError
 
 
+def _line_edit(rel, lineno, new_line):
+    """The file with one line replaced (new_line=None: removed)."""
+    lines = read(rel).splitlines(keepends=True)
+    lines[lineno - 1 : lineno] = [] if new_line is None else [new_line]
+    return "".join(lines)
+
+
+def mutate_structure():
+    """Edits that change what is defined, not a value: a kind the samples do not show."""
+    how = rng.choice(["delimport", "rename", "deldecorator", "swapbranch", "except", "delentry", "argswap", "delbase", "early"])
+    for _ in range(200):
+        rel = rng.choice(SRC)
+        src = read(rel)
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        lines = src.splitlines(keepends=True)
+        b = src.encode("utf-8")
+        offs = offsets(src)
+        new = None
+        if how == "delimport":
+            cands = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) and n.lineno == n.end_lineno and not (isinstance(n, ast.ImportFrom) and n.module == "__future__")]
+            if cands:
+                new = _line_edit(rel, rng.choice(cands).lineno, None)
+        elif how == "rename":
+            cands = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and not n.name.startswith("__")]
+            if cands:
+                n = rng.choice(cands)
+                line = lines[n.lineno - 1]
+                if ("def %s(" % n.name) in line:
+                    new = _line_edit(rel, n.lineno, line.replace("def %s(" % n.name, "def %s_x(" % n.name, 1))
+        elif how == "deldecorator":
+            cands = [d for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.ClassDef)) for d in n.decorator_list if d.lineno == d.end_lineno]
+            if cands:
+                new = _line_edit(rel, rng.choice(cands).lineno, None)
+        elif how == "swapbranch":
+            cands = [n for n in ast.walk(tree) if isinstance(n, ast.IfExp) and n.lineno == n.end_lineno]
+            if cands:
+                n = rng.choice(cands)
+                (bs, be), (os_, oe) = span(b, offs, n.body), span(b, offs, n.orelse)
+                new = (b[:bs] + b[os_:oe] + b[be:os_] + b[bs:be] + b[oe:]).decode("utf-8")
+        elif how == "except":
+            cands = [h for n in ast.walk(tree) if isinstance(n, ast.Try) for h in n.handlers if isinstance(h.type, ast.Name)]
+            if cands:
+                h = rng.choice(cands)
+                s_, e_ = span(b, offs, h.type)
+                new = (b[:s_] + (b"KeyError" if h.type.id != "KeyError" else b"ValueError") + b[e_:]).decode("utf-8")
+        elif how == "delentry":
+            cands = []
+            for n in ast.walk(tree):
+                if isinstance(n, (ast.Dict, ast.List, ast.Set, ast.Tuple)) and n.end_lineno - n.lineno >= 3:
+                    items = n.keys if isinstance(n, ast.Dict) else n.elts
+                    values = n.values if isinstance(n, ast.Dict) else n.elts
+                    for k, v in zip(items, values):
+                        first = (k or v).lineno
+                        if first == v.end_lineno and first not in (n.lineno, n.end_lineno) and lines[first - 1].rstrip().endswith(","):
+                            cands.append(first)
+            if cands:
+                new = _line_edit(rel, rng.choice(cands), None)
+        elif how == "argswap":
+            cands = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and len(n.args) >= 2 and n.lineno == n.end_lineno and not any(isinstance(a, ast.Starred) for a in n.args[:2])]
+            if cands:
+                n = rng.choice(cands)
+                (as_, ae), (bs, be) = span(b, offs, n.args[0]), span(b, offs, n.args[1])
+                if b[as_:ae] != b[bs:be]:
+                    new = (b[:as_] + b[bs:be] + b[ae:bs] + b[as_:ae] + b[be:]).decode("utf-8")
+        elif how == "delbase":
+            cands = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and len(n.bases) >= 2 and n.bases[0].lineno == n.bases[-1].end_lineno]
+            if cands:
+                n = rng.choice(cands)
+                s_ = span(b, offs, n.bases[-2])[1]
+                e_ = span(b, offs, n.bases[-1])[1]
+                new = (b[:s_] + b[e_:]).decode("utf-8")
+        elif how == "early":
+            cands = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.body and n.body[0].lineno > n.lineno and not isinstance(n.body[0], ast.Expr)]
+            if cands:
+                n = rng.choice(cands)
+                first = lines[n.body[0].lineno - 1]
+                indent = first[: len(first) - len(first.lstrip())]
+                new = "".join(lines[: n.body[0].lineno - 1] + [indent + "return None\n"] + lines[n.body[0].lineno - 1 :])
+        if new is None or new == src:
+            continue
+        try:
+            if ast.dump(ast.parse(new)) == ast.dump(tree):
+                continue
+        except SyntaxError:
+            continue
+        return {rel: new}, "struct-" + how
+    raise RuntimeError
+
+
 def make_patch(changes):
     out = []
     for rel in sorted(changes):
@@ -346,6 +438,8 @@ def one(kind):
         ch, op = mutate_testedit()
     elif kind == "classlevel":
         ch, op = mutate_class_level()
+    elif kind == "structure":
+        ch, op = mutate_structure()
     elif kind == "multi":
         ch, ops = {}, []
         for _ in range(rng.choice([2, 3, 3])):

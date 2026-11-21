@@ -7,6 +7,9 @@ on:
         default: "101"
       count:
         default: "320"
+      kinds:
+        description: kinds of change, separated by spaces (empty - the sample's mix)
+        default: ""
 jobs:
   shard:
     runs-on: ubuntu-latest
@@ -25,7 +28,7 @@ jobs:
           docker run --rm --platform linux/amd64 --user 0:0 \
             --volume $PWD:/src:ro --volume $PWD/out:/out \
             --env PYTHONDONTWRITEBYTECODE=1 --env SKIP_INTEGRATION=0 \
-            blast-radius-entry python /src/tools/validation/ci_shard.py /src /out ${{ inputs.seed }} ${{ inputs.count }} ${{ matrix.shard }} 20
+            blast-radius-entry python /src/tools/validation/ci_shard.py /src /out ${{ inputs.seed }} ${{ inputs.count }} ${{ matrix.shard }} 20 ${{ inputs.kinds }}
       - uses: actions/upload-artifact@v4
         with:
           name: result-${{ inputs.seed }}-${{ matrix.shard }}
