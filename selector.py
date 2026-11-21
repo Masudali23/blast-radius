@@ -80,6 +80,10 @@ DROP_MIN = float(os.environ.get("BR_DROP_MIN", "8"))
 # store when the image has them (br/tables.py): about this share of its calibrated CPU is left.
 ANSWER_TESTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",)
 ANSWER_SHARE = float(os.environ.get("BR_ANSWER_SHARE", "0.5"))
+# A test that does nothing but ask DuckDB, about texts whose answers are all stored: a small
+# share of its calibrated CPU is left.  Its time limits stay those of a run that asks DuckDB
+# (which is what happens when the patch touches what the stored answers depend on).
+STORED_TESTS = {"tests/test_executor.py::TestExecutor::test_optimized_tpch": float(os.environ.get("BR_STORED_SHARE", "0.06"))}
 # with nothing failing, a slow test that can be sampled is run in full only up to this many
 # seconds of CPU; past that it is sampled
 CLEAN_RUN = float(os.environ.get("BR_CLEAN_RUN", "8"))
@@ -148,10 +152,15 @@ class Selector:
             idx = self.idx_of.get(n)
             cal = self.maps.cpu_ms[idx] if idx is not None and idx < len(self.maps.cpu_ms) else None
             self.cpu[n] = (cal * CAL) if cal is not None else self.ms[n] * 0.85
+        self.slack = {}  # test -> factor from its estimate to the time a run may need at worst
         if self.stored_answers():
             for n, tid in self.id_of.items():
                 if tid in ANSWER_TESTS:
                     self.cpu[n] *= ANSWER_SHARE
+                share = STORED_TESTS.get(tid, 0.0)
+                if 0.0 < share < 1.0:
+                    self.cpu[n] *= share
+                    self.slack[n] = 1.0 / share
         self.lane = None
         self.lane2 = None
         self._related = {}
@@ -270,9 +279,9 @@ class Selector:
         def work(i):
             lane, part = lanes[i], halves[i]
             m = lane.fresh_mode(plan.files) if plan.fresh else "full"
-            jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in part]
+            jobs = [(self.id_of[n], max(1.5, 5.0 * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in part]
             wait = max(10.0, self.stop_at + 30.0 - time.monotonic())
-            cpu = max(30.0, 5.0 + 2.5 * sum(e for _, _, e in part) / 1000.0)
+            cpu = max(30.0, 5.0 + 2.5 * sum(e * self.slack.get(n, 1.0) for n, _, e in part) / 1000.0)
             lane.ensure(m)
             try:
                 for rel, content in plan.files.items():
@@ -669,9 +678,9 @@ class Selector:
         def run(items, stop_on_fail, patience=5.0):
             if st["cut"]:
                 return [], [n for n, _, _ in items]  # the child gave up earlier: do not run more
-            jobs = [(self.id_of[n], max(1.5, patience * e / 1000.0 + 0.5), v) for n, v, e in items]
+            jobs = [(self.id_of[n], max(1.5, patience * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in items]
             # total CPU this commit may burn: generous against the estimate, but bounded
-            st["planned"] += sum(e for _, _, e in items) / 1000.0
+            st["planned"] += sum(e * self.slack.get(n, 1.0) for n, _, e in items) / 1000.0
             cpu_budget = min(COMMIT_CPU, 3.0 + 2.5 * st["planned"])
             if not st["open"]:
                 budget = 30.0 + 4.0 * (total_est + sum(e for _, _, e in deferred)) / 1000.0
@@ -934,7 +943,7 @@ class Selector:
             for rel, content in plan.files.items():
                 lane.overlay.set_file(rel, content)
             to_run.sort(key=lambda it: it[0])
-            jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in to_run]
+            jobs = [(self.id_of[n], max(1.5, 5.0 * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
             results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
             if err and full and not results:
