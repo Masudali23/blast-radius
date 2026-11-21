@@ -242,9 +242,11 @@ def mutate_delete_stmt():
 
 
 def mutate_comment(files=None):
-    rel = rng.choice(files or SRC)
-    src = read(rel)
-    lines = src.splitlines(keepends=True)
+    lines = []
+    while not lines:  # (an empty __init__.py has nowhere to put a comment)
+        rel = rng.choice(files or SRC)
+        src = read(rel)
+        lines = src.splitlines(keepends=True)
     for _ in range(100):
         i = rng.randrange(len(lines))
         line = lines[i]
