@@ -35,6 +35,10 @@ class Maps:
         self._reads = None
         self.meta_reads = set()
         self.outer_reads = None  # names read while modules load (None: not recorded)
+        self.outer_recv = None  # name -> classes it is read through while loading, to feed something else
+        self.class_anc = {}  # class name -> names of its ancestors
+        self.classlike = {}  # name -> {file: {line: what the class is known to be}}, read off a class object
+        self.derives = {}  # name -> names a class-creation hook stores from it
         self._relations = None
         self._memo = None
         self._cache = {}
@@ -115,6 +119,10 @@ class Maps:
                 self._reads = (set(d["bound"]), d["reads"])
                 self.meta_reads = set(d.get("meta_reads", ()))
                 self.outer_reads = set(d["outer_reads"]) if "outer_reads" in d else None
+                self.outer_recv = {n: set(r) for n, r in d["outer_recv"].items()} if "outer_recv" in d else None
+                self.class_anc = {c: set(a) for c, a in d.get("class_anc", {}).items()}
+                self.classlike = d.get("classlike", {})
+                self.derives = d.get("derives", {})
             else:
                 self._reads = (set(), {})
         bound, table = self._reads
@@ -222,6 +230,54 @@ class Maps:
                 for d in self._memo.values():
                     d["back"] = {rel: frozenset(lines) for rel, lines in d["back"].items()}
         return self._memo.get(test_id)
+
+    def feeds_elsewhere(self, name, cls):
+        """Is class `cls`'s attribute `name` read while modules load, other than to build the
+        attribute of the same name?  Then something stored elsewhere holds (a piece of) its
+        value and readers of `name` do not tell who is affected."""
+        self.reads("")
+        if self.outer_recv is None:
+            return True
+        for r in self.outer_recv.get(name, ()):
+            if r == "*" or r == cls or cls in self.class_anc.get(r, ()):
+                return True
+        return False
+
+    def class_object_readers(self, names, cls):
+        """Tests that run a line reading one of `names` off a class object that can be `cls` (or
+        a class holding `cls`'s value of it), no instance needed; None when it cannot be told.
+
+        A name that a class-creation hook reads (`__init_subclass__`, a metaclass) lives on in
+        whatever the hook stored from it, so readers of those names count as well, off any
+        class: the hook may store on a class other than the one being created."""
+        self.reads("")
+        todo = [(n, True) for n in names]
+        seen = set(names)
+        mask = 0
+        while todo:
+            name, own = todo.pop()
+            for d in self.derives.get(name, ()):
+                if d == "*":
+                    return None
+                if d not in seen:
+                    seen.add(d)
+                    todo.append((d, False))
+            for f, lines in self.classlike.get(name, {}).items():
+                for line, recvs in lines.items():
+                    if not own or any(self._can_be(r, cls) for r in recvs):
+                        mask |= self.func(f, line, line)
+        return mask
+
+    def _can_be(self, recv, cls):
+        """Can a read through `recv` (see tools/build_reads.py) return class `cls`'s own value?"""
+        kind, other = recv[:1], recv[1:]
+        if kind == "=":
+            # the named class, which may inherit the value from cls
+            return other == cls or cls in self.class_anc.get(other, ())
+        if kind == "<":
+            # some class at or below `other`: cls itself, a subclass of cls, or one inheriting from cls
+            return other == cls or other in self.class_anc.get(cls, ()) or cls in self.class_anc.get(other, ())
+        return True
 
     def attr_readers(self, cls_keys, name):
         """Tests that read constant `name` from the definition in one of `cls_keys`.

@@ -45,6 +45,16 @@ CPU time is part of the score, so the selector avoids running what it can decide
   Plain constants of the dialect, tokenizer, parser, generator and expression classes are
   followed more closely: while the maps are built each one sits behind a descriptor that
   records which tests read it from that very definition.
+  Reads that need no instance are indexed separately (`tools/build_reads.py`): a name read off
+  a class object (`cls.NAME` in a classmethod, `exp.Select.NAME`) counts for every class that
+  read can stand for; a name read while modules load to build something stored under another
+  name is not narrowed at all; and what a metaclass or `__init_subclass__` stores from a name
+  is followed to the readers of what it stored. A classmethod is taken to create an instance
+  of its class only if the whole suite, run once at the pinned commit, never saw it do
+  otherwise (`tools/check_instantiating.py`).
+- **Executor tables**: the executor tests load the TPC tables from CSV in their class setup.
+  The image build stores the loaded tables once (`tools/build_tables.py`), and DuckDB
+  connections are opened only when a test first uses one.
 - **Swapped comparison operators** (`br/relations.py`): `a is b` and `a == b` give the same
   answer unless an object equals something it is not; `a < b` and `a <= b` unless the two are
   equal. While the maps are built, every such comparison in sqlglot is evaluated both ways each
@@ -53,10 +63,12 @@ CPU time is part of the score, so the selector avoids running what it can decide
   evaluation gives what it gave before, so the run is the same run.
 - **Regrouped conditions** (`br/boolrel.py`): for every `and` / `or` condition the maps keep
   each distinct evaluation a test makes: which operands were evaluated and which were true
-  (operands free of calls are all evaluated, so the whole truth assignment is known). A patch
+  (skipped operands are left alone, so the tracer runs nothing the program did not). A patch
   that only swaps `and` for `or` yields a second formula over the same operands; replaying the
   recorded evaluations through both shows in which tests it could ask for an operand the
-  original skipped, skip a call the original made, or answer differently.
+  original skipped, skip a call the original made, or answer differently. An edit inside one
+  operand can likewise only matter to the tests whose evaluations reached that operand. A test
+  the tracer never saw evaluate the condition is not vouched for and stays a candidate.
 - **Unchanged hand-over** (`br/memo.py`): the executor's TPC-DS test is by far the slowest test,
   and nearly all of its time goes into a pure-Python query engine and into comparing the result
   with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed
@@ -64,7 +76,8 @@ CPU time is part of the score, so the selector avoids running what it can decide
   keep a fingerprint of those per fixture entry. Entries that hand over exactly what the
   pinned commit handed over must pass again and skip the slow half; entries that hand over
   something new are run for real while that stays cheap, and otherwise the test stays selected.
-  Used only where the test would otherwise be left selected unchecked next to real failures.
+  It says nothing about state the slow half picks up from elsewhere, so it is switched off
+  (`BR_MEMO=1` turns it on).
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).

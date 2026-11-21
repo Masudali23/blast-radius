@@ -26,6 +26,7 @@ jobs:
               python tools/calibrate.py /app/repo /src/sample/tests.json /out/calib.json /tmp/cal
               mkdir -p /out/maps
               python tools/build_maps.py /out/trace /src/sample/tests.json /out/import_trace.json /out/maps /out/slices /out/calib.json /out/usage
+              python tools/check_instantiating.py /app/repo /out/maps
               python tools/build_reads.py /app/repo /out/maps
               python tools/trace_rel_all.py /app/repo /src/sample/tests.json /out/rel 4
               python tools/trace_rel_one.py /app/repo @import /out/rel_import.json

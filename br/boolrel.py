@@ -2,8 +2,8 @@
 
 A condition such as `a and not b or c` is a small formula over its operands.  While the maps
 are built, every evaluation of every such formula in sqlglot is recorded per test: which
-operands were evaluated and whether each was true.  When all operands are free of calls, the
-ones the formula skipped are evaluated as well, so the whole truth assignment is known.
+operands were evaluated and whether each was true.  Operands the formula skipped are left
+alone: evaluating them would run code the program itself never ran.
 
 A patch that only regroups the same operands with different `and` / `or` operators gives a
 second formula over the same operands.  Replaying a recorded evaluation through both shows
@@ -181,8 +181,6 @@ def instrument(tree, rel):
                 return self.generic_visit(node)
             atoms = []
             structure(node, atoms)
-            plain = [copy.deepcopy(a) for a in atoms]  # for the skipped operands: no reporting
-            all_pure = all(pure(a) for a in atoms)
             counter[0] += 1
             tmp = "_br_t%d_" % counter[0]
             where = {}
@@ -203,13 +201,10 @@ def instrument(tree, rel):
                 return n
 
             body = rebuild(node)
-            if all_pure:
-                thunks = ast.Tuple(
-                    elts=[ast.Lambda(args=ast.arguments(posonlyargs=[], args=[], vararg=None, kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[]), body=p) for p in plain],
-                    ctx=ast.Load(),
-                )
-            else:
-                thunks = ast.Constant(value=None)
+            # Operands the formula skipped are NOT evaluated on the side.  Doing so looked free for
+            # operands without calls, but an attribute can be a memoising property: the extra
+            # evaluation ran real code early, and the program then never ran it at its own time.
+            thunks = ast.Constant(value=None)
             start = ast.NamedExpr(
                 target=ast.Name(id=tmp, ctx=ast.Store()),
                 value=ast.Call(func=ast.Name(id=START, ctx=ast.Load()), args=[ast.Constant(value=rel + "|" + site_key(node))], keywords=[]),

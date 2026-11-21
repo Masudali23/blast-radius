@@ -1,0 +1,6 @@
+{
+ "sqlglot/errors.py:47": "new",
+ "sqlglot/expressions/core.py:1678": "from_arg_list",
+ "sqlglot/expressions/core.py:1782": "string",
+ "sqlglot/tokenizer_core.py:499": "string"
+}

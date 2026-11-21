@@ -352,6 +352,8 @@ def harmless_at_import(change):
     targets_n = n.targets if isinstance(n, ast.Assign) else [n.target]
     if [ast.dump(t) for t in targets_o] != [ast.dump(t) for t in targets_n] or not all(isinstance(t, ast.Name) for t in targets_o):
         return False
+    if any(t.id.startswith("__") for t in targets_o):
+        return False  # __slots__, __all__, ...: Python itself reads these while building the class
     if isinstance(o, ast.AnnAssign) and ast.dump(o.annotation) != ast.dump(n.annotation):
         return False
     return _same_but_constants(o.value, n.value, True)

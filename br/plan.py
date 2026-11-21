@@ -1,4 +1,6 @@
 """Turn one patch into a plan: which tests could possibly be affected, and how to check them."""
+import ast
+import importlib.util
 import os
 import re
 import sys
@@ -30,7 +32,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps")
 
     def __init__(self, commit):
         self.commit = commit
@@ -51,11 +53,32 @@ class Plan:
         # while importing; if one does not import any more, every test in `wide` is in play
         self.imports = []
         self.wide = 0
+        self.code_files = 0  # python files whose code (not just comments) changes
+        self.partner_swaps = 0  # changes narrowed as "operator swapped for its partner"
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
             self.cand |= mask
             self.parts.append((kind, rel, lo, hi, mask))
+
+
+# Project files that may carry pytest settings in a section of their own.
+PROJECT_FILES = ("pyproject.toml", "setup.cfg")
+_PYTEST_SECTION = re.compile(rb"^\[\s*(tool\.pytest[^\]]*|tool:pytest|pytest)\s*\]\s*$")
+
+
+def _pytest_settings(data):
+    """The lines of every pytest section of a project file (None when the file is absent)."""
+    if data is None:
+        return None
+    out, inside = [], False
+    for line in data.split(b"\n"):
+        stripped = line.strip()
+        if stripped.startswith(b"["):
+            inside = bool(_PYTEST_SECTION.match(stripped))
+        if inside and stripped:
+            out.append(stripped)
+    return out
 
 
 def _read(base, rel):
@@ -117,6 +140,11 @@ def make_plan(commit, data, base, maps, opts=None):
         except Exception as e:
             plan.unknown = True
             plan.notes.append("analysis error on %s: %r" % (ch.path, e))
+    if plan.partner_swaps and plan.code_files > 1 and opts.get("relations", True):
+        # The other operator was evaluated, while tracing, by the pinned code.  If the patch
+        # changes code elsewhere too, that evaluation may run the changed code: plan again
+        # without this narrowing.
+        return make_plan(commit, data, base, maps, dict(opts, relations=False))
     return plan
 
 
@@ -178,10 +206,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
     if not rel.endswith(".py"):
         plan.kinds.add("data")
         plan.add("data", rel, 0, 0, readers)
+        if name in PROJECT_FILES and _pytest_settings(old) != _pytest_settings(new):
+            plan.unknown = True
+            plan.notes.append("pytest settings in %s" % rel)
         return
     plan.data_only = False
     if old is None:
-        _new_module(plan, rel, new, maps)
+        _new_module(plan, rel, new, maps, base)
         return
     if new is None:
         # deleted module: everything that imported or read it is in play, on a fresh import
@@ -200,6 +231,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
         plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | readers | maps.any_line(rel))
         return
     status, changes = analyze.diff_python(old_t, new_t)
+    if status != "syntax" and new.split(b"\n", 2)[:2] != old.split(b"\n", 2)[:2]:
+        # the first two lines may carry an encoding declaration: a "comment" that decides
+        # whether the file can be read at all
+        try:
+            ast.parse(new)
+        except (SyntaxError, ValueError):
+            status = "syntax"
     plan.add("data", rel, 0, 0, readers)  # tests that read this source file as data see any textual change
     if status in ("same", "doc"):
         plan.kinds.add("comment")
@@ -211,11 +249,12 @@ def _changed(plan, rel, old, new, base, maps, opts):
         plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | maps.any_line(rel))
         return
     shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
+    plan.code_files += 1
     hot = True
     swap = regroup = operand = None
     if REFINE_RELATIONS and changes and all(c.level == "func" for c in changes) and analyze.TREES:
         # (each of these establishes by itself that the two modules differ in nothing else)
-        swap = relations.swapped(analyze.TREES[0], analyze.TREES[1])
+        swap = relations.swapped(analyze.TREES[0], analyze.TREES[1]) if opts.get("relations", True) else None
         if swap is None:
             regroup = boolrel.swapped(analyze.TREES[0], analyze.TREES[1])
         if swap is None and regroup is None:
@@ -227,6 +266,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
             if not shapes_ok or c.coarse:
                 lo, hi = c.scope_span
             slo, shi = c.scope_span
+            # Objects made while modules loaded (closures, lambdas stored in class dicts) hold
+            # the old code of everything nested in them, so what matters is whether the
+            # OUTERMOST function around the change ran then, not just the innermost scope.
+            olo, ohi = _outermost(analyze.TREES[0], slo, shi) if analyze.TREES else (slo, shi)
+            at_import = maps.ran_at_import(rel, olo, ohi)
             if swap:
                 differ, warm = maps.relation(rel, swap)
                 if differ is not None and not warm:
@@ -235,7 +279,8 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("relation-narrowed %s %s: %d -> %d" % (rel, swap, bin(mask).count("1"), bin(mask & differ).count("1")))
                     plan.add("func", rel, lo, hi, mask & differ)
-                    if maps.ran_at_import(rel, slo, shi):
+                    plan.partner_swaps += 1
+                    if at_import:
                         # nothing computed while loading differs, but function objects made
                         # then (closures, lambdas) still hold the old code: import afresh
                         hot = False
@@ -246,7 +291,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("formula-narrowed %s %s: %d -> %d" % (rel, boolrel.site_key(regroup[0]), bin(mask).count("1"), bin(mask & narrowed).count("1")))
                     plan.add("func", rel, lo, hi, mask & narrowed)
-                    if maps.ran_at_import(rel, slo, shi):
+                    if at_import:
                         hot = False  # as above: objects made while loading hold the old code
                     continue
             if operand:
@@ -257,11 +302,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("operand-narrowed %s %s[%d]: %d -> %d" % (rel, boolrel.site_key(operand[0]), operand[2], bin(mask).count("1"), bin(mask & asked).count("1")))
                     plan.add("func", rel, lo, hi, mask & asked)
-                    if maps.ran_at_import(rel, slo, shi):
+                    if at_import:
                         hot = False
                     continue
             plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
-            if maps.ran_at_import(rel, slo, shi):
+            if at_import:
                 hot = False
                 # The function ran while modules were loading, so objects made then hold its
                 # old code: import afresh.  What was BUILT then can only differ if the changed
@@ -281,6 +326,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     # imported, but nothing in it was ever traced (an empty __init__.py, say)
                     mask = maps.imports.get(rel, 0)
             everyone = mask
+            if c.names and any(n.startswith("__") for n in c.names):
+                # __slots__, __all__, __init_subclass__ ...: read by Python while it builds the
+                # class or module, with effects no reader index knows about
+                plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel) | mask)
+                continue
             if mask and c.calls and REFINE_DEFAULTS:
                 flo, fhi = c.calls
                 if not maps.ran_at_import(rel, flo, fhi):
@@ -319,6 +369,30 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 plan.probe.append(rel)
     else:
         plan.fresh = True
+
+
+_FUNCS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _outermost(tree, lo, hi):
+    """Line span of the outermost function-like node of `tree` that contains lines lo..hi
+    (decorators included); (lo, hi) when there is none."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        for child in ast.iter_child_nodes(node):
+            first = getattr(child, "lineno", None)
+            last = getattr(child, "end_lineno", None)
+            if isinstance(child, _FUNCS):
+                if isinstance(child, ast.Lambda):
+                    a, b = first, last
+                else:
+                    a, b = min([first] + [d.lineno for d in child.decorator_list]), last
+                if a is not None and a <= lo and hi <= b:
+                    return a, b
+            elif first is None or last is None or (first <= lo and hi <= last):
+                stack.append(child)
+    return lo, hi
 
 
 def _regrouped(maps, rel, regroup, old_tree):
@@ -383,6 +457,8 @@ def _key_users(maps, c, rel):
     name = c.names[0]
     if name not in maps.dict_names:
         return None
+    if maps.feeds_elsewhere(name, c.cls):
+        return None  # e.g. `TYPE_MAPPING = {..., **STRING_TYPE_MAPPING}`: looked up under another name
     res = analyze.changed_dict_keys(c)
     if res is None:
         return None
@@ -431,7 +507,13 @@ def _class_users(maps, base, rel, c):
             break
     if key is None:
         return None
-    users = maps.class_users.get(key, 0)
+    if any(maps.feeds_elsewhere(name, c.cls) for name in c.names):
+        return None  # a copy stored under another name can be reached without this class
+    # read off a class object (`cls.NAME` in a classmethod, `Dialect[...].NAME`): no instance needed
+    loose = maps.class_object_readers(c.names, c.cls)
+    if loose is None:
+        return None
+    users = maps.class_users.get(key, 0) | loose
     for d in FAMILY_DIRS:
         if rel.startswith(d) and REFINE_CLASS == "family":
             stem = rel[len(d):]
@@ -470,22 +552,48 @@ def _users(names, base, maps, rel, own_lines):
     return mask
 
 
-def _new_module(plan, rel, new, maps):
+def _new_module(plan, rel, new, maps, base):
+    """A python file that did not exist.  Nothing imports it by name yet, but it can still
+    matter: it can shadow a module, and packages are sometimes walked (pkgutil) by tests."""
     name = os.path.basename(rel)
     plan.kinds.add("new-py")
-    top = rel.split("/")[0]
-    stem = name[:-3]
-    if "/" not in rel:
-        # a new top-level module can shadow an installed one for every test
-        if stem in sys.stdlib_module_names or stem in ("duckdb", "pandas", "numpy", "pytz", "dateutil", "setuptools", "pytest", "sqlglot", "tests"):
+    parts = rel.split("/")
+    top = parts[0][:-3] if len(parts) == 1 else parts[0]
+    if len(parts) == 1 or not os.path.isdir(os.path.join(base, parts[0])):
+        # a new top-level module or package: on sys.path ahead of everything installed
+        try:
+            taken = top in sys.stdlib_module_names or importlib.util.find_spec(top) is not None
+        except Exception:
+            taken = True
+        if taken or top in ("sqlglot", "tests", "sqlglotc", "duckdb", "pandas", "numpy", "pytz", "dateutil", "setuptools", "pytest"):
             plan.unknown = True
-            plan.notes.append("new top-level module shadows %s" % stem)
+            plan.notes.append("new top-level module or package shadows %s" % top)
         return
     d = os.path.dirname(rel)
+    here = d
+    fresh_dirs = []
+    while here and not os.path.isdir(os.path.join(base, here)):
+        fresh_dirs.append(here)
+        here = os.path.dirname(here)
+    if fresh_dirs:
+        # the file sits in a directory that is new as well; `here` is the nearest existing one
+        shadowed = fresh_dirs[-1] + ".py"
+        if os.path.exists(os.path.join(base, shadowed)):
+            # pkg/mod/ next to pkg/mod.py: the import system takes the directory
+            plan.fresh = True
+            plan.notes.append("new directory shadows %s" % shadowed)
+            plan.add("mod", rel, 0, 0, maps.imports.get(shadowed, 0) | maps.any_line(shadowed) | maps.opened.get(shadowed, 0))
+        d = here
     # tests that read sibling files as data usually enumerate the directory
     for f, mask in maps.opened.items():
         if os.path.dirname(f) == d:
             plan.add("mod", rel, 0, 0, mask)
+    if rel.startswith("sqlglot/"):
+        # a package of sqlglot can be walked to find its modules: whoever imports a module
+        # that lives directly in this directory is in play
+        for f in maps.files:
+            if os.path.dirname(f) == d:
+                plan.add("mod", rel, 0, 0, maps.imports.get(f, 0) | maps.any_line(f))
     if name == "__init__.py":
         plan.fresh = True
         for f in maps.files:
