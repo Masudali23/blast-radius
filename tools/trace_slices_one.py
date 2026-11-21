@@ -41,7 +41,16 @@ def on_line(code, line):
     return mon.DISABLE
 
 
+def on_start(code, offset):
+    fn = code.co_filename
+    if (code.co_flags & 1) and fn.startswith(prefix):
+        lines.add((fn, code.co_firstlineno))
+    return mon.DISABLE
+
+
+EVENTS = mon.events.LINE | mon.events.PY_START
 mon.register_callback(tool, mon.events.LINE, on_line)
+mon.register_callback(tool, mon.events.PY_START, on_start)
 runner = worker.Runner(os.open(os.devnull, os.O_WRONLY))
 path, cls_name, meth = test_id.split("::")
 module = runner._module(path[:-3].replace("/", "."))
@@ -88,7 +97,7 @@ def record():
 
 def traced(allow):
     def go():
-        mon.set_events(tool, mon.events.LINE)
+        mon.set_events(tool, EVENTS)
         t0 = time.process_time()
         outcome = runner.run_one(test_id, {"allow": list(allow)})
         cpu = time.process_time() - t0

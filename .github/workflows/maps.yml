@@ -1,0 +1,35 @@
+name: maps
+# Rebuild the coverage maps inside the same image the scorer runs (manual).
+on:
+  workflow_dispatch:
+jobs:
+  maps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Trace, slice, calibrate
+        run: |
+          mkdir -p out
+          docker run --rm --platform linux/amd64 --user 0:0 \
+            --volume $PWD:/src:ro --volume $PWD/out:/out \
+            --env PYTHONDONTWRITEBYTECODE=1 --env SKIP_INTEGRATION=0 \
+            blast-radius-entry sh -c '
+              set -e
+              cp -r /src/tools /src/br /tmp/ && cd /tmp
+              python tools/trace_all.py /app/repo /src/sample/tests.json /out/trace 4
+              python tools/trace_slices_all.py /app/repo /src/sample/tests.json /out/slices 4 0.05
+              python tools/trace_import.py /app/repo /out/import_trace.json
+              python tools/calibrate.py /app/repo /src/sample/tests.json /out/calib.json /tmp/cal
+              mkdir -p /out/maps
+              python tools/build_maps.py /out/trace /src/sample/tests.json /out/import_trace.json /out/maps /out/slices /out/calib.json
+              python tools/build_reads.py /app/repo /out/maps
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: maps
+          path: |
+            out/maps
+            out/calib.json

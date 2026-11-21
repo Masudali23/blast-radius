@@ -34,10 +34,6 @@ CAL = float(os.environ.get("BR_CAL", "1.0"))
 # a candidate set is "broad" when running it all costs more than this share of selecting it all
 BROAD_FRAC = float(os.environ.get("BR_BROAD_FRAC", "0.75"))
 BROAD_MIN = float(os.environ.get("BR_BROAD_MIN", "2.0"))
-# seconds of tests to run as a probe on a broad set
-PROBE = float(os.environ.get("BR_PROBE", "2.0"))
-# what to do when the probe of a broad set is clean: "keep" the rest selected, or "drop" it
-BROAD_CLEAN = os.environ.get("BR_BROAD_CLEAN", "keep")
 SCALED_SHARE = 0.03
 # tests up to this estimated cost are simply run; costlier ones only while nothing has failed yet
 CHEAP = float(os.environ.get("BR_CHEAP", "0.4"))
@@ -45,7 +41,7 @@ CHEAP = float(os.environ.get("BR_CHEAP", "0.4"))
 LIKELY = float(os.environ.get("BR_LIKELY", "0.25"))
 # chance that a not-yet-run candidate passes, when nothing / something has failed so far
 P_PASS_CLEAN = float(os.environ.get("BR_P_PASS_CLEAN", "0.9"))
-P_PASS_FAILED = float(os.environ.get("BR_P_PASS_FAILED", "0.5"))
+P_PASS_FAILED = float(os.environ.get("BR_P_PASS_FAILED", "0.7"))
 # CPU seconds one commit may spend running tests, whatever was planned
 COMMIT_CPU = float(os.environ.get("BR_COMMIT_CPU", "25"))
 # seconds of a slow sliced test to sample before deciding about it
@@ -54,8 +50,6 @@ SLICE_PROBE = float(os.environ.get("BR_SLICE_PROBE", "1.0"))
 HEAVY_CLEAN = os.environ.get("BR_HEAVY_CLEAN", "drop")
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
-# old/new agreement on at least this many evaluations of a changed expression counts as evidence
-MIN_EVALS = int(os.environ.get("BR_MIN_EVALS", "200"))
 T0 = time.monotonic()
 
 
@@ -228,26 +222,17 @@ class Selector:
         total_est = sum(e for _, _, e in cheap) + sum(e for _, _, e in costly)
         dbg["est_ms"] = int(total_est)
         # "broad": running every candidate would cost about as much CPU as just selecting them all
-        everything = cost_all = None
+        cost_all = None
         if total_est > BROAD_MIN * 1000:
-            everything = [n for n, _, _ in cheap] + [n for n, _, _ in costly]
-            cost_all = split(everything, ms)[1]
+            cost_all = split([n for n, _, _ in cheap + costly + deferred], ms)[1]
         broad = cost_all is not None and total_est > BROAD_FRAC * cost_all
-        rest = []
-        if broad and not (plan.probe and not plan.fresh):
-            # No way to learn anything from a sample here, so select the candidates unseen.
-            # Only tests whose own weight in the bill exceeds the cost of checking them are run.
-            return self.broad_blind(plan, cheap + costly + deferred, likely, dbg)
         if broad:
-            # running everything would cost more CPU than simply selecting it: probe a sample
-            # (the changed expression is instrumented, so a clean sample can settle it)
-            cheap, rest = self.pick_probe(cheap + costly)
-            costly = []
-            dbg["broad"] = len(cheap) + len(rest)
-        deferred_n = [n for n, _, _ in deferred]
-        rest_n = [n for n, _, _ in rest]
+            # Running a sample proves nothing about the tests left out, so select the candidates
+            # unseen.  Only tests whose own weight in the bill exceeds the cost of checking them
+            # are run.
+            return self.broad_blind(plan, cheap + costly + deferred, likely, dbg)
         if not cheap and not costly and not deferred:
-            return likely + rest_n, "unseen"
+            return likely, "unseen"
 
         lane = self.get_lane()
         st = {"mode": "bare" if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0}
@@ -301,11 +286,6 @@ class Selector:
                         dbg.setdefault("failed", []).append(self.id_of[n])
             return failed, unseen
 
-        def agree():
-            # the changed expression was evaluated many times in passing tests, and the old and
-            # new versions gave the same result every single time
-            return st["probed"] and st["differ"] == 0 and st["evals"] >= MIN_EVALS
-
         def cost_of(numbers):
             return split(numbers, ms)[1]
 
@@ -317,32 +297,7 @@ class Selector:
                 failed, unseen = run(cheap, False)
                 failed = failed + unseen
             later = costly + deferred
-            if not failed and agree():
-                how = "agree"
-            elif broad:
-                keep_heavy = list(deferred_n)
-                if failed and deferred:
-                    # the slow candidates decide most of the cost: run those that are cheap to check
-                    base = failed + rest_n
-                    run_list, keep_heavy = [], []
-                    for item in sorted(deferred, key=lambda it: it[2]):
-                        n, v, est = item
-                        keep_cost = cost_of(base + keep_heavy + [n]) - cost_of(base + keep_heavy)
-                        if est < P_PASS_FAILED * keep_cost:
-                            run_list.append(item)
-                        else:
-                            keep_heavy.append(n)
-                    if run_list:
-                        run_list.sort(key=lambda it: it[0])
-                        failed2, unseen2 = run(run_list, False)
-                        failed = failed + failed2 + unseen2
-                unverified = rest_n + keep_heavy
-                if failed or BROAD_CLEAN != "drop":
-                    selected = failed + unverified
-                    how = "broad-fail" if failed else "broad-kept"
-                else:
-                    how = "broad-dropped"
-            elif later:
+            if later:
                 # for each remaining test: is running it cheaper than just selecting it?
                 p_pass = P_PASS_FAILED if failed else P_PASS_CLEAN
                 base = list(failed)
@@ -358,10 +313,7 @@ class Selector:
                     run_list.sort(key=lambda it: it[0])
                     failed2, unseen2 = run(run_list, False)
                     failed = failed + failed2 + unseen2
-                if not failed and agree():
-                    how = "agree"
-                    keep = []
-                elif keep and not failed:
+                if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
                     probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
                     hit = []
@@ -381,12 +333,11 @@ class Selector:
                         unverified = keep
                         how = "heavy-kept"
                 selected = failed + [n for n in keep if n not in failed]
-                if how is None:
-                    how = "fail" if failed else "clean"
                 if failed:
                     unverified = [n for n in keep if n not in failed]
             else:
                 selected = failed
+            if how is None:
                 how = "fail" if failed else "clean"
         finally:
             try:
@@ -397,8 +348,6 @@ class Selector:
         dbg["ran"] = st["ran"]
         dbg["cpu_ms"] = st["cpu"]
         dbg["unverified"] = unverified
-        if st["probed"]:
-            dbg["evals"], dbg["differ"] = st["evals"], st["differ"]
         return selected + likely, how
 
     def broad_blind(self, plan, items, likely, dbg):
@@ -477,34 +426,6 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": keys}, self.cpu[n] * (spent + 0.02)
 
-    def pick_probe(self, runnable):
-        """A cheap, varied sample of the runnable tests: cheapest first, round-robin over files."""
-        by_file = {}
-        for item in runnable:
-            by_file.setdefault(self.id_of[item[0]].split("::")[0], []).append(item)
-        for items in by_file.values():
-            items.sort(key=lambda it: it[2])
-        probe, spent = [], 0.0
-        files = sorted(by_file)
-        pos = {f: 0 for f in files}
-        progress = True
-        while progress and spent < PROBE * 1000:
-            progress = False
-            for f in files:
-                i = pos[f]
-                if i < len(by_file[f]):
-                    it = by_file[f][i]
-                    if spent + it[2] > PROBE * 1000 and probe:
-                        continue
-                    probe.append(it)
-                    spent += it[2]
-                    pos[f] = i + 1
-                    progress = True
-        chosen = {it[0] for it in probe}
-        probe.sort(key=lambda it: it[0])
-        return probe, [it for it in runnable if it[0] not in chosen]
-
-    # ------------------------------------------------------------------ batch
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -532,6 +453,21 @@ class Selector:
         if DEBUG:
             with open(DEBUG, "w") as fh:
                 json.dump(self.debug, fh, indent=1)
+        try:
+            import resource
+
+            kids = resource.getrusage(resource.RUSAGE_CHILDREN)
+            hows = {}
+            for d in self.debug.values():
+                h = hows.setdefault(d.get("how", "?"), [0, 0])
+                h[0] += 1
+                h[1] += d.get("cpu_ms", 0) or 0
+            log("cpu: main %.2fs workers %.2fs (tests %.2fs) | %s" % (
+                time.process_time(), kids.ru_utime + kids.ru_stime,
+                sum(h[1] for h in hows.values()) / 1000.0,
+                " ".join("%s=%d/%.1fs" % (k, v[0], v[1] / 1000.0) for k, v in sorted(hows.items()))))
+        except Exception:
+            pass
         log("done %d commits in %.1fs wall" % (len(patches), time.monotonic() - T0))
 
 

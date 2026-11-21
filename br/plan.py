@@ -13,6 +13,10 @@ REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 # use the index of real reads of a name (rather than any textual mention) to find its users
 USE_READS = os.environ.get("BR_USE_READS", "1") == "1"
 
+# instrument a single changed expression to compare old and new values while tests run
+# (diagnostic only: agreement in the tests that ran says nothing about the ones that did not)
+PROBE_EXPR = os.environ.get("BR_PROBE_EXPR", "0") == "1"
+
 RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py")
 
 
@@ -228,7 +232,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
             plan.add("mod", rel, lo, hi, mask)
     if hot:
         plan.swaps.append(rel)
-        if len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
+        if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
             if infect.applicable(analyze.TREES[0], analyze.TREES[1]):
                 plan.probe.append(rel)
     else:

@@ -43,8 +43,16 @@ def audit(event, args):
 
 
 sys.addaudithook(audit)
+def on_start(code, offset):
+    fn = code.co_filename
+    if fn.startswith(prefix) and code.co_flags & 1:
+        func.setdefault(fn, set()).add(code.co_firstlineno)
+    return mon.DISABLE
+
+
 mon.register_callback(tool, mon.events.LINE, on_line)
-mon.set_events(tool, mon.events.LINE)
+mon.register_callback(tool, mon.events.PY_START, on_start)
+mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 from br import inlinepool, worker
 
 inlinepool.install()

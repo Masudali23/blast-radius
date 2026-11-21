@@ -33,11 +33,15 @@ CPU time is part of the score, so the selector avoids running what it can decide
   For an edited fixture, only the entries that differ are run.
 - **Scaled tests**: `test_max_nodes` and `test_generator_memory` are slow only because of a size
   constant. They run with the constant reduced; every assertion and code path is unchanged.
-- **Old-versus-new evaluation** (`br/infect.py`): when a patch changes a single expression, the
-  patched function also evaluates the old expression from the same operand values and counts
-  disagreements. Tests in which the two never differ behave exactly as before.
 - **Cost-based staging**: cheap candidates run first; a slower candidate is run only when that is
-  expected to cost less than simply selecting it.
+  expected to cost less than simply selecting it. When a change reaches so many tests that
+  running them would cost more than selecting them, they are selected unseen.
+- **Class attributes**: a changed class-level constant can only matter to tests that read that
+  name on an instance of the class (or a subclass), so the candidates are narrowed with an
+  index of where each name is read and a record of which classes each test instantiates.
+
+`br/infect.py` is a diagnostic (off by default): it evaluates the old and new versions of a
+changed expression side by side while tests run.
 
 ## Maps
 

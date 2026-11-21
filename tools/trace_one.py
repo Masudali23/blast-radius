@@ -107,8 +107,21 @@ def main():
             s.add(line)
         return DISABLE
 
+    def on_start(code, offset):
+        # A body that sits on the same line as its `def` / `lambda` produces no LINE event of
+        # its own, so entering a code object counts as executing its first line.
+        fn = code.co_filename
+        if fn.startswith(prefix):
+            d = func if (code.co_flags & 1) else mod
+            s = d.get(fn)
+            if s is None:
+                s = d[fn] = set()
+            s.add(code.co_firstlineno)
+        return DISABLE
+
     mon.register_callback(tool, mon.events.LINE, on_line)
-    mon.set_events(tool, mon.events.LINE)
+    mon.register_callback(tool, mon.events.PY_START, on_start)
+    mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
     path, cls_name, meth = test_id.split("::")
     module_name = path[:-3].replace("/", ".")
