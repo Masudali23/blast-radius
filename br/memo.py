@@ -18,10 +18,16 @@ changes nothing at module or class level.
 """
 import enum
 import hashlib
+import os
 import sys
 import time
 
 from br import inlinepool
+
+# an allowance this large means "run whatever is not recognised"
+WHOLE = 1e11
+# validation only: a file noting, for every slow half that is skipped, what running it gives
+CHECK = os.environ.get("BR_MEMO_CHECK")
 
 TESTS = {
     # test id -> (class attribute with the fixture entries, is_tpch flag value)
@@ -210,6 +216,8 @@ class Session:
         # their estimated cost ({sql key: ms}) stays within `budget`.
         self.costs = costs or {}
         self.budget = budget
+        # no limit: every entry is settled, either recognised or run for real
+        self.whole = budget >= WHOLE
         self.spent = 0.0
         self.cost_record = {}  # map building: CPU ms of each entry's slow half
         self.depth = 0
@@ -249,6 +257,8 @@ class Session:
             except Unstable:
                 key = None
             session.fronts.append(key)
+            if session.strict and key is None and session.whole:
+                return slow(real_execute, executor, plan)  # cannot be recognised: run it
             if session.strict and (key is None or (key not in session.plans and session.budget <= 0)):
                 # not a plan seen at the pinned commit, and no allowance to run it for real
                 session.gave_up = True
@@ -303,7 +313,7 @@ class Session:
             skey = text_key(sql)
             if session.gave_up:
                 return None
-            if session.strict and not session.weighed:
+            if session.strict and not session.weighed and not session.whole:
                 # Every quick half has run by now (the pool takes all queries before the first
                 # result is looked at), so it is known which entries are handed something new.
                 # If running all of those for real costs more than the allowance, stop before
@@ -324,10 +334,22 @@ class Session:
             if isinstance(table, Unchanged):
                 executor, plan = session.pending.pop(table.key)
                 same = unchanged(skey, sql, table.key)
+                if same and CHECK:
+                    # validation: run the slow half all the same; it must not fail
+                    try:
+                        real_helper(test, i, slow(real_execute, executor, plan), tpch=tpch)
+                        note = "ok"
+                    except BaseException as e:  # noqa: BLE001
+                        note = "FAILS %s %r" % (skey, repr(e)[:200])
+                    try:
+                        with open(CHECK, "a") as fh:
+                            fh.write(note + "\n")
+                    except OSError:
+                        pass
                 if same:
                     session.skipped += 1
                     return None
-                if session.strict:
+                if session.strict and not session.whole:
                     # a new hand-over: run this entry for real if the allowance covers it,
                     # otherwise stop here and let the caller keep the test
                     cost = session.costs.get(skey)

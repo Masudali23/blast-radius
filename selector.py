@@ -85,6 +85,8 @@ ANSWER_SHARE = float(os.environ.get("BR_ANSWER_SHARE", "0.5"))
 CLEAN_RUN = float(os.environ.get("BR_CLEAN_RUN", "8"))
 # narrow sliced tests to the fixture entries a swapped operator / regrouped condition can reach
 ENTRY_NARROW = os.environ.get("BR_ENTRY_NARROW", "1") == "1"
+# use the executor shortcut (br/memo.py) for every run of its test, not only for samples
+SHORT_RUNS = os.environ.get("BR_SHORT_RUNS", "1") == "1"
 # a test that an edited class fixture reaches only through its class set-up is settled by
 # running that set-up
 SETUP_ONLY = os.environ.get("BR_SETUP_ONLY", "1") == "1"
@@ -335,7 +337,16 @@ class Selector:
 
     def variant_for(self, plan, n):
         """How to run test n for this plan: (variant or None, share of its recorded time)."""
-        return self.plain_variant(plan, n)
+        v, share = self.plain_variant(plan, n)
+        if SHORT_RUNS and MEMO and self.maps.memo(self.id_of[n]) is not None:
+            short = self.short_variant(plan, n)
+            if short is not None:
+                # The executor's fixture test, settled entry by entry: an entry that is handed
+                # exactly what the pinned commit handed over needs no slow half, every other
+                # entry is run for real.  (The estimate stays that of the plain run.)
+                v = dict(short[0])
+                v["memo_budget"] = 1e12
+        return v, share
 
     def short_variant(self, plan, n):
         """(variant, estimated CPU ms) for settling test n by recognising unchanged hand-overs

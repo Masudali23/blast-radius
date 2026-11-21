@@ -109,14 +109,13 @@ CPU time is part of the score, so the selector avoids running what it can decide
   and nearly all of its time goes into a pure-Python query engine and into comparing the result
   with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed
   function of what it is handed: the plan, the tables and the SQL text for DuckDB. The maps
-  keep a fingerprint of those per fixture entry. Entries that hand over exactly what the
-  pinned commit handed over must pass again and skip the slow half; entries that hand over
-  something new are run for real while that stays cheap, and otherwise the test stays selected.
+  keep a fingerprint of those per fixture entry. Whenever that test is run, an entry that
+  hands over exactly what the pinned commit handed over must pass again and skips the slow
+  half; every other entry is run for real. Entries are looked at one at a time, so a failing
+  entry ends the test before the rest have cost anything.
   Which lines the slow half runs is recorded twice: during the test itself, and again by
   replaying every hand-over in a process that never ran the quick half, so that nothing the
-  quick half had already cached is missed. All quick halves run before the first result is
-  looked at; if the entries that are handed something new would together cost more than an
-  allowance, none of them is run and the test simply stays selected.
+  quick half had already cached is missed.
   The replay also notes, per entry, which lines its slow half runs and (run once more with
   the class-usage instrumentation) which classes it instantiates, constants it reads and dict
   entries it looks up. An entry whose slow half runs patched code, or uses a patched class
