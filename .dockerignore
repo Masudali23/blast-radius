@@ -4,6 +4,7 @@ sample
 tools/*
 !tools/fetch_sqlglot.py
 !tools/build_tables.py
+!tools/build_answers.py
 output.jsonl
 *.md
 __pycache__
