@@ -57,6 +57,14 @@ CPU time is part of the score, so the selector avoids running what it can decide
   that only swaps `and` for `or` yields a second formula over the same operands; replaying the
   recorded evaluations through both shows in which tests it could ask for an operand the
   original skipped, skip a call the original made, or answer differently.
+- **Unchanged hand-over** (`br/memo.py`): the executor's TPC-DS test is by far the slowest test,
+  and nearly all of its time goes into a pure-Python query engine and into comparing the result
+  with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed
+  function of what it is handed: the plan, the tables and the SQL text for DuckDB. The maps
+  keep a fingerprint of those per fixture entry. Entries that hand over exactly what the
+  pinned commit handed over must pass again and skip the slow half; entries that hand over
+  something new are run for real while that stays cheap, and otherwise the test stays selected.
+  Used only where the test would otherwise be left selected unchecked next to real failures.
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
@@ -84,13 +92,15 @@ changed expression side by side while tests run.
 - where each class/module level name is read,
 - per comparison: the tests in which the operator and its partner disagree; per and/or
   condition: the evaluations each test makes,
+- per entry of the executor's TPC-DS test: a fingerprint of what its slow half is handed, and
+  the lines that half runs,
 - per fixture entry coverage for fixture-driven tests,
 - the lines that already run while the workers warm up, and each test's measured cost.
 
 They are produced by `tools/trace_all.py` (once plain for coverage, once with
 `BR_INSTRUMENT=1` for class and dict usage), `tools/trace_rel_all.py` (comparisons and
 conditions, on source rewritten to report them), `tools/trace_slices_all.py`,
-`tools/trace_import.py`, `tools/calibrate.py` and `tools/build_reads.py`, and compiled by
+`tools/trace_import.py`, `tools/trace_memo.py`, `tools/calibrate.py` and `tools/build_reads.py`, and compiled by
 `tools/build_maps.py` and `tools/build_relations.py`. Each test is traced in its own process so that caches warmed by one test
 never hide lines from another.
 

@@ -61,6 +61,11 @@ RELATED_RUN = float(os.environ.get("BR_RELATED_RUN", "0.5"))
 MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
 # seconds to wait for the stand-alone import check of a patched module
 IMPORT_WAIT = 45.0
+# recognise unchanged hand-overs to the slow half of the executor's TPC-DS test
+MEMO = os.environ.get("BR_MEMO", "1") == "1"
+# ... and entries whose hand-over changed are run for real while their estimated CPU stays
+# under this share of the test's recorded time
+MEMO_BUDGET = float(os.environ.get("BR_MEMO_BUDGET", "0.3"))
 # stop the cheap candidates at the first failure and weigh the rest: run or leave selected
 STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -192,6 +197,49 @@ class Selector:
 
     def variant_for(self, plan, n):
         """How to run test n for this plan: (variant or None, share of its recorded time)."""
+        return self.plain_variant(plan, n)
+
+    def short_variant(self, plan, n):
+        """(variant, estimated CPU ms) for settling test n by recognising unchanged hand-overs
+        to its slow half (br/memo.py), or None when that cannot be done for this patch."""
+        tid = self.id_of[n]
+        known = self.maps.memo(tid) if MEMO else None
+        if known is None:
+            return None
+        v, share = self.plain_variant(plan, n)
+        if (v is not None and not v.get("allow")) or not self.unchanged_back_half(plan, n, known):
+            return None
+        frac = 1.0
+        if v is not None:
+            sm = self.maps.slices(tid)
+            live = [k for k, s in zip(sm["keys"], sm["share"]) if s > 0.0]
+            allowed = set(v["allow"])
+            frac = len([k for k in live if k in allowed]) / max(1, len(live))
+        v = dict(v or {})
+        v["memo"] = known["entries"]
+        # entries that are handed something new may still be run for real, up to this much
+        v["memo_costs"] = {k: self.cpu[n] * share for k, share in known.get("costs", {}).items()}
+        v["memo_budget"] = MEMO_BUDGET * self.ms[n]
+        return v, self.cpu[n] * (frac * known["share"] + 0.01)
+
+    def unchanged_back_half(self, plan, n, known):
+        """Does the patch change only function bodies, none of them run by the slow half?"""
+        idx = self.idx_of.get(n)
+        if idx is None or plan.unknown or plan.syntax or self.id_of[n].split("::")[0] in plan.files:
+            return False
+        back = known["back"]
+        for kind, rel, lo, hi, mask in plan.parts:
+            if kind == "func":
+                lines = back.get(rel)
+                if lines and (any(lo <= line <= hi for line in lines) if hi - lo > len(lines) else any(line in lines for line in range(lo, hi + 1))):
+                    return False
+            elif kind == "data" and rel.endswith(".py") and not (mask >> idx) & 1:
+                continue  # another test reads that source file as text
+            else:
+                return False  # module / class level change or edited data: no claim is made
+        return True
+
+    def plain_variant(self, plan, n):
         tid = self.id_of[n]
         idx = self.idx_of.get(n)
         if idx is None or tid.split("::")[0] in plan.files:
@@ -286,7 +334,7 @@ class Selector:
             return likely, "unseen"
 
         lane = self.get_lane()
-        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}}
+        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}, "undecided": set()}
 
         def install():
             lane.ensure(st["mode"])
@@ -327,6 +375,8 @@ class Selector:
                 r = results.get(i)
                 if r is None or r[0] == "U":
                     unseen.append(n)
+                    if r is not None and v and "memo" in v:
+                        st["undecided"].add(n)  # not a failure: simply not settled this way
                 else:
                     st["ran"] += 1
                     st["cpu"] += r[1]
@@ -350,6 +400,8 @@ class Selector:
             kept = []  # cheap candidates left selected without being run
             if cheap:
                 failed, rest = run(cheap, STOP_FIRST)
+                open_ = [n for n in rest if n in st["undecided"]]
+                rest = [n for n in rest if n not in st["undecided"]]
                 if rest and (st["cut"] or not failed or not STOP_FIRST):
                     failed = failed + rest  # could not be checked
                 elif rest:
@@ -373,6 +425,7 @@ class Selector:
                         again.sort(key=lambda it: it[0])
                         f2, u2 = run(again, False)
                         failed = failed + f2 + u2
+                kept = open_ + kept
             later = costly + deferred
             if later:
                 # for each remaining test: is running it cheaper than just selecting it?
@@ -389,7 +442,8 @@ class Selector:
                 if run_list:
                     run_list.sort(key=lambda it: it[0])
                     failed2, unseen2 = run(run_list, False)
-                    failed = failed + failed2 + unseen2
+                    failed = failed + failed2 + [n for n in unseen2 if n not in st["undecided"]]
+                    keep = keep + [n for n in unseen2 if n in st["undecided"]]
                 keep = kept + keep
                 if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
@@ -414,7 +468,7 @@ class Selector:
                     # Something else fails.  A slow test we could not afford to run stays
                     # selected unless the tests closest to it (same test file, or reading the
                     # same fixture file) were run and all passed, and the breakage is small.
-                    slow = {it[0] for it in deferred}
+                    slow = {it[0] for it in deferred} | st["undecided"]
                     by_n = {it[0]: it for it in cheap + later}
                     maybe = []
                     if len(failed) < MANY_FAILED:
@@ -442,10 +496,33 @@ class Selector:
                     if probes:
                         hit, unseen = run(probes, False)
                         hit = hit + unseen
-                        dropped = [n for n, _, _ in probes if n not in hit]
+                        # a sample that fails is a failure among the slow tests' own
+                        # neighbours: then none of them is let go on the strength of a sample
+                        dropped = [] if hit else [n for n, _, _ in probes]
                         failed = failed + [m for m in hit if m not in failed]
                         dbg["related_dropped"] = dropped
                         keep = [n for n in keep if n not in dropped]
+                if keep and not st["cut"] and (failed or HEAVY_CLEAN != "drop"):
+                    # Last resort for a slow test that is still selected unchecked: show that
+                    # its slow half is handed exactly what it was handed before the patch
+                    # (br/memo.py).
+                    short = []
+                    for n in keep:
+                        if ms[n] <= HEAVY * 1000 or n in st["undecided"]:
+                            continue
+                        sv = self.short_variant(plan, n)
+                        if sv is None:
+                            continue
+                        weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
+                        if sv[1] < (P_PASS_FAILED if failed else P_PASS_CLEAN) * weight:
+                            short.append((n, sv[0], sv[1]))
+                    if short:
+                        f3, u3 = run(short, False)
+                        settled = {n for n, _, _ in short} - set(f3) - set(u3)
+                        failed = failed + [n for n in f3 if n not in failed]
+                        keep = [n for n in keep if n not in settled]
+                        unverified = [n for n in unverified if n not in settled]
+                        dbg["short"] = sorted(settled)
                 selected = failed + [n for n in keep if n not in failed]
                 if failed:
                     unverified = [n for n in keep if n not in failed]
@@ -535,8 +612,10 @@ class Selector:
                     back.append(n)  # fails, or could not be checked: stays selected
                 keep.discard(n)
             dropped = []
+            sample_failed = any(outcome.get(n) != "P" for n, _, _ in bundles)
             for n, related, _ in bundles:
-                if outcome.get(n) == "P" and all(outcome.get(m) == "P" for m in related):
+                # (one failing sample among the slow tests and none of them is let go)
+                if not sample_failed and outcome.get(n) == "P" and all(outcome.get(m) == "P" for m in related):
                     keep.discard(n)
                     dropped.append(n)
             if dropped:

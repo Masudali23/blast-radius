@@ -232,6 +232,10 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("relation-narrowed %s %s: %d -> %d" % (rel, swap, bin(mask).count("1"), bin(mask & differ).count("1")))
                     plan.add("func", rel, lo, hi, mask & differ)
+                    if maps.ran_at_import(rel, slo, shi):
+                        # nothing computed while loading differs, but function objects made
+                        # then (closures, lambdas) still hold the old code: import afresh
+                        hot = False
                     continue
             if regroup:
                 narrowed = _regrouped(maps, rel, regroup, analyze.TREES[0])
@@ -239,6 +243,8 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("formula-narrowed %s %s: %d -> %d" % (rel, boolrel.site_key(regroup[0]), bin(mask).count("1"), bin(mask & narrowed).count("1")))
                     plan.add("func", rel, lo, hi, mask & narrowed)
+                    if maps.ran_at_import(rel, slo, shi):
+                        hot = False  # as above: objects made while loading hold the old code
                     continue
             plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
             if maps.ran_at_import(rel, slo, shi):

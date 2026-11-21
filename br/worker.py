@@ -22,7 +22,7 @@ import time
 import types
 import unittest
 
-from br import infect, variants
+from br import infect, memo, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
@@ -326,14 +326,26 @@ class Runner:
             if "changed" in variant:
                 variants.SL.changed = set(variant["changed"])
                 variants.apply_slices(test, cls, None, variants.SL.changed)
+        session = None
+        if variant and variant.get("memo"):
+            attr = memo.TESTS.get(test_id)
+            if attr is None:
+                return "U"
+            session = memo.Session(mod, cls, attr, known=variant["memo"], strict=True, costs=variant.get("memo_costs"), budget=variant.get("memo_budget", 0.0))
         variants.SL.active = allow
         try:
+            if session is not None:
+                session.__enter__()
             test.run(res)
         finally:
+            if session is not None:
+                session.__exit__(None, None, None)
             variants.SL.active = None
             variants.SL.changed = None
             res.shouldStop = False
         after = (len(res.failures), len(res.errors), len(res.unexpectedSuccesses), len(res.skipped))
+        if session is not None and session.gave_up and after[:3] == before[:3]:
+            return "U"  # some entry is handed something new: nothing was decided
         if after[:3] != before[:3]:
             if FAILLOG:
                 with open(FAILLOG, "a") as fh:

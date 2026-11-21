@@ -35,6 +35,7 @@ class Maps:
         self._reads = None
         self.meta_reads = set()
         self._relations = None
+        self._memo = None
         self._cache = {}
         self.all = (1 << len(self.ids)) - 1
 
@@ -198,6 +199,18 @@ class Maps:
         if site in d["warm_aborted"]:
             return None
         return d["vectors"].get(site, {}), d["aborted"].get(site, 0) | d["always"], d["warm_vectors"].get(site, ())
+
+    def memo(self, test_id):
+        """Hand-over fingerprints of an executor test (see br/memo.py), or None."""
+        if self._memo is None:
+            path = os.path.join(self.dir, "memo.pkl")
+            self._memo = {}
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    self._memo = pickle.loads(zlib.decompress(fh.read()))
+                for d in self._memo.values():
+                    d["back"] = {rel: frozenset(lines) for rel, lines in d["back"].items()}
+        return self._memo.get(test_id)
 
     def attr_readers(self, cls_keys, name):
         """Tests that read constant `name` from the definition in one of `cls_keys`.

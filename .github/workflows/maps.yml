@@ -30,6 +30,7 @@ jobs:
               python tools/trace_rel_all.py /app/repo /src/sample/tests.json /out/rel 4
               python tools/trace_rel_one.py /app/repo @import /out/rel_import.json
               python tools/build_relations.py /out/rel /src/sample/tests.json /app/repo /out/maps /out/rel_import.json
+              python tools/trace_memo.py /app/repo /out/memo.json /out/maps
             '
       - uses: actions/upload-artifact@v4
         with:
