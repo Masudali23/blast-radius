@@ -1,0 +1,35 @@
+name: validate
+# End-to-end check against real pytest runs on synthetic patches, in the scorer's image (manual).
+on:
+  workflow_dispatch:
+    inputs:
+      seed:
+        default: "101"
+      count:
+        default: "320"
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Check shard
+        run: |
+          mkdir -p out
+          docker run --rm --platform linux/amd64 --user 0:0 \
+            --volume $PWD:/src:ro --volume $PWD/out:/out \
+            --env PYTHONDONTWRITEBYTECODE=1 --env SKIP_INTEGRATION=0 \
+            blast-radius-entry python /src/tools/validation/ci_shard.py /src /out ${{ inputs.seed }} ${{ inputs.count }} ${{ matrix.shard }} 20
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ inputs.seed }}-${{ matrix.shard }}
+          path: |
+            out/result_*.json
+            out/*.patch
+            out/debug.json

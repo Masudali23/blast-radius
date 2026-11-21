@@ -36,50 +36,77 @@ class Lane:
         self.overlay = Overlay(base, os.path.join(tmp, "o"))
         self.z = {}
         self.proc = None
+        self.core_loaded = None
         self.cut = None
         self._deadline = 60.0
         self.log = log or (lambda *a: None)
 
     def _start_base(self):
-        """Start the bare worker; it can later fork the full one over a second pipe pair."""
+        """Start the bare worker.  The core and full workers are forked from it later, each over
+        its own pipe pair created here."""
         env = dict(os.environ)
         env["PYTHONPATH"] = self.app_dir
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env.setdefault("SKIP_INTEGRATION", "0")
-        to_full_r, to_full_w = os.pipe()
-        from_full_r, from_full_w = os.pipe()
-        args = [sys.executable, "-m", "br.worker", self.overlay.root, self.base, str(to_full_r), str(from_full_w)] + list(THIRD_PARTY)
-        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=self.app_dir, bufsize=0, start_new_session=True, pass_fds=(to_full_r, from_full_w))
-        os.close(to_full_r)
-        os.close(from_full_w)
+        child_fds, self._ends = [], {}
+        for mode in ("core", "full"):
+            to_r, to_w = os.pipe()
+            from_r, from_w = os.pipe()
+            child_fds += [to_r, from_w]
+            self._ends[mode] = (to_w, from_r)
+        args = [sys.executable, "-m", "br.worker", self.overlay.root, self.base] + [str(fd) for fd in child_fds] + list(THIRD_PARTY)
+        p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, cwd=self.app_dir, bufsize=0, start_new_session=True, pass_fds=tuple(child_fds))
+        for fd in child_fds:
+            os.close(fd)
         self.proc = p
         bare = Chan(p.pid, p.stdin.fileno(), p.stdout.fileno())
-        self._full_fds = (to_full_w, from_full_r)
-        try:
-            line = self._readline(bare, START_TIMEOUT)
-        except TimeoutError:
-            line = b""
-        if line.strip() != b"READY":
-            self._kill()
-            raise RuntimeError("worker did not start: %r" % (line,))
+        self._await(bare, "bare")
         self.z["bare"] = bare
 
+    def _await(self, chan, mode):
+        try:
+            line = self._readline(chan, START_TIMEOUT)
+        except TimeoutError:
+            line = b""
+        if not line.startswith(b"READY"):
+            self._kill()
+            raise RuntimeError("%s worker did not start: %r" % (mode, line[:80]))
+        return line[5:].strip()
+
     def _start(self, mode):
+        """Start `mode` and whatever precedes it in the chain bare -> core -> full."""
         if "bare" not in self.z:
             self._start_base()
-        if mode == "full":
-            bare = self.z["bare"]
-            bare.send(b'{"fork_full":1}\n')
-            full = Chan(bare.pid, self._full_fds[0], self._full_fds[1])
+        if mode in ("core", "full") and "core" not in self.z:
+            self.z["bare"].send(b'{"fork":"core"}\n')
+            core = Chan(self.proc.pid, *self._ends["core"])
+            payload = self._await(core, "core")
             try:
-                line = self._readline(full, START_TIMEOUT)
-            except TimeoutError:
-                line = b""
-            if line.strip() != b"READY":
-                self._kill()
-                raise RuntimeError("full worker did not start: %r" % (line,))
+                self.core_loaded = set(json.loads(payload)) if payload else set()
+            except ValueError:
+                self.core_loaded = None
+            self.z["core"] = core
+        if mode == "full" and "full" not in self.z:
+            self.z["core"].send(b'{"fork":"full"}\n')
+            full = Chan(self.proc.pid, *self._ends["full"])
+            self._await(full, "full")
             self.z["full"] = full
         return self.z[mode]
+
+    def fresh_mode(self, files):
+        """Where a change that needs a fresh import can be checked from: the core worker when
+        none of the changed python files is already loaded there, the bare one otherwise."""
+        if "core" not in self.z:
+            self._start("core")
+        loaded = self.core_loaded
+        if loaded is None:
+            return "bare"
+        for rel in files:
+            if rel in loaded:
+                return "bare"
+            if rel.endswith(".py") and not rel.startswith(("sqlglot/", "tests/")):
+                return "bare"
+        return "core"
 
     def _readline(self, p, timeout):
         """One line from the worker, or TimeoutError.  b"" means the pipe closed."""

@@ -57,7 +57,8 @@ from br import inlinepool, worker
 
 inlinepool.install()
 worker._limit_duckdb_threads()
-worker.preload(root)
+worker.preload_core(root)
+worker.preload(root, skip=worker.LAZY_MODULES)
 mon.set_events(tool, 0)
 loaded = {getattr(m, "__file__", None) for m in list(sys.modules.values())}
 data_files = sorted(f for f in opened if os.path.join(root, f) not in loaded)

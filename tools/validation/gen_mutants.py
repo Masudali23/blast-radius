@@ -20,6 +20,8 @@ count = int(sys.argv[3])
 seed = int(sys.argv[4])
 kinds = sys.argv[5:] or ["code", "comment", "fixture", "multi"]
 rng = random.Random(seed)
+# pick the file of a code mutant uniformly (as the kit's samples appear to) rather than by size
+UNIFORM = os.environ.get("BR_GEN_UNIFORM") == "1"
 os.makedirs(out_dir, exist_ok=True)
 
 COMMENTS = [
@@ -331,7 +333,7 @@ def make_patch(changes):
 
 def one(kind):
     if kind == "code":
-        ch, op = mutate_code(by_line=rng.random() < 0.5)
+        ch, op = mutate_code(by_line=(not UNIFORM) and rng.random() < 0.5)
     elif kind == "comment":
         ch, op = mutate_comment(FIX if rng.random() < 0.15 else None)
     elif kind == "fixture":

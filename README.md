@@ -16,13 +16,17 @@ selects the ones that actually fail. Anything it could not check cheaply stays s
 3. **Find candidates** (`br/plan.py`, `br/maps.py`): coverage maps built from the pinned commit
    say, for every source line, which tests execute it. Only tests that execute a changed
    statement (or import the changed module, or open the changed fixture) are candidates.
-4. **Run them** (`br/worker.py`, `br/engine.py`): a worker process imports sqlglot and all test
-   modules once. For each commit it forks; the child swaps in the new code objects of the
-   changed functions and runs the candidate tests with `unittest`, in collection order.
-   Module/class level changes are run from a fresh import instead. Fixture edits are served
-   through a symlink overlay in `/tmp` (the image is read-only).
+4. **Run them** (`br/worker.py`, `br/engine.py`): warm worker processes fork one child per
+   commit. For a change inside functions the child swaps in the new code objects and runs the
+   candidate tests with `unittest`, in collection order. Module/class level changes are run from
+   a fresh import instead. Fixture edits are served through a symlink overlay in `/tmp` (the
+   image is read-only).
 5. **Select** (`selector.py`): tests that fail are selected and packed onto 1–8 workers
    (longest first onto the lightest worker, trying every worker count).
+
+Workers form a chain so nothing is imported twice: *bare* (third-party libraries) → *core*
+(sqlglot without dialects) → *full* (all dialects, all test modules, the executor fixtures).
+A change is checked from the warmest worker that has not already loaded the changed file.
 
 ## Keeping the CPU bill down
 
@@ -33,12 +37,17 @@ CPU time is part of the score, so the selector avoids running what it can decide
   For an edited fixture, only the entries that differ are run.
 - **Scaled tests**: `test_max_nodes` and `test_generator_memory` are slow only because of a size
   constant. They run with the constant reduced; every assertion and code path is unchanged.
+- **Class attributes**: a changed class-level constant can only matter to tests that read that
+  name on an instance of the class (or a subclass). Candidates are narrowed with an index of
+  where each name is read and a record of which classes each test instantiates. For an edited
+  entry of a class-level dict, the tests that look that key up (or invoke the callable stored
+  under it) are known too; entries read while classes are being built are never narrowed.
 - **Cost-based staging**: cheap candidates run first; a slower candidate is run only when that is
   expected to cost less than simply selecting it. When a change reaches so many tests that
   running them would cost more than selecting them, they are selected unseen.
-- **Class attributes**: a changed class-level constant can only matter to tests that read that
-  name on an instance of the class (or a subclass), so the candidates are narrowed with an
-  index of where each name is read and a record of which classes each test instantiates.
+- **Slow tests**: a test too slow to run in full is selected, unless everything else passes
+  (or, when something fails, the tests closest to it — same test file or same fixture — all
+  pass) and a sample of its own fixture entries passes too.
 
 `br/infect.py` is a diagnostic (off by default): it evaluates the old and new versions of a
 changed expression side by side while tests run.
@@ -49,12 +58,16 @@ changed expression side by side while tests run.
 
 - per source file: line → tests executing it (call time and import time separately),
 - files each test opens, modules it imports, classes it instantiates,
+- class-level dict entries each test looks up or invokes,
+- where each class/module level name is read,
 - per fixture entry coverage for fixture-driven tests,
-- the lines that already run while the worker warms up.
+- the lines that already run while the workers warm up, and each test's measured cost.
 
-They are produced by `tools/trace_all.py`, `tools/trace_slices_all.py`, `tools/trace_import.py`
-and compiled by `tools/build_maps.py`. Each test is traced in its own process so that caches
-warmed by one test never hide lines from another.
+They are produced by `tools/trace_all.py` (once plain for coverage, once with
+`BR_INSTRUMENT=1` for class and dict usage), `tools/trace_slices_all.py`,
+`tools/trace_import.py`, `tools/calibrate.py` and `tools/build_reads.py`, and compiled by
+`tools/build_maps.py`. Each test is traced in its own process so that caches warmed by one test
+never hide lines from another.
 
 There is no table from patches, or from kinds of edit, to failing tests anywhere in this
 repository.

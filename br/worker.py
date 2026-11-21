@@ -46,6 +46,46 @@ def preload_modules(root):
     return sorted(mods)
 
 
+CORE_PACKAGES = ("sqlglot.expressions", "sqlglot.optimizer", "sqlglot.executor")
+CORE_MODULES = ("sqlglot.lineage", "sqlglot.planner", "sqlglot.diff", "sqlglot.serde", "sqlglot.anonymize", "sqlglot.jsonpath", "sqlglot.transforms", "sqlglot.schema", "sqlglot.time", "sqlglot.trie")
+
+
+def preload_core(root):
+    """sqlglot without any dialect: what the "core" zygote holds.  A patch that only touches
+    files this does not load can be checked from here, importing just the dialects it needs."""
+    import pkgutil
+
+    try:
+        importlib.import_module("sqlglot")
+    except BaseException:
+        return
+    for pkg in CORE_PACKAGES:
+        try:
+            m = importlib.import_module(pkg)
+            for info in pkgutil.iter_modules(m.__path__, pkg + "."):
+                try:
+                    importlib.import_module(info.name)
+                except BaseException:
+                    pass
+        except BaseException:
+            pass
+    for name in CORE_MODULES:
+        try:
+            importlib.import_module(name)
+        except BaseException:
+            pass
+
+
+def loaded_files(root):
+    prefix = root + os.sep
+    out = []
+    for m in list(sys.modules.values()):
+        f = getattr(m, "__file__", None)
+        if f and f.startswith(prefix):
+            out.append(f[len(prefix):])
+    return sorted(out)
+
+
 def preload(root, skip=()):
     for m in preload_modules(root):
         if m in skip:
@@ -508,32 +548,43 @@ def _limit_duckdb_threads():
     duckdb.connect = connect
 
 
-def serve(mode, overlay, base, in_fd, out_fd, spare=None):
+def serve(mode, overlay, base, in_fd, out_fd, spares):
     """The zygote loop: one forked child per job.
 
-    A "bare" zygote can also be asked to fork a "full" one, which then inherits the already
-    imported third-party libraries and talks to the caller over the spare pipe pair.
+    Zygotes form a chain, each forked from the previous one so nothing is imported twice:
+      bare  third-party libraries only
+      core  + sqlglot without dialects
+      full  + every dialect, every test module, expensive class set-ups
+    `spares` maps the next mode down the chain to its pipe pair.
     """
-    if mode == "full":
+    ready = b"READY"
+    if mode == "core":
+        preload_core(overlay)
+        ready += b" " + json.dumps(loaded_files(overlay)).encode()
+    elif mode == "full":
         preload(overlay, skip=LAZY_MODULES)
         gc.collect()
         index_functions(overlay)
     gc.collect()
     gc.freeze()
-    os.write(out_fd, b"READY\n")
+    os.write(out_fd, ready + b"\n")
     while True:
         line = _read_line(in_fd)
         if not line or line.strip() == b"quit":
             break
         job = json.loads(line)
-        if job.get("fork_full") and spare is not None:
+        nxt = job.get("fork")
+        if nxt:
+            fds = spares.get(nxt)
+            if fds is None:
+                continue
             pid = os.fork()
             if pid == 0:
                 try:
                     os.close(in_fd)
                     os.close(out_fd)
                     gc.unfreeze()
-                    serve("full", overlay, base, spare[0], spare[1])
+                    serve(nxt, overlay, base, fds[0], fds[1], {k: v for k, v in spares.items() if k != nxt})
                 finally:
                     os._exit(0)
             continue
@@ -565,9 +616,9 @@ def serve(mode, overlay, base, in_fd, out_fd, spare=None):
 
 
 def main():
-    # usage: worker.py <overlay> <base> <spare_in_fd> <spare_out_fd> [modules to preload...]
+    # usage: worker.py <overlay> <base> <core_in> <core_out> <full_in> <full_out> [modules...]
     overlay, base = sys.argv[1], sys.argv[2]
-    spare = (int(sys.argv[3]), int(sys.argv[4]))
+    spares = {"core": (int(sys.argv[3]), int(sys.argv[4])), "full": (int(sys.argv[5]), int(sys.argv[6]))}
     out_fd = os.dup(1)
     in_fd = os.dup(0)
     # nothing imported below may write into the protocol channel
@@ -589,14 +640,14 @@ def main():
     from br import inlinepool
 
     inlinepool.install()
-    for name in sys.argv[5:]:
+    for name in sys.argv[7:]:
         try:
             importlib.import_module(name)
         except Exception:
             pass
     _limit_duckdb_threads()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
-    serve("bare", overlay, base, in_fd, out_fd, spare)
+    serve("bare", overlay, base, in_fd, out_fd, spares)
 
 
 if __name__ == "__main__":

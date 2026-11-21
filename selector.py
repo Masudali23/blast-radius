@@ -24,6 +24,8 @@ MAPS = os.environ.get("BR_MAPS", "/app/maps")
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 DEBUG = os.environ.get("BR_DEBUG")
 
+# diagnostic build: tag expensive commits in the simulated milliseconds (see Selector.diagnose)
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 FIXTURES = "tests/fixtures/"
 CLASS_FIXTURES = set(variants.CLASS_LISTS.values())
 WORKER_MS = 2000
@@ -35,6 +37,7 @@ CAL = float(os.environ.get("BR_CAL", "1.25"))
 # a candidate set is "broad" when running it all costs more than this share of selecting it all
 BROAD_FRAC = float(os.environ.get("BR_BROAD_FRAC", "0.75"))
 BROAD_MIN = float(os.environ.get("BR_BROAD_MIN", "2.0"))
+BROAD_COST = float(os.environ.get("BR_BROAD_COST", "6.0"))
 SCALED_SHARE = 0.03
 # tests up to this estimated cost are simply run; costlier ones only while nothing has failed yet
 CHEAP = float(os.environ.get("BR_CHEAP", "0.4"))
@@ -238,7 +241,8 @@ class Selector:
         cost_all = None
         if total_est > BROAD_MIN * 1000:
             cost_all = split([n for n, _, _ in cheap + costly + deferred], ms)[1]
-        broad = cost_all is not None and total_est > BROAD_FRAC * cost_all
+        # (a small set is always run: checking it costs about what selecting it would)
+        broad = cost_all is not None and cost_all >= BROAD_COST * 1000 and total_est > BROAD_FRAC * cost_all
         if broad:
             # Running a sample proves nothing about the tests left out, so select the candidates
             # unseen.  Only tests whose own weight in the bill exceeds the cost of checking them
@@ -248,7 +252,7 @@ class Selector:
             return likely, "unseen"
 
         lane = self.get_lane()
-        st = {"mode": "bare" if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}}
+        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}}
 
         def install():
             lane.ensure(st["mode"])
@@ -272,9 +276,9 @@ class Selector:
                     dbg["fallback"] = err
                     lane.finish()
                     lane.overlay.restore()
-                    st["mode"] = "bare"
+                    st["mode"] = lane.fresh_mode(plan.files)
                     install()
-                    results, err = lane.run("bare", jobs, stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
+                    results, err = lane.run(st["mode"], jobs, stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
                 st["open"] = True
                 st["probed"] = lane.probed and st["mode"] == "full"
             else:
@@ -427,7 +431,7 @@ class Selector:
         if not to_run:
             return sorted(keep) + likely, "broad-blind"
         lane = self.get_lane()
-        mode = "bare" if plan.fresh else "full"
+        mode = lane.fresh_mode(plan.files) if plan.fresh else "full"
         back = []
         lane.ensure(mode)
         try:
@@ -440,7 +444,7 @@ class Selector:
             if err and full and not results:
                 dbg["fallback"] = err
                 lane.overlay.restore()
-                mode = "bare"
+                mode = lane.fresh_mode(plan.files)
                 lane.ensure(mode)
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
@@ -535,6 +539,63 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": keys}, self.cpu[n] * (spent + 0.02)
 
+    def diagnose(self, commit, selected, workers, cost):
+        """Diagnostic build only: tag each expensive commit with the path that produced it.
+
+        The scorer reports simulated milliseconds exactly, so a few harmless extra tests of
+        known duration on the busiest worker (or one extra worker) tell which decision path the
+        costly commits went through.  Adds cost and never removes a test.
+        """
+        if cost < 8000:
+            return workers, cost
+        d = self.debug.get(commit, {})
+        how = d.get("how")
+        ms = self.ms
+        chosen = set(selected)
+        slow = {n for n in chosen if ms[n] >= 3500}
+        num = {tid: n for n, tid in self.id_of.items()}
+        failed = {num[t] for t in d.get("failed", ()) if t in num}
+        unverified = set(d.get("unverified") or ())
+        if how in ("all", "out-of-time") or "crash" in d or how is None:
+            # one more worker than needed: +2000 ms
+            k = len(workers) + 1
+            if k <= MAX_WORKERS and len(selected) >= k:
+                items = sorted(selected, key=lambda n: -ms[n])
+                loads, ws = [0] * k, [[] for _ in range(k)]
+                for n in items:
+                    i = loads.index(min(loads))
+                    loads[i] += ms[n]
+                    ws[i].append(n)
+                return [w for w in ws if w], max(loads) + WORKER_MS * k
+            return workers, cost
+        if how == "broad-blind":
+            tag = 16
+        elif slow & failed:
+            tag = 1
+        elif slow & unverified:
+            tag = 4
+        elif how in ("unseen", "heavy-kept", "sure") or (slow and not (slow & failed)):
+            tag = 64
+        else:
+            tag = 256
+        if any(ms[n] >= 25000 for n in chosen):
+            tag += 1024  # the slowest test of all is in the selection
+        extra, left = [], tag
+        for n in sorted((n for n in self.all_numbers if n not in chosen and 0 < ms[n] <= tag), key=lambda n: -ms[n]):
+            if ms[n] <= left:
+                extra.append(n)
+                left -= ms[n]
+                if not left:
+                    break
+        if left:
+            return workers, cost
+        loads = [sum(ms[n] for n in w) for w in workers]
+        i = loads.index(max(loads))
+        workers = [list(w) for w in workers]
+        workers[i].extend(extra)
+        d["diag"] = tag
+        return workers, cost + tag
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -553,6 +614,8 @@ class Selector:
                 selected = list(self.all_numbers)
                 self.debug.setdefault(commit, {})["crash"] = repr(e)
             workers, cost = split(selected, self.ms)
+            if DIAG:
+                workers, cost = self.diagnose(commit, selected, workers, cost)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")

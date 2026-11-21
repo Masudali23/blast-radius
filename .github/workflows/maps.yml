@@ -20,11 +20,12 @@ jobs:
               set -e
               cp -r /src/tools /src/br /tmp/ && cd /tmp
               python tools/trace_all.py /app/repo /src/sample/tests.json /out/trace 4
+              BR_INSTRUMENT=1 python tools/trace_all.py /app/repo /src/sample/tests.json /out/usage 4
               python tools/trace_slices_all.py /app/repo /src/sample/tests.json /out/slices 4 0.05
               python tools/trace_import.py /app/repo /out/import_trace.json
               python tools/calibrate.py /app/repo /src/sample/tests.json /out/calib.json /tmp/cal
               mkdir -p /out/maps
-              python tools/build_maps.py /out/trace /src/sample/tests.json /out/import_trace.json /out/maps /out/slices /out/calib.json
+              python tools/build_maps.py /out/trace /src/sample/tests.json /out/import_trace.json /out/maps /out/slices /out/calib.json /out/usage
               python tools/build_reads.py /app/repo /out/maps
             '
       - uses: actions/upload-artifact@v4
