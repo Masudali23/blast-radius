@@ -12,6 +12,7 @@ Protocol (line oriented, on the pipes given by the parent):
   child  -> parent : "T <index> <P|F|S> <cpu_ms>" per finished test, "X <reason>" if the job
                      cannot be honoured, and the zygote ends each job with "END <exit status>"
 """
+import ast
 import gc
 import importlib
 import json
@@ -236,6 +237,39 @@ def hot_swap(path, old_src, new_src, probe=False, base_path=None):
     for old, new in pairs:
         if not found[id(old)]:
             return "no live function for %s:%d" % (old.co_qualname, old.co_firstlineno)
+    return None
+
+
+_ABSENT = object()
+
+
+def give_constant(path, names, attr, old_repr, new_repr):
+    """Set a class constant of an already imported module to its patched literal value.
+
+    Only for a constant nothing read while modules loaded (the planner checks that): the warm
+    process then differs from a freshly imported patched one in this attribute alone.
+    Returns None on success, or why a fresh import is required."""
+    if path not in LOADED:
+        return None  # not imported yet: the child will import the patched source itself
+    module = next((m for m in list(sys.modules.values()) if getattr(m, "__file__", None) == path), None)
+    if module is None:
+        return "module not found"
+    obj = module
+    for n in names:
+        obj = vars(obj).get(n)
+        if not isinstance(obj, type):
+            return "class not found"
+    try:
+        old, new = ast.literal_eval(old_repr), ast.literal_eval(new_repr)
+    except Exception:
+        return "not a literal"
+    current = obj.__dict__.get(attr, _ABSENT)
+    if current is _ABSENT or type(current) is not type(old) or current != old:
+        return "the class does not hold the pinned value"
+    try:
+        type.__setattr__(obj, attr, new)
+    except Exception as e:
+        return "cannot set: %r" % (e,)
     return None
 
 
@@ -505,6 +539,13 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
             if why:
                 runner.emit("X %s: %s" % (rel, why))
                 return
+        for rel, names, attr, old_repr, new_repr in job.get("consts", ()):
+            why = give_constant(os.path.join(overlay, rel), names, attr, old_repr, new_repr)
+            if why:
+                runner.emit("X %s: %s" % (rel, why))
+                return
+        if job.get("consts"):
+            runner.classes = {}  # class set-ups made before the fork saw the old value
         if PROBED[0]:
             infect.install()
             runner.emit("I %d" % PROBED[0])

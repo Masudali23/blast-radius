@@ -19,6 +19,8 @@ REFINE_RELATIONS = os.environ.get("BR_REFINE_RELATIONS", "1") == "1"
 REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
 # narrow an edited class-level constant to the tests that read it from that class
 REFINE_ATTRS = os.environ.get("BR_REFINE_ATTRS", "1") == "1"
+# hand a changed literal class constant to the warm worker instead of importing afresh
+HOT_CONSTS = os.environ.get("BR_HOT_CONSTS", "1") == "1"
 # narrow an edited class-level dict entry to the tests that look that entry up
 REFINE_KEYS = os.environ.get("BR_REFINE_KEYS", "1") == "1"
 # use the index of real reads of a name (rather than any textual mention) to find its users
@@ -32,7 +34,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts")
 
     def __init__(self, commit):
         self.commit = commit
@@ -58,6 +60,9 @@ class Plan:
         # (path, lo, hi) of a narrowed function change -> f(test id): the fixture entries of a
         # sliced test the change can reach (bit mask), or None when that is not known
         self.entry = {}
+        # class constants the warm worker can simply be given: [path, [class, ...], NAME,
+        # repr(old), repr(new)]
+        self.consts = []
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -252,6 +257,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
         plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | maps.any_line(rel))
         return
     shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
+    given = False  # the file's one change is a class constant handed to the warm worker
     plan.code_files += 1
     hot = True
     swap = regroup = operand = None
@@ -356,6 +362,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     plan.add("mod", rel, lo, hi, mask & readers)
                     # of a sliced test, the entries that read the constant from this definition
                     plan.entry[(rel, lo, hi)] = (lambda items: lambda test_id: maps.entry_use(test_id, "attr_reads", items))(["%s:%d\t%s" % (rel, line, c.names[0]) for line in c.cls_lines])
+                    patch = _const_patch(c, rel) if HOT_CONSTS and len(changes) == 1 and analyze.harmless_at_import(c) else None
+                    if patch is not None:
+                        # Nothing read this constant while modules loaded (that is what made the
+                        # narrowing possible), so a fresh import would differ from the warm
+                        # worker in this one attribute only: set it there instead.
+                        plan.consts.append(patch)
+                        given = True
                     _import_guard(plan, rel, c, everyone, mask & readers)
                     continue
             factors = []  # the same narrowings, asked per fixture entry of a sliced test
@@ -382,7 +395,9 @@ def _changed(plan, rel, old, new, base, maps, opts):
             if factors:
                 plan.entry[(rel, lo, hi)] = _all_of(factors)
             _import_guard(plan, rel, c, everyone, mask)
-    if hot:
+    if given:
+        pass  # no function changes and nothing to import afresh
+    elif hot:
         plan.swaps.append(rel)
         if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
             if infect.applicable(analyze.TREES[0], analyze.TREES[1]):
@@ -452,6 +467,42 @@ def _asked(maps, rel, operand):
         if boolrel.asks_for(struct, kind, vec, index):
             mask |= tests
     return mask
+
+
+def _const_patch(c, rel):
+    """[path, [class, ...], NAME, repr(old), repr(new)] when a change replaces one literal
+    class constant by another, else None."""
+    if c.stmts is None or not c.cls or len(c.names) != 1 or not analyze.TREES:
+        return None
+    values = []
+    for st in c.stmts:
+        if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            target, value = st.targets[0].id, st.value
+        elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name) and st.value is not None:
+            target, value = st.target.id, st.value
+        else:
+            return None
+        if target != c.names[0]:
+            return None
+        try:
+            values.append(ast.literal_eval(value))
+        except Exception:
+            return None
+    old, new = c.stmts
+    if type(old) is not type(new):
+        return None
+    if isinstance(old, ast.AnnAssign) and ast.dump(old.annotation) != ast.dump(new.annotation):
+        return None
+    path, body = [], analyze.TREES[0].body
+    while True:
+        inner = next((n for n in body if isinstance(n, ast.ClassDef) and n.lineno <= old.lineno <= n.end_lineno), None)
+        if inner is None:
+            break
+        path.append(inner.name)
+        body = inner.body
+    if not path or path[-1] != c.cls or not any(n.lineno == old.lineno and type(n) is type(old) for n in body):
+        return None
+    return [rel, path, c.names[0], repr(values[0]), repr(values[1])]
 
 
 def _entries_swapped(maps, rel, swap):

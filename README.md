@@ -45,6 +45,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   Plain constants of the dialect, tokenizer, parser, generator and expression classes are
   followed more closely: while the maps are built each one sits behind a descriptor that
   records which tests read it from that very definition.
+  When such a constant is a literal replaced by another literal, nothing read it while
+  modules loaded, so a freshly imported patched program differs from the warm worker in that
+  one attribute: the worker's forked child is simply given the new value (any class set-up
+  it inherited is run again), which saves the import.
   Reads that need no instance are indexed separately (`tools/build_reads.py`): a name read off
   a class object (`cls.NAME` in a classmethod, `exp.Select.NAME`) counts for every class that
   read can stand for; a name read while modules load to build something stored under another

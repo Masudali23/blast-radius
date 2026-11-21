@@ -267,7 +267,7 @@ class Selector:
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
                 full = m == "full"
-                results, err = lane.run(m, jobs, swap=plan.swaps if full else (), deadline=wait, cpu_budget=cpu)
+                results, err = lane.run(m, jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), deadline=wait, cpu_budget=cpu)
                 if err and full and not results:
                     lane.overlay.restore()
                     m = lane.fresh_mode(plan.files)
@@ -503,7 +503,7 @@ class Selector:
                 budget = 30.0 + 4.0 * (total_est + sum(e for _, _, e in deferred)) / 1000.0
                 budget = max(10.0, min(budget, self.stop_at + 30.0 - time.monotonic()))
                 full = st["mode"] == "full"
-                results, err = lane.run(st["mode"], jobs, swap=plan.swaps if full else (), probe=plan.probe if full else (), stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
+                results, err = lane.run(st["mode"], jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), probe=plan.probe if full else (), stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
                 if err and full and not results:
                     # the warm worker cannot take this change: start from a fresh import instead
                     dbg["fallback"] = err
@@ -746,7 +746,7 @@ class Selector:
             to_run.sort(key=lambda it: it[0])
             jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
-            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
+            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
             if err and full and not results:
                 dbg["fallback"] = err
                 lane.overlay.restore()
