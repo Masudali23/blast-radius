@@ -40,6 +40,14 @@ for k, cid in enumerate(ids):
         touched |= maps.any_line(f) | maps.opened.get(f, 0) | maps.imports.get(f, 0)
         if not maps.known(f) and f.endswith(".py") and f not in maps.opened:
             pass
+    if os.environ.get("BR_LABEL_PLAN") == "1":
+        # quicker labels for checking a refinement that sits on top of line coverage: only the
+        # tests the planner names (run it with that refinement switched off) are executed
+        from br import plan as planner
+
+        pl = planner.make_plan(cid, data, root, maps)
+        if not pl.unknown:
+            touched = pl.cand | pl.sure
     skip = {t["number"] for t in tests if not (touched >> idx[t["id"]]) & 1}
     run = [t for t in tests if t["number"] not in skip]
     try:

@@ -27,6 +27,9 @@ jobs:
               mkdir -p /out/maps
               python tools/build_maps.py /out/trace /src/sample/tests.json /out/import_trace.json /out/maps /out/slices /out/calib.json /out/usage
               python tools/build_reads.py /app/repo /out/maps
+              python tools/trace_rel_all.py /app/repo /src/sample/tests.json /out/rel 4
+              python tools/trace_rel_one.py /app/repo @import /out/rel_import.json
+              python tools/build_relations.py /out/rel /src/sample/tests.json /app/repo /out/maps /out/rel_import.json
             '
       - uses: actions/upload-artifact@v4
         with:

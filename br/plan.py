@@ -3,13 +3,16 @@ import os
 import re
 import sys
 
-from . import analyze, infect, patch
+from . import analyze, boolrel, infect, patch, relations
 
 # Files that configure the test run itself.  We cannot model those, so such a commit runs everything.
 # how far to narrow a class-attribute change: "off", "class" (instances of the class) or
 # "family" (instances of any class of the same dialect)
 REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 
+# a comparison operator swapped for its partner (is/==, </<=, ...) is in play only for the
+# tests in which the two ever give different answers
+REFINE_RELATIONS = os.environ.get("BR_REFINE_RELATIONS", "1") == "1"
 # an edited literal default value of a function is in play only for tests that call the function
 REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
 # narrow an edited class-level constant to the tests that read it from that class
@@ -209,14 +212,35 @@ def _changed(plan, rel, old, new, base, maps, opts):
         return
     shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
     hot = True
+    swap = regroup = None
+    if REFINE_RELATIONS and len(changes) == 1 and changes[0].level == "func" and analyze.TREES:
+        swap = relations.swapped(analyze.TREES[0], analyze.TREES[1])
+        if swap is None:
+            regroup = boolrel.swapped(analyze.TREES[0], analyze.TREES[1])
     for c in changes:
         if c.level == "func":
             plan.kinds.add("func")
             lo, hi = c.lines
             if not shapes_ok or c.coarse:
                 lo, hi = c.scope_span
-            plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
             slo, shi = c.scope_span
+            if swap:
+                differ, warm = maps.relation(rel, swap)
+                if differ is not None and not warm:
+                    # Every evaluation of this comparison outside these tests (and while the
+                    # worker loaded) gives what it gave before: nothing else can change.
+                    mask = maps.func(rel, lo, hi)
+                    plan.notes.append("relation-narrowed %s %s: %d -> %d" % (rel, swap, bin(mask).count("1"), bin(mask & differ).count("1")))
+                    plan.add("func", rel, lo, hi, mask & differ)
+                    continue
+            if regroup:
+                narrowed = _regrouped(maps, rel, regroup, analyze.TREES[0])
+                if narrowed is not None:
+                    mask = maps.func(rel, lo, hi)
+                    plan.notes.append("formula-narrowed %s %s: %d -> %d" % (rel, boolrel.site_key(regroup[0]), bin(mask).count("1"), bin(mask & narrowed).count("1")))
+                    plan.add("func", rel, lo, hi, mask & narrowed)
+                    continue
+            plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
             if maps.ran_at_import(rel, slo, shi):
                 hot = False
                 # anything built at import time from this function may differ
@@ -271,6 +295,29 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 plan.probe.append(rel)
     else:
         plan.fresh = True
+
+
+def _regrouped(maps, rel, regroup, old_tree):
+    """Tests in which the regrouped condition can behave differently, from its recorded
+    evaluations; None when nothing can be said."""
+    node, old, new, impure = regroup
+    seen = maps.formula(rel, boolrel.site_key(node))
+    if seen is None:
+        return None
+    truth_only = None
+    for n, flag in boolrel.formulas(old_tree):
+        if n is node:
+            truth_only = flag
+    if truth_only is None:
+        return None
+    vectors, keep, warm = seen
+    if any(boolrel.differs(old, new, kind, vec, impure, truth_only) for kind, vec in warm):
+        return None  # already behaved differently while the worker loaded
+    mask = keep
+    for (kind, vec), tests in vectors.items():
+        if boolrel.differs(old, new, kind, vec, impure, truth_only):
+            mask |= tests
+    return mask
 
 
 def _import_guard(plan, rel, change, everyone, narrowed):

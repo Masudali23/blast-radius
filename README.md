@@ -45,6 +45,18 @@ CPU time is part of the score, so the selector avoids running what it can decide
   Plain constants of the dialect, tokenizer, parser, generator and expression classes are
   followed more closely: while the maps are built each one sits behind a descriptor that
   records which tests read it from that very definition.
+- **Swapped comparison operators** (`br/relations.py`): `a is b` and `a == b` give the same
+  answer unless an object equals something it is not; `a < b` and `a <= b` unless the two are
+  equal. While the maps are built, every such comparison in sqlglot is evaluated both ways each
+  time it runs, and the tests in which the two ever disagree are recorded. A patch that only
+  swaps such an operator for its partner can change nothing in any other test: every
+  evaluation gives what it gave before, so the run is the same run.
+- **Regrouped conditions** (`br/boolrel.py`): for every `and` / `or` condition the maps keep
+  each distinct evaluation a test makes: which operands were evaluated and which were true
+  (operands free of calls are all evaluated, so the whole truth assignment is known). A patch
+  that only swaps `and` for `or` yields a second formula over the same operands; replaying the
+  recorded evaluations through both shows in which tests it could ask for an operand the
+  original skipped, skip a call the original made, or answer differently.
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
@@ -70,13 +82,16 @@ changed expression side by side while tests run.
 - files each test opens, modules it imports, classes it instantiates,
 - class-level dict entries each test looks up or invokes, class-level constants each test reads,
 - where each class/module level name is read,
+- per comparison: the tests in which the operator and its partner disagree; per and/or
+  condition: the evaluations each test makes,
 - per fixture entry coverage for fixture-driven tests,
 - the lines that already run while the workers warm up, and each test's measured cost.
 
 They are produced by `tools/trace_all.py` (once plain for coverage, once with
-`BR_INSTRUMENT=1` for class and dict usage), `tools/trace_slices_all.py`,
+`BR_INSTRUMENT=1` for class and dict usage), `tools/trace_rel_all.py` (comparisons and
+conditions, on source rewritten to report them), `tools/trace_slices_all.py`,
 `tools/trace_import.py`, `tools/calibrate.py` and `tools/build_reads.py`, and compiled by
-`tools/build_maps.py`. Each test is traced in its own process so that caches warmed by one test
+`tools/build_maps.py` and `tools/build_relations.py`. Each test is traced in its own process so that caches warmed by one test
 never hide lines from another.
 
 There is no table from patches, or from kinds of edit, to failing tests anywhere in this

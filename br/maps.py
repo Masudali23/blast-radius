@@ -34,6 +34,7 @@ class Maps:
         self._slices = {}
         self._reads = None
         self.meta_reads = set()
+        self._relations = None
         self._cache = {}
         self.all = (1 << len(self.ids)) - 1
 
@@ -158,6 +159,45 @@ class Maps:
             if want & set(self.ancestry.get(owner, (owner,))):
                 return True
         return False
+
+    def relation(self, rel, key):
+        """For the comparison at `key` in file `rel` (see br/relations.py): the tests in which
+        the operator and its partner ever disagree, and whether they disagreed while the warm
+        worker loaded.  (None, False) when that comparison was not observed."""
+        if self._relations is None:
+            path = os.path.join(self.dir, "relations.pkl")
+            d = {"sites": {}, "hits": {}, "always": 0, "warm": ()}
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    d = pickle.loads(zlib.decompress(fh.read()))
+            d["sites"] = {f: frozenset(keys) for f, keys in d["sites"].items()}
+            d["warm"] = frozenset(d["warm"])
+            if "formulas" in d:
+                d["formulas"] = {f: frozenset(keys) for f, keys in d["formulas"].items()}
+                d["warm_aborted"] = frozenset(d["warm_aborted"])
+                per = {}
+                for site, kind, vec in d["warm_vectors"]:
+                    per.setdefault(site, []).append((kind, vec))
+                d["warm_vectors"] = per
+            self._relations = d
+        d = self._relations
+        if key not in d["sites"].get(rel, ()):
+            return None, False
+        site = rel + "|" + key
+        return d["hits"].get(site, 0) | d["always"], site in d["warm"]
+
+    def formula(self, rel, key):
+        """Recorded evaluations of the condition at `key` (see br/boolrel.py):
+        ({(kind, vector): tests}, tests to keep regardless, evaluations made while the warm
+        worker loaded), or None when it was not observed or one of those did not finish."""
+        self.relation("", "")
+        d = self._relations
+        if key not in d.get("formulas", {}).get(rel, ()):
+            return None
+        site = rel + "|" + key
+        if site in d["warm_aborted"]:
+            return None
+        return d["vectors"].get(site, {}), d["aborted"].get(site, 0) | d["always"], d["warm_vectors"].get(site, ())
 
     def attr_readers(self, cls_keys, name):
         """Tests that read constant `name` from the definition in one of `cls_keys`.

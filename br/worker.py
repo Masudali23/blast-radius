@@ -27,6 +27,7 @@ from br import infect, variants
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
 IMPORT_LIMIT = 30.0  # seconds allowed for importing one patched module on its own
+GC_YOUNG = int(os.environ.get("BR_GC_YOUNG", "100000"))  # 0 keeps the interpreter's defaults
 
 
 class TestTimeout(KeyboardInterrupt):
@@ -388,6 +389,12 @@ def _read_line(fd):
 
 def run_job(job, mode, overlay, base, out_fd, in_fd=0):
     """Runs inside the forked child."""
+    if GC_YOUNG:
+        # A child lives for one commit.  With the default thresholds the collector runs every
+        # 700 allocations and keeps re-scanning the syntax trees the tests build; collecting
+        # less often changes when unreachable cycles are freed and nothing else.  (The tests
+        # that measure memory or watch weak references call gc.collect() themselves.)
+        gc.set_threshold(GC_YOUNG, 50, 100)
     runner = Runner(out_fd)
     # keep anything the tests print away from our channel
     devnull = os.open(os.devnull, os.O_RDWR)
