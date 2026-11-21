@@ -400,6 +400,28 @@ class Selector:
             if est < P_PASS_CLEAN * (current - without):
                 to_run.append(by_n[n])
                 keep.discard(n)
+        # A slow test that weighs on the bill can still be settled through the tests closest to
+        # it (same test file / same fixture file): run those and a sample of the slow test.
+        bundles = []  # (slow test, its related tests, its sample)
+        if HEAVY_FAILED == "related":
+            scheduled = {it[0] for it in to_run}
+            for n in sorted(keep, key=lambda n: -ms[n])[:4]:
+                if by_n[n][2] <= HEAVY * 1000:
+                    continue
+                gain = split(sorted(keep), ms)[1] - split(sorted(keep - {n}), ms)[1]
+                rel_mask = self.related_mask(n)
+                related = [by_n[m] for m in everything if m != n and by_n[m][2] <= CHEAP * 1000 and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
+                pn, pv, pe = self.slice_probe(plan, n)
+                if pv is None or len(related) < MIN_RELATED:
+                    continue
+                cost = pe + sum(e for m, _, e in related if m not in scheduled)
+                if cost < 0.5 * gain:
+                    bundles.append((n, [m for m, _, _ in related], (pn, pv, pe)))
+                    for it in related:
+                        if it[0] not in scheduled:
+                            scheduled.add(it[0])
+                            to_run.append(it)
+                    to_run.append((pn, pv, pe))
         dbg["broad"] = len(everything)
         dbg["unverified"] = sorted(keep)
         if not to_run:
@@ -423,10 +445,25 @@ class Selector:
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
                 results, err = lane.run(mode, jobs, deadline=60.0, cpu_budget=COMMIT_CPU)
+            outcome = {}
+            sampled = {b[0] for b in bundles}
             for i, (n, v, e) in enumerate(to_run):
                 r = results.get(i)
-                if r is None or r[0] in ("F", "U"):
+                bad = r is None or r[0] in ("F", "U")
+                outcome[n] = "F" if bad else "P"
+                if n in sampled:
+                    continue  # a sample, not the whole test: settled with its bundle below
+                if bad:
                     back.append(n)  # fails, or could not be checked: stays selected
+                keep.discard(n)
+            dropped = []
+            for n, related, _ in bundles:
+                if outcome.get(n) == "P" and all(outcome.get(m) == "P" for m in related):
+                    keep.discard(n)
+                    dropped.append(n)
+            if dropped:
+                dbg["related_dropped"] = dropped
+            dbg["unverified"] = sorted(keep)
             dbg["ran"] = len(results)
             dbg["cpu_ms"] = sum(r[1] for r in results.values())
             dbg["mode"] = mode
@@ -434,25 +471,31 @@ class Selector:
             lane.overlay.restore()
         return sorted(keep) + back + likely, "broad-blind"
 
-    def related_outcomes(self, n, outcome):
-        """(passed, failed) among the tests that ran and are close to test n: same test file,
-        or reading one of the fixture files n reads."""
-        idx = self.idx_of.get(n)
-        if idx is None:
-            return 0, 0
+    def related_mask(self, n):
+        """Map-index mask of the tests close to test n (same test file, or a shared fixture)."""
         mask = self._related.get(n)
         if mask is None:
             mask = 0
+            idx = self.idx_of.get(n)
             path = self.id_of[n].split("::")[0]
             for m, tid in self.id_of.items():
                 if tid.startswith(path + "::"):
                     j = self.idx_of.get(m)
                     if j is not None:
                         mask |= 1 << j
-            for f, readers in self.maps.opened.items():
-                if f.startswith(FIXTURES) and (readers >> idx) & 1:
-                    mask |= readers
+            if idx is not None:
+                for f, readers in self.maps.opened.items():
+                    if f.startswith(FIXTURES) and (readers >> idx) & 1:
+                        mask |= readers
             self._related[n] = mask
+        return mask
+
+    def related_outcomes(self, n, outcome):
+        """(passed, failed) among the tests that ran and are close to test n: same test file,
+        or reading one of the fixture files n reads."""
+        if self.idx_of.get(n) is None:
+            return 0, 0
+        mask = self.related_mask(n)
         passed = failed = 0
         for m, o in outcome.items():
             j = self.idx_of.get(m)
