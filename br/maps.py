@@ -26,6 +26,7 @@ class Maps:
         self.dict_names = set(idx.get("dict_names", ()))
         self.dict_all_keys = idx.get("dict_all_keys", {})
         self._dict_users = None
+        self._relsl = None
         self.class_users = idx.get("class_users", {})  # "file:line" of a class -> tests instantiating it
         self.tracked = set(idx.get("tracked", ()))
         self.cpu_ms = idx.get("cpu_ms") or []
@@ -218,6 +219,39 @@ class Maps:
             observed |= tests
         # (tests the tracer never saw evaluate the condition are not vouched for)
         return vectors, d["aborted"].get(site, 0) | d["always"] | (self.all & ~observed), d["warm_vectors"].get(site, ())
+
+    def _relslices(self):
+        if self._relsl is None:
+            path = os.path.join(self.dir, "relslices.pkl")
+            self._relsl = {}
+            if os.path.exists(path):
+                with open(path, "rb") as fh:
+                    self._relsl = pickle.loads(zlib.decompress(fh.read()))
+        return self._relsl
+
+    def entry_relation(self, test_id, rel, key):
+        """For a sliced test: the fixture entries (bit mask, slice-map order) in which the
+        comparison at `key` can behave differently under its partner operator: those in which
+        the two disagreed, and those the tracer did not see evaluate it at all.  None when the
+        test's entries were not recorded.  (tools/trace_rel_slices_one.py)"""
+        d = self._relslices().get(test_id)
+        if d is None:
+            return None
+        site = rel + "|" + key
+        return d["hits"].get(site, 0) | (((1 << d["n"]) - 1) & ~d["seen"].get(site, 0))
+
+    def entry_formula(self, test_id, rel, key):
+        """For a sliced test: ([(kind, vector, entries)], entries to keep regardless) for the
+        condition at `key`, or None when the test's entries were not recorded."""
+        d = self._relslices().get(test_id)
+        if d is None:
+            return None
+        site = rel + "|" + key
+        vectors = d["vectors"].get(site, ())
+        observed = d["aborted"].get(site, 0)
+        for _, _, entries in vectors:
+            observed |= entries
+        return vectors, d["aborted"].get(site, 0) | (((1 << d["n"]) - 1) & ~observed)
 
     def memo(self, test_id):
         """Hand-over fingerprints of an executor test (see br/memo.py), or None."""

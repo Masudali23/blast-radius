@@ -75,6 +75,15 @@ STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
 # a slow test whose sample passes is only let go when keeping it would add at least this many
 # seconds to the bill; a lighter one stays selected
 DROP_MIN = float(os.environ.get("BR_DROP_MIN", "8"))
+# The slowest test spends over half its time waiting for DuckDB, whose answers come from the
+# store when the image has them (br/tables.py): about this share of its calibrated CPU is left.
+ANSWER_TESTS = ("tests/test_executor.py::TestExecutor::test_execute_tpcds",)
+ANSWER_SHARE = float(os.environ.get("BR_ANSWER_SHARE", "0.5"))
+# with nothing failing, a slow test that can be sampled is run in full only up to this many
+# seconds of CPU; past that it is sampled
+CLEAN_RUN = float(os.environ.get("BR_CLEAN_RUN", "8"))
+# narrow sliced tests to the fixture entries a swapped operator / regrouped condition can reach
+ENTRY_NARROW = os.environ.get("BR_ENTRY_NARROW", "1") == "1"
 # for measuring only: select nothing that was not seen to fail
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -129,6 +138,10 @@ class Selector:
             idx = self.idx_of.get(n)
             cal = self.maps.cpu_ms[idx] if idx is not None and idx < len(self.maps.cpu_ms) else None
             self.cpu[n] = (cal * CAL) if cal is not None else self.ms[n] * 0.85
+        if self.stored_answers():
+            for n, tid in self.id_of.items():
+                if tid in ANSWER_TESTS:
+                    self.cpu[n] *= ANSWER_SHARE
         self.lane = None
         self.lane2 = None
         self._related = {}
@@ -171,6 +184,16 @@ class Selector:
         return self.lane2
 
     # ------------------------------------------------------------------ one commit
+    @staticmethod
+    def stored_answers():
+        """Does the table store hold DuckDB answers (tools/build_tables.py says so next to it)?"""
+        try:
+            with open(os.environ.get("BR_TABLES", "/app/tables.pkl") + ".info") as fh:
+                words = fh.read().split()
+            return len(words) == 2 and words[0] == "answers" and int(words[1]) > 0
+        except (OSError, ValueError):
+            return False
+
     def decide(self, commit, data):
         plan = planner.make_plan(commit, data, BASE, self.maps)
         dbg = {"kinds": sorted(plan.kinds), "notes": plan.notes, "fresh": plan.fresh}
@@ -384,12 +407,23 @@ class Selector:
             if kind != "func":
                 return None, 1.0
             table = sm["lines"].get(rel, {})
+            part = 0
             for line, m in self.maps.func_lines(rel, lo, hi):
                 if (m >> idx) & 1:
                     sl = table.get(line, 0)
                     if not sl:
                         return None, 1.0  # runs outside the fixture loop (class set-up, ...)
-                    allow |= sl
+                    part |= sl
+            entries = plan.entry.get((rel, lo, hi)) if ENTRY_NARROW else None
+            if entries is not None and part:
+                # a swapped operator or regrouped condition: of the entries that reach the
+                # line, only those in which it can behave differently (when none is recorded
+                # as such although the test is a candidate, the recording does not explain
+                # the test and every entry that reaches the line is run)
+                reach = entries(tid)
+                if reach is not None and part & reach:
+                    part &= reach
+            allow |= part
             if allow == full:
                 return None, 1.0
         share = sm["share"]
@@ -542,7 +576,7 @@ class Selector:
                 for item in sorted(later, key=lambda it: it[2]):
                     n, v, est = item
                     keep_cost = cost_of(base + keep + [n]) - cost_of(base + keep)
-                    if est < p_pass * keep_cost:
+                    if est < p_pass * keep_cost and (failed or est <= CLEAN_RUN * 1000 or self.slice_probe(plan, n)[1] is None):
                         run_list.append(item)
                     else:
                         keep.append(n)

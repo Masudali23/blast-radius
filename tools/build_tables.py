@@ -127,6 +127,8 @@ def main():
     stored[tables.ANSWERS] = answers
     with open(out, "wb") as fh:
         pickle.dump(stored, fh, protocol=5)
+    with open(out + ".info", "w") as fh:  # for the selector, which never loads the rows itself
+        fh.write("answers %d\n" % sum(len(v) for v in answers.values()))
     print("tables:", ntables, "rows:", nrows, "DuckDB answers:", sum(len(v) for v in answers.values()), "bytes:", os.path.getsize(out))
 
 

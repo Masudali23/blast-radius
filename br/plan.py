@@ -32,7 +32,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry")
 
     def __init__(self, commit):
         self.commit = commit
@@ -55,6 +55,9 @@ class Plan:
         self.wide = 0
         self.code_files = 0  # python files whose code (not just comments) changes
         self.partner_swaps = 0  # changes narrowed as "operator swapped for its partner"
+        # (path, lo, hi) of a narrowed function change -> f(test id): the fixture entries of a
+        # sliced test the change can reach (bit mask), or None when that is not known
+        self.entry = {}
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -279,6 +282,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("relation-narrowed %s %s: %d -> %d" % (rel, swap, bin(mask).count("1"), bin(mask & differ).count("1")))
                     plan.add("func", rel, lo, hi, mask & differ)
+                    plan.entry[(rel, lo, hi)] = _entries_swapped(maps, rel, swap)
                     plan.partner_swaps += 1
                     if at_import:
                         # nothing computed while loading differs, but function objects made
@@ -291,6 +295,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("formula-narrowed %s %s: %d -> %d" % (rel, boolrel.site_key(regroup[0]), bin(mask).count("1"), bin(mask & narrowed).count("1")))
                     plan.add("func", rel, lo, hi, mask & narrowed)
+                    plan.entry[(rel, lo, hi)] = _entries_regrouped(maps, rel, regroup, analyze.TREES[0])
                     if at_import:
                         hot = False  # as above: objects made while loading hold the old code
                     continue
@@ -302,6 +307,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     mask = maps.func(rel, lo, hi)
                     plan.notes.append("operand-narrowed %s %s[%d]: %d -> %d" % (rel, boolrel.site_key(operand[0]), operand[2], bin(mask).count("1"), bin(mask & asked).count("1")))
                     plan.add("func", rel, lo, hi, mask & asked)
+                    plan.entry[(rel, lo, hi)] = _entries_asked(maps, rel, operand)
                     if at_import:
                         hot = False
                     continue
@@ -432,6 +438,49 @@ def _asked(maps, rel, operand):
         if boolrel.asks_for(struct, kind, vec, index):
             mask |= tests
     return mask
+
+
+def _entries_swapped(maps, rel, swap):
+    """The same question as maps.relation, asked per fixture entry of a sliced test."""
+    return lambda test_id: maps.entry_relation(test_id, rel, swap)
+
+
+def _entries_regrouped(maps, rel, regroup, old_tree):
+    node, old, new, impure = regroup
+    key = boolrel.site_key(node)
+    truth_only = None
+    for n, flag in boolrel.formulas(old_tree):
+        if n is node:
+            truth_only = flag
+
+    def entries(test_id):
+        got = maps.entry_formula(test_id, rel, key) if truth_only is not None else None
+        if got is None:
+            return None
+        vectors, mask = got
+        for kind, vec, where in vectors:
+            if boolrel.differs(old, new, kind, vec, impure, truth_only):
+                mask |= where
+        return mask
+
+    return entries
+
+
+def _entries_asked(maps, rel, operand):
+    node, struct, index = operand
+    key = boolrel.site_key(node)
+
+    def entries(test_id):
+        got = maps.entry_formula(test_id, rel, key)
+        if got is None:
+            return None
+        vectors, mask = got
+        for kind, vec, where in vectors:
+            if boolrel.asks_for(struct, kind, vec, index):
+                mask |= where
+        return mask
+
+    return entries
 
 
 def _import_guard(plan, rel, change, everyone, narrowed):

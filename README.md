@@ -72,6 +72,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   original skipped, skip a call the original made, or answer differently. An edit inside one
   operand can likewise only matter to the tests whose evaluations reached that operand. A test
   the tracer never saw evaluate the condition is not vouched for and stays a candidate.
+- **The same, per fixture entry** (`tools/trace_rel_slices_one.py`): for the tests that loop
+  over a fixture file, both recordings are also taken with one entry at a time. When a swapped
+  operator or regrouped condition reaches such a test, only the entries in which it can behave
+  differently are run, which is often cheap enough to settle the slowest tests outright.
 - **Unchanged hand-over** (`br/memo.py`): the executor's TPC-DS test is by far the slowest test,
   and nearly all of its time goes into a pure-Python query engine and into comparing the result
   with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed
