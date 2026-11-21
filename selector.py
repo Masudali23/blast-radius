@@ -72,6 +72,11 @@ EXACT = os.environ.get("BR_EXACT", "0") == "1"
 EXACT_CAP = float(os.environ.get("BR_EXACT_CAP", "15"))
 # stop the cheap candidates at the first failure and weigh the rest: run or leave selected
 STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
+# a slow test whose sample passes is only let go when keeping it would add at least this many
+# seconds to the bill; a lighter one stays selected
+DROP_MIN = float(os.environ.get("BR_DROP_MIN", "8"))
+# for measuring only: select nothing that was not seen to fail
+ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
 T0 = time.monotonic()
@@ -172,7 +177,7 @@ class Selector:
         self.debug[commit] = dbg
         if plan.unknown:
             dbg["how"] = "all"
-            return list(self.all_numbers)
+            return [] if ONLY_SEEN else list(self.all_numbers)
         cand = set(self.numbers(plan.cand)) | set(self.unmapped) if (plan.cand or plan.files) else set()
         if not plan.cand:
             cand = set()
@@ -193,9 +198,12 @@ class Selector:
             return sorted(sure)
         if time.monotonic() > self.stop_at:
             dbg["how"] = "out-of-time"
-            return sorted(cand | sure)
+            return sorted(sure) if ONLY_SEEN else sorted(cand | sure)
         selected, how = self.verify_all(plan, cand, dbg) if EXACT else self.check(plan, cand, dbg)
         dbg["how"] = how
+        if ONLY_SEEN:
+            unchecked = set(dbg.get("unverified") or ()) | set(dbg.get("unseen") or ())
+            selected = [n for n in selected if n not in unchecked]
         return sorted(set(selected) | sure)
 
     def verify_all(self, plan, cand, dbg):
@@ -428,6 +436,7 @@ class Selector:
             # unseen.  Only tests whose own weight in the bill exceeds the cost of checking them
             # are run.
             return self.broad_blind(plan, cheap + costly + deferred, likely, dbg)
+        dbg["unseen"] = likely
         if not cheap and not costly and not deferred:
             return likely, "unseen"
 
@@ -555,10 +564,13 @@ class Selector:
                         how = "fail"
                     elif HEAVY_CLEAN == "drop" and len(probes) == len(keep) and st["ran"] - len(probes) >= MIN_CLEAN:
                         # every cheaper candidate passes and so does a sample of each slow one:
-                        # a slow test failing on its own in that situation has not been observed
-                        unverified = keep
-                        keep = []
-                        how = "heavy-dropped"
+                        # the slow tests that weigh on the bill are let go; a sample is not the
+                        # whole test, so the ones that are cheap to keep stay selected
+                        unverified = list(keep)
+                        for n in sorted(keep, key=lambda n: -ms[n]):
+                            if cost_of(keep) - cost_of([m for m in keep if m != n]) >= DROP_MIN * 1000:
+                                keep = [m for m in keep if m != n]
+                        how = "heavy-kept" if keep else "heavy-dropped"
                     else:
                         unverified = keep
                         how = "heavy-kept"
@@ -638,6 +650,7 @@ class Selector:
         dbg["ran"] = st["ran"]
         dbg["cpu_ms"] = st["cpu"]
         dbg["unverified"] = unverified
+        dbg["unseen"] = likely
         return selected + likely, how
 
     def broad_blind(self, plan, items, likely, dbg):
