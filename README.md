@@ -12,7 +12,11 @@ selects the ones that actually fail. Anything it could not check cheaply stays s
 2. **Locate the change** (`br/analyze.py`): the old and new files are parsed and compared as
    syntax trees. The result is a list of changed statements, each either inside a function
    (runs at call time) or in a module/class body (runs at import time). Comment and formatting
-   edits compare equal and need no tests, unless a test reads that file as data.
+   edits compare equal and need no tests, unless a test reads that file as data. A string that
+   stands alone as a statement (documentation) does nothing when it is evaluated, so an edit
+   inside one compares equal too. A comment in the first two lines can declare the file's
+   encoding: if the file can no longer be read under it, or its text reads differently outside
+   comments and documentation, every test that imports the file is selected.
 3. **Find candidates** (`br/plan.py`, `br/maps.py`): coverage maps built from the pinned commit
    say, for every source line, which tests execute it. Only tests that execute a changed
    statement (or import the changed module, or open the changed fixture) are candidates.
@@ -129,11 +133,17 @@ CPU time is part of the score, so the selector avoids running what it can decide
   hand-over, so the shortcut also serves patches to class-level values that nothing read
   while modules loaded.
 - **A slow fixture-driven test next to real failures**: when other tests already fail and the
-  slowest such test is still unchecked, its cheapest entries are run, up to about a third of
-  its cost and in a few short parts. On the labelled commits a failing run of that test fails
-  on most of its entries, so a failure shows on the first part; if every sampled entry passes
-  the test is let go. This is the one place where a test is released on a sample while other
-  tests fail, and it is a measured trade: a sample is not the whole test.
+  slowest such test is still unchecked, its cheapest entries are run in a few short parts. On
+  the labelled commits a failing run of that test fails on most of its entries, so a failure
+  shows on the first part. If the first part passes and some of its entries were handed
+  exactly what the pinned commit handed over, the patch changes the hand-over of only some
+  entries: then the quick halves of all the other entries are run, which tells which of them
+  are handed something new, and when running those costs no more than the rest of the sample
+  would have, they are all run. The verdict is then that of the whole test, not of a sample.
+  Otherwise the cheapest entries stand in for the rest, and if every one of them passes the
+  test is let go: a measured trade, since a sample is not the whole test. Each entry runs on
+  its own short leash of CPU time, so an entry that hangs is cut off at once and the test
+  stays selected.
 - **Typing-only definitions**: a class made only of typing constructs (a `TypedDict`, say) or a
   module-level name, in a module that postpones annotations and is only ever imported name by
   name, may be mentioned nowhere but in annotations that are never evaluated and under

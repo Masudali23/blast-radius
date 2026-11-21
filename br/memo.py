@@ -26,8 +26,15 @@ from br import inlinepool
 
 # an allowance this large means "run whatever is not recognised"
 WHOLE = 1e11
+# CPU seconds a quick half may take, and a slow half: so much plus a multiple of its usual cost
+QUICK_LEASH = 2.0
+CHECK_LEASH = 6.0  # ... and comparing an entry's result with DuckDB's
+SLOW_LEASH = 2.0
+SLOW_FACTOR = 4.0
 # validation only: a file noting, for every slow half that is skipped, what running it gives
 CHECK = os.environ.get("BR_MEMO_CHECK")
+# measuring only: a file noting what each session did
+NOTE = os.environ.get("BR_MEMO_NOTE")
 
 TESTS = {
     # test id -> (class attribute with the fixture entries, is_tpch flag value)
@@ -198,7 +205,7 @@ class Session:
     After a strict session gave up, `gave_up` is set and the test's outcome means nothing.
     """
 
-    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0, capture=None, must=()):
+    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0, capture=None, must=(), sample=0.0, leash=None):
         self.module = module
         self.cls = cls
         self.attr = attr
@@ -218,6 +225,16 @@ class Session:
         self.budget = budget
         # no limit: every entry is settled, either recognised or run for real
         self.whole = budget >= WHOLE
+        # When the entries that are handed something new cost more than `budget` together, the
+        # least expensive of them are still run, up to `sample` (ms): then `only` holds their
+        # keys and a pass says no more than that this sample passed.
+        self.sample = sample
+        self.only = None
+        self.cleared = False  # weighed, and what is to be run fits the allowance
+        # callable(seconds): how much CPU time may pass before the next hand-over or result;
+        # an entry that hangs is then cut off long before the test's own limit
+        self.leash = leash
+        self.slowest = max(self.costs.values(), default=1000.0)
         self.spent = 0.0
         self.cost_record = {}  # map building: CPU ms of each entry's slow half
         self.depth = 0
@@ -246,10 +263,16 @@ class Session:
             if session.phase is not None:
                 session.phase(on)
 
+        def hold(cost=None, base=QUICK_LEASH):
+            """Allow the next step its time: a quick half, or a slow half of about `cost` ms."""
+            if session.leash is not None:
+                session.leash(base if cost is None else SLOW_LEASH + SLOW_FACTOR * cost / 1000.0)
+
         def execute(executor, plan, outer_scope=None):
             if session.depth or outer_scope is not None:
                 # a subquery, executed from inside the slow half
                 return real_execute(executor, plan, outer_scope)
+            hold()
             if session.gave_up:
                 return Unchanged(None)
             try:
@@ -276,14 +299,16 @@ class Session:
                 table._br_cost = time.process_time() - t0
             return table
 
-        def slow(fn, *args, **kwargs):
+        def slow(fn, *args, cost=None, **kwargs):
             session.depth += 1
             back(True)
+            hold(session.slowest if cost is None else cost)
             try:
                 return fn(*args, **kwargs)
             finally:
                 session.depth -= 1
                 back(False)
+                hold(base=CHECK_LEASH)
 
         def transpile(sql, *args, **kwargs):
             # front half: its lines are not part of the slow half, its output is compared
@@ -313,6 +338,7 @@ class Session:
             skey = text_key(sql)
             if session.gave_up:
                 return None
+            hold(base=CHECK_LEASH)  # (asking DuckDB may mean opening its connection first)
             if session.strict and not session.weighed and not session.whole:
                 # Every quick half has run by now (the pool takes all queries before the first
                 # result is looked at), so it is known which entries are handed something new.
@@ -322,14 +348,25 @@ class Session:
                 ran = [e for e in entries if e[0].get("execute")]
                 session.total = len(ran)
                 if len(ran) == len(session.fronts):
-                    need = 0.0
+                    new = []
                     for (_, text, *_rest), key in zip(ran, session.fronts):
                         k = text_key(text)
                         if not unchanged(k, text, key):
-                            need += session.costs.get(k, float("inf"))
-                    if need > session.budget:
-                        session.gave_up = True
-                        return None
+                            new.append((session.costs.get(k, float("inf")), k))
+                    if sum(cost for cost, _ in new) <= session.budget:
+                        session.cleared = True
+                    else:
+                        take, spent = set(), 0.0
+                        for cost, k in sorted(new):
+                            if spent + cost > session.sample:
+                                break
+                            take.add(k)
+                            spent += cost
+                        if not take:
+                            session.gave_up = True
+                            return None
+                        session.only = take
+                        session.cleared = True
             session.looked += 1
             if isinstance(table, Unchanged):
                 executor, plan = session.pending.pop(table.key)
@@ -349,7 +386,9 @@ class Session:
                 if same:
                     session.skipped += 1
                     return None
-                if session.strict and not session.whole:
+                if session.only is not None and skey not in session.only:
+                    return None  # not in the sample: nothing is said about this entry
+                if session.strict and not session.whole and not session.cleared:
                     # a new hand-over: run this entry for real if the allowance covers it,
                     # otherwise stop here and let the caller keep the test
                     cost = session.costs.get(skey)
@@ -361,7 +400,7 @@ class Session:
                         session.gave_up = True
                         return None
                     session.spent += cost
-                table = slow(real_execute, executor, plan)
+                table = slow(real_execute, executor, plan, cost=session.costs.get(skey))
                 session.ran += 1
                 return real_helper(test, i, table, tpch=tpch)
             session.ran += 1
@@ -395,9 +434,10 @@ class Session:
             mp_execute.__qualname__ = real_mp.__qualname__
             mp_execute.__name__ = real_mp.__name__
             self._patch(self.module, "mp_execute", mp_execute)
-        if self.strict and getattr(self.module, "ProcessPoolExecutor", None) is inlinepool.InlinePool:
+        if self.strict and self.whole and getattr(self.module, "ProcessPoolExecutor", None) is inlinepool.InlinePool:
             # look at each entry as soon as its quick half is done: a slow half that fails
             # then ends the test before the other entries have cost anything
+            # (a session with an allowance wants every quick half first, to weigh what is new)
             self._patch(self.module, "ProcessPoolExecutor", inlinepool.LazyPool)
         self._patch(py.PythonExecutor, "execute", execute)
         self._patch(self.cls, "subtestHelper", helper)

@@ -96,8 +96,14 @@ SHORT_RUNS = os.environ.get("BR_SHORT_RUNS", "1") == "1"
 SETUP_ONLY = os.environ.get("BR_SETUP_ONLY", "1") == "1"
 # share of a slow sliced test's cost that is run as a sample when the test is still selected
 # unchecked next to real failures (0: never sample, keep it)
-SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.35"))
+SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.2"))
+SAMPLE_ORDER = os.environ.get("BR_SAMPLE_ORDER", "cost")
 SAMPLE_PARTS = 4
+# the sample looks at every entry's quick half first (br/memo.py): when few entries are handed
+# something new, all of those are run and the sample is the whole test
+SETTLE = os.environ.get("BR_SETTLE", "1") == "1"
+# ... as long as running them costs no more than this share of the test
+WEIGHED_SHARE = float(os.environ.get("BR_WEIGHED_SHARE", "0.3"))
 # for measuring only: select nothing that was not seen to fail
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -432,6 +438,52 @@ class Selector:
                 return True
         return False
 
+    def sample_order(self, tid, sm, live):
+        """The order in which a sample takes fixture entries.  "cost": least expensive first.
+        "cover": the entry that runs the most lines no earlier entry of the sample ran, per
+        unit of cost, comes next (an entry that adds none counts by its cost alone), so that
+        the sample sees as much of the code the whole test reaches as it can for its price."""
+        share = sm["share"]
+        if SAMPLE_ORDER != "cover":
+            return sorted(live, key=lambda i: share[i])
+        want = 0
+        for i in live:
+            want |= 1 << i
+        weight = {}  # set of entries (as a mask) -> number of lines that exactly they run
+        for table in sm["lines"].values():
+            for mask in table.values():
+                mask &= want
+                if mask:
+                    weight[mask] = weight.get(mask, 0) + 1
+        groups = list(weight.items())
+        of = {i: [] for i in live}
+        gain = {i: 0 for i in live}
+        for g, (mask, w) in enumerate(groups):
+            m = mask
+            while m:
+                low = m & -m
+                i = low.bit_length() - 1
+                of[i].append(g)
+                gain[i] += w
+                m ^= low
+        seen = [False] * len(groups)
+        left = set(live)
+        order = []
+        while left:
+            best = max(left, key=lambda i: ((gain[i] + 0.5) / max(share[i], 1e-9), -i))
+            order.append(best)
+            left.discard(best)
+            for g in of[best]:
+                if not seen[g]:
+                    seen[g] = True
+                    mask, w = groups[g]
+                    m = mask
+                    while m:
+                        low = m & -m
+                        gain[low.bit_length() - 1] -= w
+                        m ^= low
+        return order
+
     def sample_variant(self, plan, n):
         """([(variant, estimated CPU ms), ...], total ms) for running the cheapest entries of
         sliced test n, up to SAMPLE_SHARE of the cost of the entries the patch can reach, in a
@@ -450,7 +502,7 @@ class Selector:
         if not live or total <= 0.0:
             return None
         keys, spent = [], 0.0
-        for i in sorted(live, key=lambda i: sm["share"][i]):
+        for i in self.sample_order(tid, sm, live):
             keys.append(sm["keys"][i])
             spent += sm["share"][i]
             if spent >= SAMPLE_SHARE * total:
@@ -459,25 +511,51 @@ class Selector:
             return None
         short = self.short_variant(plan, n)
         share_of = dict(zip(sm["keys"], sm["share"]))
-        parts, chunk, load = [], [], 0.0
-        for k in keys:
-            chunk.append(k)
-            load += share_of[k]
-            if load >= spent / SAMPLE_PARTS and len(parts) < SAMPLE_PARTS - 1:
+
+        def split_up(keys, count):
+            total = sum(share_of[k] for k in keys)
+            parts, chunk, load = [], [], 0.0
+            for k in keys:
+                chunk.append(k)
+                load += share_of[k]
+                if load >= total / count and len(parts) < count - 1:
+                    parts.append((chunk, load))
+                    chunk, load = [], 0.0
+            if chunk:
                 parts.append((chunk, load))
-                chunk, load = [], 0.0
-        if chunk:
-            parts.append((chunk, load))
+            return parts
+
+        parts = split_up(keys, SAMPLE_PARTS)
         out = []
         for chunk, load in parts:
             variant = {"allow": chunk}
             if short is not None:
-                # unchanged hand-overs among the sampled entries need no slow half
+                # unchanged hand-overs among these entries need no slow half
                 variant = dict(short[0])
                 variant["allow"] = chunk
                 variant["memo_budget"] = 1e12
+                variant["memo_leash"] = 1
             out.append((variant, self.cpu[n] * (load + 0.02)))
-        return out, self.cpu[n] * (spent + 0.02)
+        rest = None
+        if SETTLE and short is not None:
+            # For a patch that changes what only some entries hand over (the first part shows
+            # it): all the other entries at once.  Their quick halves tell which of them are
+            # handed something new.  If running those costs no more than the rest of the
+            # sample would have, they are all run and the verdict is that of the whole test;
+            # otherwise the least expensive of them are run, for the same price.
+            first, load = parts[0]
+            taken = set(first)
+            others = [sm["keys"][i] for i in live if sm["keys"][i] not in taken]
+            allowance = self.cpu[n] * max(0.0, spent - load)
+            variant = dict(short[0])
+            variant["allow"] = others
+            variant["memo_budget"] = max(allowance, self.cpu[n] * WEIGHED_SHARE)
+            variant["memo_sample"] = allowance
+            variant["memo_leash"] = 1
+            known = self.maps.memo(tid)
+            quick = self.cpu[n] * known["share"] * len(others) / max(1, len(live))
+            rest = (variant, quick + variant["memo_budget"] + 0.02 * self.cpu[n])
+        return out, self.cpu[n] * (spent + 0.02), rest
 
     def class_list_uses(self, rel, name):
         """Line spans of the statements in test file `rel` (outside the class set-up) that
@@ -674,7 +752,7 @@ class Selector:
             return likely, "unseen"
 
         lane = self.get_lane()
-        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}, "undecided": set()}
+        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}, "undecided": set(), "note": {}}
 
         def install():
             lane.ensure(st["mode"])
@@ -721,6 +799,7 @@ class Selector:
                     st["ran"] += 1
                     st["cpu"] += r[1]
                     st["outcome"][n] = r[0]
+                    st["note"][n] = r[4] if len(r) > 4 else ""
                     if DEBUG:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1)))
                     st["evals"] += r[2]
@@ -732,6 +811,32 @@ class Selector:
 
         def cost_of(numbers):
             return split(numbers, ms)[1]
+
+        def settle(n, sv=None, weigh=True):
+            """Run slow sliced test n in a few parts, its least expensive entries first, each
+            part on a short leash: "F" when a part fails, "U" when one takes much longer than
+            it should or the test cannot be run this way, "P" when every part passed."""
+            sv = sv or self.sample_variant(plan, n)
+            if sv is None:
+                return "U"
+            parts, rest = sv[0], sv[2] if weigh else None
+            # (the child's CPU allowance follows what is planned: plan all of it now)
+            st["planned"] += sv[1] / 1000.0
+            for k, (variant, est) in enumerate(parts):
+                f3, u3 = run([(n, variant, est)], False, patience=1.8)
+                if f3:
+                    return "F"
+                if u3:
+                    return "U"
+                recognised = st["note"].get(n, "").partition("/")[0]
+                if k == 0 and rest is not None and recognised.isdigit() and int(recognised) > 0:
+                    # some of these entries are handed what they were always handed: weigh
+                    # the others instead of going on entry by entry
+                    st["planned"] += rest[1] / 1000.0
+                    f3, u3 = run([(n, rest[0], rest[1])], False, patience=1.8)
+                    dbg.setdefault("weighed", []).append((n, "F" if f3 else "U" if u3 else "P", st["note"].get(n, "")))
+                    return "F" if f3 else "U" if u3 else "P"
+            return "P"
 
         selected, how, unverified = [], None, []
         try:
@@ -802,8 +907,19 @@ class Selector:
                         unverified = list(keep)
                         for n in sorted(keep, key=lambda n: -ms[n]):
                             if cost_of(keep) - cost_of([m for m in keep if m != n]) >= DROP_MIN * 1000:
-                                keep = [m for m in keep if m != n]
-                        how = "heavy-kept" if keep else "heavy-dropped"
+                                # (where unchanged hand-overs are recognised, a larger sample
+                                # than the probe is cheap: take it before letting the test go)
+                                sv = self.sample_variant(plan, n) if SETTLE else None
+                                verdict = settle(n, sv, weigh=False) if sv is not None and sv[0][0][0].get("memo") else "P"
+                                dbg.setdefault("settled", []).append((n, verdict))
+                                if verdict == "F":
+                                    failed = [n]
+                                    how = "fail"
+                                    break
+                                if verdict == "P":
+                                    keep = [m for m in keep if m != n]
+                        if how is None:
+                            how = "heavy-kept" if keep else "heavy-dropped"
                     else:
                         unverified = keep
                         how = "heavy-kept"
@@ -861,20 +977,11 @@ class Selector:
                             continue
                         sv = self.sample_variant(plan, n)
                         if sv is not None and sv[1] < P_PASS_FAILED * weight:
-                            sampled.append((n, sv[0]))
-                            # (the child's CPU allowance follows what is planned: plan the
-                            # whole sample now, not part by part)
-                            st["planned"] += sv[1] / 1000.0
+                            sampled.append((n, sv))
                     passed = []
-                    for n, parts in sampled:
-                        # in a few parts, each with a short leash: a part that fails, or takes
-                        # much longer than it should, ends the sample
-                        verdict = "P"
-                        for variant, est in parts:
-                            f3, u3 = run([(n, variant, est)], False, patience=1.8)
-                            if f3 or u3:
-                                verdict = "F" if f3 else "U"
-                                break
+                    for n, sv in sampled:
+                        verdict = settle(n, sv)
+                        dbg.setdefault("sampled", []).append((n, verdict))
                         if verdict == "F" and n not in failed:
                             failed.append(n)
                         elif verdict == "P":

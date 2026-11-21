@@ -172,7 +172,7 @@ class Lane:
                 return results, "worker died", False
             if line.startswith(b"T "):
                 parts = line.split()
-                results[int(parts[1])] = (parts[2].decode(), int(parts[3]), int(parts[4]), int(parts[5]))
+                results[int(parts[1])] = (parts[2].decode(), int(parts[3]), int(parts[4]), int(parts[5]), parts[6].decode() if len(parts) > 6 else "")
             elif line.startswith(b"I "):
                 self.probed = True
             elif line.startswith(b"M "):

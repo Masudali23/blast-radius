@@ -292,6 +292,7 @@ def give_constant(path, names, attr, old_repr, new_repr):
 class Runner:
     def __init__(self, out_fd):
         self.out = out_fd
+        self.note = ""  # a word about the last test run, sent along with its outcome
         self.classes = dict(PRESET)
         self.modules = {}
         self.result = unittest.TestResult()
@@ -386,7 +387,10 @@ class Runner:
             attr = memo.TESTS.get(test_id)
             if attr is None:
                 return "U"
-            session = memo.Session(mod, cls, attr, known=variant["memo"], strict=True, costs=variant.get("memo_costs"), budget=variant.get("memo_budget", 0.0), must=variant.get("memo_must", ()))
+            session = memo.Session(
+                mod, cls, attr, known=variant["memo"], strict=True, costs=variant.get("memo_costs"), budget=variant.get("memo_budget", 0.0),
+                must=variant.get("memo_must", ()), sample=variant.get("memo_sample", 0.0), leash=leash if variant.get("memo_leash") else None,
+            )
         variants.SL.active = allow
         try:
             if session is not None:
@@ -399,6 +403,12 @@ class Runner:
             variants.SL.changed = None
             res.shouldStop = False
         after = (len(res.failures), len(res.errors), len(res.unexpectedSuccesses), len(res.skipped))
+        if session is not None and memo.NOTE:
+            with open(memo.NOTE, "a") as fh:
+                fh.write("%s skipped=%d ran=%d weighed=%s only=%s gave_up=%s fronts=%d\n" % (test_id, session.skipped, session.ran, session.cleared, None if session.only is None else len(session.only), session.gave_up, len(session.fronts)))
+        if session is not None:
+            # how many of the entries looked at were recognised, and how many were run
+            self.note = "%d/%d" % (session.skipped, session.ran)
         if session is not None and session.gave_up and after[:3] == before[:3]:
             return "U"  # some entry is handed something new: nothing was decided
         if after[:3] != before[:3]:
@@ -495,6 +505,11 @@ def arm(cpu_seconds):
     A much longer wall-clock limit backs it up for code that blocks without using CPU."""
     signal.setitimer(signal.ITIMER_PROF, cpu_seconds, 0.2)
     signal.setitimer(signal.ITIMER_REAL, 8.0 * cpu_seconds + 20.0, 1.0)
+
+
+def leash(cpu_seconds):
+    """Shorten (or extend) the CPU time the running test has left."""
+    signal.setitimer(signal.ITIMER_PROF, cpu_seconds, 0.2)
 
 
 def disarm():
@@ -601,7 +616,8 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 outcome = "F"
             finally:
                 disarm()
-            runner.emit("T %d %s %d %d %d" % (index, outcome, int((time.process_time() - t0) * 1000), infect.STATS[0] - e0, infect.STATS[1] - i0))
+            runner.emit("T %d %s %d %d %d %s" % (index, outcome, int((time.process_time() - t0) * 1000), infect.STATS[0] - e0, infect.STATS[1] - i0, runner.note))
+            runner.note = ""
             if timed_out:
                 # a change that makes one test hang usually makes many hang: stop paying for it
                 runner.emit("B timeout")
