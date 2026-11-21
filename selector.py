@@ -24,8 +24,6 @@ MAPS = os.environ.get("BR_MAPS", "/app/maps")
 TMP = os.environ.get("BR_TMP", "/tmp/br")
 DEBUG = os.environ.get("BR_DEBUG")
 
-# diagnostic build: tag expensive commits in the simulated milliseconds (see Selector.diagnose)
-DIAG = os.environ.get("BR_DIAG", "0") == "1"
 FIXTURES = "tests/fixtures/"
 CLASS_FIXTURES = set(variants.CLASS_LISTS.values())
 WORKER_MS = 2000
@@ -57,6 +55,9 @@ HEAVY_CLEAN = os.environ.get("BR_HEAVY_CLEAN", "drop")
 # and a sample of the slow test itself passes)
 HEAVY_FAILED = os.environ.get("BR_HEAVY_FAILED", "related")
 MIN_RELATED = int(os.environ.get("BR_MIN_RELATED", "5"))
+# related tests left unrun are run for this purpose when they cost at most this share of what
+# the slow test weighs in the selection
+RELATED_RUN = float(os.environ.get("BR_RELATED_RUN", "0.5"))
 MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
@@ -357,20 +358,35 @@ class Selector:
                     # selected unless the tests closest to it (same test file, or reading the
                     # same fixture file) were run and all passed, and the breakage is small.
                     slow = {it[0] for it in deferred}
+                    by_n = {it[0]: it for it in later}
                     maybe = []
                     if len(failed) < MANY_FAILED:
-                        for n in keep:
-                            if n not in slow:
-                                continue  # cheap to keep selected: not worth any risk
+                        for n in sorted((n for n in keep if n in slow), key=lambda n: -ms[n]):
+                            rel_mask = self.related_mask(n)
+                            pending = [m for m in keep if m != n and m not in slow and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
+                            if pending:
+                                # related tests we kept without running: run them first, if that
+                                # costs clearly less than the slow test weighs
+                                weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
+                                if sum(by_n[m][2] for m in pending) > RELATED_RUN * weight:
+                                    continue
+                                items = sorted((by_n[m] for m in pending), key=lambda it: it[0])
+                                f2, u2 = run(items, False)
+                                bad = set(f2 + u2)
+                                failed = failed + [m for m in f2 + u2 if m not in failed]
+                                keep = [m for m in keep if m in bad or m not in pending]
+                                if bad:
+                                    continue
                             rel_pass, rel_fail = self.related_outcomes(n, st["outcome"])
-                            if rel_fail == 0 and rel_pass >= MIN_RELATED:
+                            unrun = [m for m in keep if m != n and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1 and m not in st["outcome"] and m not in slow]
+                            if rel_fail == 0 and rel_pass >= MIN_RELATED and not unrun:
                                 maybe.append(n)
                     probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in maybe) if pv is not None]
                     if probes:
                         hit, unseen = run(probes, False)
                         hit = hit + unseen
                         dropped = [n for n, _, _ in probes if n not in hit]
-                        failed = failed + hit
+                        failed = failed + [m for m in hit if m not in failed]
                         dbg["related_dropped"] = dropped
                         keep = [n for n in keep if n not in dropped]
                 selected = failed + [n for n in keep if n not in failed]
@@ -414,7 +430,7 @@ class Selector:
                     continue
                 gain = split(sorted(keep), ms)[1] - split(sorted(keep - {n}), ms)[1]
                 rel_mask = self.related_mask(n)
-                related = [by_n[m] for m in everything if m != n and by_n[m][2] <= CHEAP * 1000 and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
+                related = [by_n[m] for m in everything if m != n and by_n[m][2] <= HEAVY * 1000 and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
                 pn, pv, pe = self.slice_probe(plan, n)
                 if pv is None or len(related) < MIN_RELATED:
                     continue
@@ -539,63 +555,6 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": keys}, self.cpu[n] * (spent + 0.02)
 
-    def diagnose(self, commit, selected, workers, cost):
-        """Diagnostic build only: tag each expensive commit with the path that produced it.
-
-        The scorer reports simulated milliseconds exactly, so a few harmless extra tests of
-        known duration on the busiest worker (or one extra worker) tell which decision path the
-        costly commits went through.  Adds cost and never removes a test.
-        """
-        if cost < 8000:
-            return workers, cost
-        d = self.debug.get(commit, {})
-        how = d.get("how")
-        ms = self.ms
-        chosen = set(selected)
-        slow = {n for n in chosen if ms[n] >= 3500}
-        num = {tid: n for n, tid in self.id_of.items()}
-        failed = {num[t] for t in d.get("failed", ()) if t in num}
-        unverified = set(d.get("unverified") or ())
-        if how in ("all", "out-of-time") or "crash" in d or how is None:
-            # one more worker than needed: +2000 ms
-            k = len(workers) + 1
-            if k <= MAX_WORKERS and len(selected) >= k:
-                items = sorted(selected, key=lambda n: -ms[n])
-                loads, ws = [0] * k, [[] for _ in range(k)]
-                for n in items:
-                    i = loads.index(min(loads))
-                    loads[i] += ms[n]
-                    ws[i].append(n)
-                return [w for w in ws if w], max(loads) + WORKER_MS * k
-            return workers, cost
-        if how == "broad-blind":
-            tag = 16
-        elif slow & failed:
-            tag = 1
-        elif slow & unverified:
-            tag = 4
-        elif how in ("unseen", "heavy-kept", "sure") or (slow and not (slow & failed)):
-            tag = 64
-        else:
-            tag = 256
-        if any(ms[n] >= 25000 for n in chosen):
-            tag += 1024  # the slowest test of all is in the selection
-        extra, left = [], tag
-        for n in sorted((n for n in self.all_numbers if n not in chosen and 0 < ms[n] <= tag), key=lambda n: -ms[n]):
-            if ms[n] <= left:
-                extra.append(n)
-                left -= ms[n]
-                if not left:
-                    break
-        if left:
-            return workers, cost
-        loads = [sum(ms[n] for n in w) for w in workers]
-        i = loads.index(max(loads))
-        workers = [list(w) for w in workers]
-        workers[i].extend(extra)
-        d["diag"] = tag
-        return workers, cost + tag
-
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -614,8 +573,6 @@ class Selector:
                 selected = list(self.all_numbers)
                 self.debug.setdefault(commit, {})["crash"] = repr(e)
             workers, cost = split(selected, self.ms)
-            if DIAG:
-                workers, cost = self.diagnose(commit, selected, workers, cost)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
