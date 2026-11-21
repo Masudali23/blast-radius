@@ -105,6 +105,12 @@ CPU time is part of the score, so the selector avoids running what it can decide
   constant or dict entry, is always run for real; the others can be recognised by their
   hand-over, so the shortcut also serves patches to class-level values that nothing read
   while modules loaded.
+- **A slow fixture-driven test next to real failures**: when other tests already fail and the
+  slowest such test is still unchecked, its cheapest entries are run, up to about a third of
+  its cost and in a few short parts. On the labelled commits a failing run of that test fails
+  on most of its entries, so a failure shows on the first part; if every sampled entry passes
+  the test is let go. This is the one place where a test is released on a sample while other
+  tests fail, and it is a measured trade: a sample is not the whole test.
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).

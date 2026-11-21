@@ -84,6 +84,10 @@ ANSWER_SHARE = float(os.environ.get("BR_ANSWER_SHARE", "0.5"))
 CLEAN_RUN = float(os.environ.get("BR_CLEAN_RUN", "8"))
 # narrow sliced tests to the fixture entries a swapped operator / regrouped condition can reach
 ENTRY_NARROW = os.environ.get("BR_ENTRY_NARROW", "1") == "1"
+# share of a slow sliced test's cost that is run as a sample when the test is still selected
+# unchecked next to real failures (0: never sample, keep it)
+SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.35"))
+SAMPLE_PARTS = 4
 # for measuring only: select nothing that was not seen to fail
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
@@ -403,6 +407,53 @@ class Selector:
                 return True
         return False
 
+    def sample_variant(self, plan, n):
+        """([(variant, estimated CPU ms), ...], total ms) for running the cheapest entries of
+        sliced test n, up to SAMPLE_SHARE of the cost of the entries the patch can reach, in a
+        few parts of about equal cost; None when the test is not sliced or the sample would be
+        all of it."""
+        tid = self.id_of[n]
+        sm = self.maps.slices(tid)
+        if sm is None or tid.split("::")[0] in plan.files:
+            return None
+        v, _ = self.plain_variant(plan, n)
+        if v is not None and "allow" not in v:
+            return None
+        allowed = set(v["allow"]) if v is not None else None
+        live = [i for i, k in enumerate(sm["keys"]) if sm["share"][i] > 0.0 and (allowed is None or k in allowed)]
+        total = sum(sm["share"][i] for i in live)
+        if not live or total <= 0.0:
+            return None
+        keys, spent = [], 0.0
+        for i in sorted(live, key=lambda i: sm["share"][i]):
+            keys.append(sm["keys"][i])
+            spent += sm["share"][i]
+            if spent >= SAMPLE_SHARE * total:
+                break
+        if len(keys) >= len(live):
+            return None
+        short = self.short_variant(plan, n)
+        share_of = dict(zip(sm["keys"], sm["share"]))
+        parts, chunk, load = [], [], 0.0
+        for k in keys:
+            chunk.append(k)
+            load += share_of[k]
+            if load >= spent / SAMPLE_PARTS and len(parts) < SAMPLE_PARTS - 1:
+                parts.append((chunk, load))
+                chunk, load = [], 0.0
+        if chunk:
+            parts.append((chunk, load))
+        out = []
+        for chunk, load in parts:
+            variant = {"allow": chunk}
+            if short is not None:
+                # unchanged hand-overs among the sampled entries need no slow half
+                variant = dict(short[0])
+                variant["allow"] = chunk
+                variant["memo_budget"] = 1e12
+            out.append((variant, self.cpu[n] * (load + 0.02)))
+        return out, self.cpu[n] * (spent + 0.02)
+
     def plain_variant(self, plan, n):
         tid = self.id_of[n]
         idx = self.idx_of.get(n)
@@ -527,10 +578,10 @@ class Selector:
             for rel, content in plan.files.items():
                 lane.overlay.set_file(rel, content)
 
-        def run(items, stop_on_fail):
+        def run(items, stop_on_fail, patience=5.0):
             if st["cut"]:
                 return [], [n for n, _, _ in items]  # the child gave up earlier: do not run more
-            jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in items]
+            jobs = [(self.id_of[n], max(1.5, patience * e / 1000.0 + 0.5), v) for n, v, e in items]
             # total CPU this commit may burn: generous against the estimate, but bounded
             st["planned"] += sum(e for _, _, e in items) / 1000.0
             cpu_budget = min(COMMIT_CPU, 3.0 + 2.5 * st["planned"])
@@ -691,27 +742,43 @@ class Selector:
                         failed = failed + [m for m in hit if m not in failed]
                         dbg["related_dropped"] = dropped
                         keep = [n for n in keep if n not in dropped]
-                if keep and not st["cut"] and (failed or HEAVY_CLEAN != "drop"):
-                    # Last resort for a slow test that is still selected unchecked: show that
-                    # its slow half is handed exactly what it was handed before the patch
-                    # (br/memo.py).
-                    short = []
+                if keep and failed and not st["cut"] and SAMPLE_SHARE > 0:
+                    # A slow fixture-driven test is still selected unchecked next to real
+                    # failures, and weighs heavily on the bill.  Run its cheapest entries, up
+                    # to a share of its cost: when such a test fails it fails on most of its
+                    # entries, so a failure shows at once; if every sampled entry passes, the
+                    # test is let go.  (Entries whose slow half is handed exactly what it was
+                    # handed before the patch are recognised without running it: br/memo.py.)
+                    sampled = []
                     for n in keep:
                         if ms[n] <= HEAVY * 1000 or n in st["undecided"]:
                             continue
-                        sv = self.short_variant(plan, n)
-                        if sv is None:
-                            continue
                         weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
-                        if sv[1] < (P_PASS_FAILED if failed else P_PASS_CLEAN) * weight:
-                            short.append((n, sv[0], sv[1]))
-                    if short:
-                        f3, u3 = run(short, False)
-                        settled = {n for n, _, _ in short} - set(f3) - set(u3)
-                        failed = failed + [n for n in f3 if n not in failed]
-                        keep = [n for n in keep if n not in settled]
-                        unverified = [n for n in unverified if n not in settled]
-                        dbg["short"] = sorted(settled)
+                        if weight < DROP_MIN * 1000:
+                            continue
+                        sv = self.sample_variant(plan, n)
+                        if sv is not None and sv[1] < P_PASS_FAILED * weight:
+                            sampled.append((n, sv[0]))
+                            # (the child's CPU allowance follows what is planned: plan the
+                            # whole sample now, not part by part)
+                            st["planned"] += sv[1] / 1000.0
+                    passed = []
+                    for n, parts in sampled:
+                        # in a few parts, each with a short leash: a part that fails, or takes
+                        # much longer than it should, ends the sample
+                        verdict = "P"
+                        for variant, est in parts:
+                            f3, u3 = run([(n, variant, est)], False, patience=1.8)
+                            if f3 or u3:
+                                verdict = "F" if f3 else "U"
+                                break
+                        if verdict == "F" and n not in failed:
+                            failed.append(n)
+                        elif verdict == "P":
+                            passed.append(n)
+                    if passed:
+                        keep = [n for n in keep if n not in passed]
+                        dbg["sample_dropped"] = sorted(passed)
                 selected = failed + [n for n in keep if n not in failed]
                 if failed:
                     unverified = [n for n in keep if n not in failed]
