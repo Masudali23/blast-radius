@@ -380,7 +380,7 @@ class Runner:
             attr = memo.TESTS.get(test_id)
             if attr is None:
                 return "U"
-            session = memo.Session(mod, cls, attr, known=variant["memo"], strict=True, costs=variant.get("memo_costs"), budget=variant.get("memo_budget", 0.0))
+            session = memo.Session(mod, cls, attr, known=variant["memo"], strict=True, costs=variant.get("memo_costs"), budget=variant.get("memo_budget", 0.0), must=variant.get("memo_must", ()))
         variants.SL.active = allow
         try:
             if session is not None:

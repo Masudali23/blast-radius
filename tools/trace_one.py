@@ -411,6 +411,60 @@ def main():
     mon.register_callback(tool, mon.events.PY_START, on_start)
     mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
+    if INSTRUMENT and os.environ.get("BR_COLD_HANDED"):
+        # What does the slow half of an executor entry instantiate, read and look up?  Every
+        # hand-over recorded by tools/trace_memo.py (a pickled plan with its tables) is
+        # executed in a forked child of this process, which has only loaded the modules:
+        # nothing the quick half would have cached is there to hide a read.  Nothing is
+        # cleared before a child runs, so whatever loading the modules instantiated counts for
+        # every entry.
+        import pickle
+
+        mon.set_events(tool, 0)
+        import sqlglot.executor  # noqa: F401
+        from sqlglot.executor.python import PythonExecutor
+
+        per = []
+        with open(os.environ["BR_COLD_HANDED"], "rb") as handed:
+            while True:
+                try:
+                    plan, tables = pickle.load(handed)
+                except EOFError:
+                    break
+                r, w = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(r)
+                    try:
+                        PythonExecutor(tables=tables).execute(plan)
+                    except BaseException:
+                        pass
+                    key_of = {c: "%s:%d" % (f, line) for c, f, line in created}
+                    classes = set()
+                    for c in used:
+                        for b in c.__mro__:
+                            k = key_of.get(b)
+                            if k:
+                                classes.add(k)
+                    payload = {
+                        "classes": sorted(classes),
+                        "attr_reads": sorted(attr_reads),
+                        "dict_keys": sorted("%s\t%s" % kv for kv in dict_keys),
+                        "dict_calls": sorted("%s\t%s" % kv for kv in dict_calls),
+                    }
+                    with os.fdopen(w, "wb") as fh:
+                        fh.write(pickle.dumps(payload))
+                    os._exit(0)
+                os.close(w)
+                with os.fdopen(r, "rb") as fh:
+                    data = fh.read()
+                os.waitpid(pid, 0)
+                per.append(pickle.loads(data) if data else None)
+        with open(out, "wb") as fh:
+            pickle.dump(per, fh)
+        sys.stdout.flush()
+        os._exit(0)
+
     if INSTRUMENT and os.environ.get("BR_ENTRIES"):
         # Per fixture entry of a sliced test: which classes it instantiates, which class-level
         # constants it reads and which dict entries it looks up.  The class is set up once and

@@ -346,6 +346,8 @@ class Maps:
                     self._memo = pickle.loads(zlib.decompress(fh.read()))
                 for d in self._memo.values():
                     d["back"] = {rel: frozenset(lines) for rel, lines in d["back"].items()}
+                    d["back_by"] = {k: {rel: frozenset(lines) for rel, lines in per.items()} for k, per in d.get("back_by", {}).items()}
+                    d["use_by"] = {k: {f: frozenset(items) for f, items in per.items()} for k, per in d.get("use_by", {}).items()}
         return self._memo.get(test_id)
 
     def feeds_elsewhere(self, name, cls):

@@ -55,6 +55,7 @@ def on_start(code, offset):
 mon.register_callback(tool, mon.events.LINE, on_line)
 mon.register_callback(tool, mon.events.PY_START, on_start)
 total = {}
+per = []
 count = 0
 with open(handed, "rb") as fh:
     while True:
@@ -84,10 +85,13 @@ with open(handed, "rb") as fh:
         with os.fdopen(r, "rb") as in_fh:
             data = in_fh.read()
         os.waitpid(pid, 0)
+        mine = {}
         for rel, line in (pickle.loads(data) if data else ()):
             total.setdefault(rel, set()).add(line)
+            mine.setdefault(rel, []).append(line)
+        per.append(mine)
 with open(out, "wb") as fh:
-    pickle.dump((total, count), fh)
+    pickle.dump((total, count, per), fh)
 """
 
 
@@ -97,9 +101,26 @@ def cold_back(root, handed):
     out = handed + ".cold"
     subprocess.run([sys.executable, "-c", COLD, root, handed, out], stdin=subprocess.DEVNULL, check=True)
     with open(out, "rb") as fh:
-        total, count = pickle.load(fh)
+        total, count, per = pickle.load(fh)
     os.unlink(out)
-    return total, count
+    return total, count, per
+
+
+def cold_use(root, handed):
+    """Per hand-over: what the slow half instantiates, reads and looks up (tools/trace_one.py
+    with BR_COLD_HANDED); [] when that could not be recorded."""
+    out = handed + ".use"
+    env = dict(os.environ, BR_INSTRUMENT="1", BR_COLD_HANDED=handed)
+    env.pop("BR_ENTRIES", None)
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trace_one.py")
+    p = subprocess.run([sys.executable, tool, root, "-", out], env=env, stdin=subprocess.DEVNULL)
+    try:
+        with open(out, "rb") as fh:
+            per = pickle.load(fh)
+        os.unlink(out)
+    except OSError:
+        per = []
+    return per if p.returncode == 0 else []
 
 
 def main():
@@ -166,7 +187,8 @@ def main():
             ok = result.wasSuccessful() and result.testsRun == 1
             phase(False)
             warm = sum(len(ls) for ls in back.values())
-            cold_lines, replayed = cold_back(root, handed)
+            cold_lines, replayed, cold_per = cold_back(root, handed)
+            use_per = cold_use(root, handed)
             os.unlink(handed)
             for rel, ls in cold_lines.items():
                 back.setdefault(rel, set()).update(ls)
@@ -182,6 +204,12 @@ def main():
                 "ok": ok and result2.wasSuccessful(),
                 "entries": record,
                 "back": lines,
+                # per entry (in hand-over order, which is the order of `entries`): the lines its
+                # slow half runs when nothing before it has run
+                "back_by": dict(zip(record.keys(), cold_per)) if len(cold_per) == len(record) else {},
+                # per entry: the classes its slow half instantiates, the class constants it
+                # reads, the dict entries it looks up (the same cold replay, instrumented)
+                "use_by": dict(zip(record.keys(), use_per)) if len(use_per) == len(record) and all(use_per) else {},
                 "front_ms": int(front * 1000),
                 "full_ms": int(full * 1000),
                 "costs": {k: round(v, 1) for k, v in costs.items()},
@@ -202,6 +230,8 @@ def main():
             tid: {
                 "entries": d["entries"],
                 "back": d["back"],
+                "back_by": d.get("back_by", {}),
+                "use_by": d.get("use_by", {}),
                 "share": d["front_ms"] / max(1.0, d["full_ms"]),
                 # each entry's slow half as a share of the whole test
                 "costs": {k: v / max(1.0, d["full_ms"]) for k, v in d["costs"].items()},

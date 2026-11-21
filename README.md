@@ -99,6 +99,12 @@ CPU time is part of the score, so the selector avoids running what it can decide
   quick half had already cached is missed. All quick halves run before the first result is
   looked at; if the entries that are handed something new would together cost more than an
   allowance, none of them is run and the test simply stays selected.
+  The replay also notes, per entry, which lines its slow half runs and (run once more with
+  the class-usage instrumentation) which classes it instantiates, constants it reads and dict
+  entries it looks up. An entry whose slow half runs patched code, or uses a patched class
+  constant or dict entry, is always run for real; the others can be recognised by their
+  hand-over, so the shortcut also serves patches to class-level values that nothing read
+  while modules loaded.
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).

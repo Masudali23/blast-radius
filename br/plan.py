@@ -34,7 +34,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts", "uses")
 
     def __init__(self, commit):
         self.commit = commit
@@ -63,6 +63,11 @@ class Plan:
         # class constants the warm worker can simply be given: [path, [class, ...], NAME,
         # repr(old), repr(new)]
         self.consts = []
+        # (path, lo, hi) of a narrowed class-level change -> what code must do to notice it: a
+        # list of conditions that must all hold, each a list of alternatives (kind, what) with
+        # kind in classes / attr_reads / dict_keys / dict_calls / pairs [(file, line)] /
+        # range [file, lo, hi].  (For asking whether one half of a test can notice it.)
+        self.uses = {}
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -353,6 +358,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     plan.add("mod", rel, lo, hi, callers)
                     # of a sliced test, the entries that enter the function
                     plan.entry[(rel, lo, hi)] = (lambda r, a, b: lambda test_id: maps.entry_lines(test_id, r, a, b, loading=False))(rel, flo, fhi)
+                    plan.uses[(rel, lo, hi)] = [[("range", [rel, flo, fhi])]]
                     continue
             if mask and c.names and not c.coarse and c.cls and len(c.names) == 1 and REFINE_ATTRS:
                 readers = maps.attr_readers(["%s:%d" % (rel, line) for line in c.cls_lines], c.names[0])
@@ -362,6 +368,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     plan.add("mod", rel, lo, hi, mask & readers)
                     # of a sliced test, the entries that read the constant from this definition
                     plan.entry[(rel, lo, hi)] = (lambda items: lambda test_id: maps.entry_use(test_id, "attr_reads", items))(["%s:%d\t%s" % (rel, line, c.names[0]) for line in c.cls_lines])
+                    plan.uses[(rel, lo, hi)] = [[("attr_reads", ["%s:%d\t%s" % (rel, line, c.names[0]) for line in c.cls_lines])]]
                     patch = _const_patch(c, rel) if HOT_CONSTS and len(changes) == 1 and analyze.harmless_at_import(c) else None
                     if patch is not None:
                         # Nothing read this constant while modules loaded (that is what made the
@@ -372,17 +379,21 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     _import_guard(plan, rel, c, everyone, mask & readers)
                     continue
             factors = []  # the same narrowings, asked per fixture entry of a sliced test
+            needs = []  # ... and as conditions on the code that could notice the change
             if mask and c.names and not c.coarse and opts.get("refine_names", True):
                 mask &= _users(c.names, base, maps, rel, c.lines)
                 mentions = _user_lines(c.names, base, maps, rel, c.lines)
                 if mentions is not None:
                     factors.append((lambda pairs: lambda test_id: maps.entry_line_users(test_id, pairs))(mentions))
+                    needs.append([("pairs", mentions)])
                 if mask and c.cls and REFINE_CLASS != "off":
                     cu = _class_users(maps, base, rel, c)
                     if cu is not None:
                         plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
                         mask &= cu
-                        factors.append(_entries_class(maps, _class_parts(maps, base, rel, c)))
+                        parts = _class_parts(maps, base, rel, c)
+                        factors.append(_entries_class(maps, parts))
+                        needs.append([("classes", parts[0]), ("pairs", parts[1])])
                         if HOT_CONSTS and len(changes) == 1 and c.names == ["arg_types"] and _arg_types_settled(maps, rel, c):
                             patch = _const_patch(c, rel)
                             if patch is not None:
@@ -399,9 +410,16 @@ def _changed(plan, rel, old, new, base, maps, opts):
                         mask &= ku
                         if how:
                             factors.append((lambda field, items: lambda test_id: maps.entry_use(test_id, field, items))(*how[0]))
+                            needs.append([how[0]])
+                        else:
+                            needs = None  # narrowed in a way that has no per-code description
             plan.add("mod", rel, lo, hi, mask)
             if factors:
                 plan.entry[(rel, lo, hi)] = _all_of(factors)
+            if needs and (len(needs) > 1 or needs[0][0][0] != "pairs"):
+                # (mentions of the name alone say little about a half of a test: require one of
+                # the sharper conditions as well)
+                plan.uses[(rel, lo, hi)] = needs
             _import_guard(plan, rel, c, everyone, mask)
     if given:
         pass  # no function changes and nothing to import afresh

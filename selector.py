@@ -336,7 +336,8 @@ class Selector:
         if known is None:
             return None
         v, share = self.plain_variant(plan, n)
-        if (v is not None and not v.get("allow")) or not self.unchanged_back_half(plan, n, known):
+        must = None if (v is not None and not v.get("allow")) else self.patched_slow_halves(plan, n, known)
+        if must is None:
             return None
         frac = 1.0
         if v is not None:
@@ -349,24 +350,58 @@ class Selector:
         # entries that are handed something new may still be run for real, up to this much
         v["memo_costs"] = {k: self.cpu[n] * share for k, share in known.get("costs", {}).items()}
         v["memo_budget"] = MEMO_BUDGET * self.ms[n]
-        return v, self.cpu[n] * (frac * known["share"] + 0.01)
+        v["memo_must"] = sorted(must)
+        # the quick halves, plus the entries whose slow half runs patched code
+        return v, self.cpu[n] * (frac * known["share"] + 0.01 + sum(known.get("costs", {}).get(k, 0.0) for k in must))
 
-    def unchanged_back_half(self, plan, n, known):
-        """Does the patch change only function bodies, none of them run by the slow half?"""
+    def patched_slow_halves(self, plan, n, known):
+        """The entries of test n whose slow half runs code the patch changes (they are run for
+        real whatever they are handed), when the patch changes only function bodies; None when
+        nothing can be claimed (a module / class level change, edited data, or patched code in
+        the slow half that cannot be pinned to entries)."""
         idx = self.idx_of.get(n)
         if idx is None or plan.unknown or plan.syntax or self.id_of[n].split("::")[0] in plan.files:
-            return False
-        back = known["back"]
+            return None
+        back, by = known["back"], known.get("back_by") or {}
+        must = set()
         for kind, rel, lo, hi, mask in plan.parts:
             if kind == "func":
                 lines = back.get(rel)
                 if lines and (any(lo <= line <= hi for line in lines) if hi - lo > len(lines) else any(line in lines for line in range(lo, hi + 1))):
-                    return False
+                    hit = [key for key, per in by.items() if any(lo <= line <= hi for line in per.get(rel, ()))]
+                    if not hit:
+                        return None  # run by the slow half, but not by any one entry's replay
+                    must.update(hit)
             elif kind == "data" and rel.endswith(".py") and not (mask >> idx) & 1:
                 continue  # another test reads that source file as text
+            elif kind == "mod" and plan.uses.get((rel, lo, hi)) and by and known.get("use_by"):
+                # A class constant, dict entry or default value that nothing looked at while
+                # modules loaded: a slow half notices it only by using it.
+                needs = plan.uses[(rel, lo, hi)]
+                use_by = known["use_by"]
+                for key, lines in by.items():
+                    use = use_by.get(key)
+                    if use is None or all(self.uses_it(need, lines, use) for need in needs):
+                        must.add(key)
             else:
-                return False  # module / class level change or edited data: no claim is made
-        return True
+                return None  # another module / class level change, or edited data: no claim
+        return must
+
+    @staticmethod
+    def uses_it(alternatives, lines, use):
+        """Does code that ran `lines` ({file: lines}) and used `use` ({kind: items}) meet one of
+        the alternatives (see Plan.uses)?"""
+        for kind, what in alternatives:
+            if kind == "pairs":
+                if any(line in lines.get(f, ()) for f, line in what):
+                    return True
+            elif kind == "range":
+                f, lo, hi = what
+                if any(lo <= line <= hi for line in lines.get(f, ())):
+                    return True
+            elif any(item in use.get(kind, ()) for item in what):
+                return True
+        return False
 
     def plain_variant(self, plan, n):
         tid = self.id_of[n]

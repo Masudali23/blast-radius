@@ -190,7 +190,7 @@ class Session:
     After a strict session gave up, `gave_up` is set and the test's outcome means nothing.
     """
 
-    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0, capture=None):
+    def __init__(self, module, cls, attr, known=None, record=None, phase=None, strict=False, costs=None, budget=0.0, capture=None, must=()):
         self.module = module
         self.cls = cls
         self.attr = attr
@@ -199,6 +199,7 @@ class Session:
         self.record = record
         self.phase = phase  # callable(bool): tells the tracer when the slow half runs
         self.capture = capture  # map building: callable(plan, tables), given every hand-over
+        self.must = frozenset(must)  # entries whose slow half runs patched code: never skipped
         self.pending = {}
         # strict: on the first entry that is not recognised, stop doing work and report so
         self.strict = strict
@@ -281,7 +282,7 @@ class Session:
         def unchanged(skey, sql, key):
             """Is this entry handed exactly what the pinned commit handed over?"""
             want = session.known.get(skey)
-            if want is None or key is None or want[0] != key:
+            if want is None or key is None or want[0] != key or skey in session.must:
                 return False
             text = session.duckdb_text.get(skey)
             if text is None:
