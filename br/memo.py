@@ -210,6 +210,9 @@ class Session:
         self.spent = 0.0
         self.cost_record = {}  # map building: CPU ms of each entry's slow half
         self.depth = 0
+        self.fronts = []  # plan fingerprint of every hand-over, in the order they were made
+        self.weighed = False
+        self.duckdb_text = {}
         self.skipped = 0
         self.ran = 0
         self._saved = []
@@ -240,6 +243,7 @@ class Session:
                 key = fingerprint(plan, executor.tables)
             except Unstable:
                 key = None
+            session.fronts.append(key)
             if session.strict and (key is None or (key not in session.plans and session.budget <= 0)):
                 # not a plan seen at the pinned commit, and no allowance to run it for real
                 session.gave_up = True
@@ -274,21 +278,45 @@ class Session:
             finally:
                 back(True)
 
+        def unchanged(skey, sql, key):
+            """Is this entry handed exactly what the pinned commit handed over?"""
+            want = session.known.get(skey)
+            if want is None or key is None or want[0] != key:
+                return False
+            text = session.duckdb_text.get(skey)
+            if text is None:
+                try:
+                    text = text_key(real_transpile(sql, write="duckdb")[0])
+                except Exception:
+                    text = ""
+                session.duckdb_text[skey] = text
+            return text == want[1]
+
         def helper(test, i, table, tpch=True):
             entries = test.tpch_sqls if tpch else test.tpcds_sqls
             sql = entries[i][1]
             skey = text_key(sql)
             if session.gave_up:
                 return None
+            if session.strict and not session.weighed:
+                # Every quick half has run by now (the pool takes all queries before the first
+                # result is looked at), so it is known which entries are handed something new.
+                # If running all of those for real costs more than the allowance, stop before
+                # running any: the caller keeps the test.
+                session.weighed = True
+                ran = [e for e in entries if e[0].get("execute")]
+                if len(ran) == len(session.fronts):
+                    need = 0.0
+                    for (_, text, *_rest), key in zip(ran, session.fronts):
+                        k = text_key(text)
+                        if not unchanged(k, text, key):
+                            need += session.costs.get(k, float("inf"))
+                    if need > session.budget:
+                        session.gave_up = True
+                        return None
             if isinstance(table, Unchanged):
                 executor, plan = session.pending.pop(table.key)
-                want = session.known.get(skey)
-                same = False
-                if want is not None and want[0] == table.key:
-                    try:
-                        same = text_key(real_transpile(sql, write="duckdb")[0]) == want[1]
-                    except Exception:
-                        same = False
+                same = unchanged(skey, sql, table.key)
                 if same:
                     session.skipped += 1
                     return None

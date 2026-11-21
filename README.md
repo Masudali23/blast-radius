@@ -94,8 +94,11 @@ CPU time is part of the score, so the selector avoids running what it can decide
   keep a fingerprint of those per fixture entry. Entries that hand over exactly what the
   pinned commit handed over must pass again and skip the slow half; entries that hand over
   something new are run for real while that stays cheap, and otherwise the test stays selected.
-  It says nothing about state the slow half picks up from elsewhere, so it is switched off
-  (`BR_MEMO=1` turns it on).
+  Which lines the slow half runs is recorded twice: during the test itself, and again by
+  replaying every hand-over in a process that never ran the quick half, so that nothing the
+  quick half had already cached is missed. All quick halves run before the first result is
+  looked at; if the entries that are handed something new would together cost more than an
+  allowance, none of them is run and the test simply stays selected.
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
