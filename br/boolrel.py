@@ -342,13 +342,16 @@ def differs(old, new, kind, vector, impure, truth_only):
     return False
 
 
-def swapped(old_tree, new_tree):
+def swapped(old_tree, new_tree, same=None):
     """If two modules differ only in how one formula combines its (unchanged) operands, return
-    (old formula node, old structure, new structure, impure flags); otherwise None."""
+    (old formula node, old structure, new structure, impure flags); otherwise None.
+    `same` may tell which pairs of statements are written identically (nothing to find there)."""
     found = []
 
     def walk(o, n):
         if len(found) > 1:
+            return
+        if same is not None and isinstance(o, ast.stmt) and type(o) is type(n) and same(o, n):
             return
         if is_formula(o) or is_formula(n):
             if not (isinstance(o, ast.AST) and isinstance(n, ast.AST)):
@@ -389,14 +392,16 @@ def swapped(old_tree, new_tree):
     return None
 
 
-def one_operand(old_tree, new_tree):
+def one_operand(old_tree, new_tree, same=None):
     """If two modules differ only inside ONE operand of one formula (same and/or structure,
     every other operand textually unchanged), return (old formula node, structure, index of
-    that operand); otherwise None."""
+    that operand); otherwise None.  `same`: as for swapped."""
     found = []
 
     def walk(o, n):
         if len(found) > 1:
+            return
+        if same is not None and isinstance(o, ast.stmt) and type(o) is type(n) and same(o, n):
             return
         if is_formula(o) or is_formula(n):
             if not (isinstance(o, ast.AST) and isinstance(n, ast.AST)):

@@ -105,9 +105,10 @@ class _Ctx:
 
 
 class Differ:
-    def __init__(self):
+    def __init__(self, same=None):
         self.changes = []
         self._seen = set()
+        self.same = same  # optional test for two statements being written identically
 
     # -- reporting ---------------------------------------------------------
     def _report(self, ctx, node=None, coarse=False, what=""):
@@ -153,7 +154,10 @@ class Differ:
             # try to salvage: common prefix / suffix are unchanged, the middle is a structural edit
             self._report(_Ctx(ctx_scope, None, cls=cls), coarse=True, what="stmt-list")
             return
+        same = self.same
         for o, n in zip(olist, nlist):
+            if same is not None and same(o, n):
+                continue  # written identically: nothing to find
             self.stmt(o, n, ctx_scope, cls)
 
     def stmt(self, o, n, scope, cls):
@@ -224,7 +228,10 @@ class Differ:
         if len(olist) != len(nlist) or any(type(a) is not type(b) for a, b in zip(olist, nlist)):
             self._report(_Ctx(scope, None, cls=cls), coarse=True, what="block")
             return
+        same = self.same
         for o, n in zip(olist, nlist):
+            if same is not None and same(o, n):
+                continue
             self.stmt(o, n, scope, cls)
 
     def generic(self, o, n, ctx):
@@ -396,6 +403,51 @@ def _strip_doc(body):
 
 
 TREES = []  # the (old, new) trees of the last diff_python call that found differences
+SAME = [None]  # ... and its test for "these two statements are written identically" (or None)
+
+
+def same_text(old_src, new_src):
+    """A cheap test for two statements being the same code: the same source lines at the same
+    columns.  (A statement written identically parses identically, so a comparison of the two
+    trees has nothing to find below such a pair.)  None when lines cannot be told apart simply."""
+    if not isinstance(old_src, str) or not isinstance(new_src, str) or "\r" in old_src or "\r" in new_src:
+        return None
+    old_lines, new_lines = old_src.split("\n"), new_src.split("\n")
+
+    def start(node):
+        lo, co = node.lineno, node.col_offset
+        for d in getattr(node, "decorator_list", None) or ():
+            if (d.lineno, d.col_offset) < (lo, co):
+                lo, co = d.lineno, d.col_offset
+        return lo, co
+
+    def same(o, n):
+        try:
+            olo, oco = start(o)
+            nlo, nco = start(n)
+            ohi, nhi = o.end_lineno, n.end_lineno
+            if oco != nco or o.end_col_offset != n.end_col_offset or ohi - olo != nhi - nlo:
+                return False
+            return old_lines[olo - 1 : ohi] == new_lines[nlo - 1 : nhi]
+        except (AttributeError, TypeError):
+            return False
+
+    return same
+
+
+def _equal(o, n, same):
+    """ast.dump(o) == ast.dump(n), without dumping statements that are written identically."""
+    if type(o) is not type(n):
+        return False
+    if isinstance(o, list):
+        return len(o) == len(n) and all(_equal(a, b, same) for a, b in zip(o, n))
+    if not isinstance(o, ast.AST):
+        return o == n
+    if isinstance(o, ast.stmt):
+        if same(o, n):
+            return True
+        return all(_equal(getattr(o, f, None), getattr(n, f, None), same) for f in o._fields)
+    return ast.dump(o) == ast.dump(n)
 
 
 def diff_python(old_src, new_src):
@@ -406,6 +458,7 @@ def diff_python(old_src, new_src):
             "diff"   - see changes
     """
     TREES.clear()
+    SAME[0] = None
     try:
         new_tree = ast.parse(new_src)
     except (SyntaxError, ValueError, RecursionError):
@@ -414,9 +467,13 @@ def diff_python(old_src, new_src):
         old_tree = ast.parse(old_src)
     except (SyntaxError, ValueError, RecursionError):
         return "diff", [Change("mod", (1, 10**9), coarse=True, what="old-unparseable")]
-    if ast.dump(old_tree) == ast.dump(new_tree):
+    same = SAME[0] = same_text(old_src, new_src)
+    if same is None:
+        if ast.dump(old_tree) == ast.dump(new_tree):
+            return "same", []
+    elif _equal(old_tree.body, new_tree.body, same) and _equal(old_tree.type_ignores, new_tree.type_ignores, same):
         return "same", []
-    d = Differ()
+    d = Differ(same)
     d.stmts(old_tree.body, new_tree.body, old_tree, None)
     if not d.changes:
         # only docstrings differ (we strip them): harmless for the test-suite, but stay honest

@@ -268,11 +268,12 @@ def _changed(plan, rel, old, new, base, maps, opts):
     swap = regroup = operand = None
     if REFINE_RELATIONS and changes and all(c.level == "func" for c in changes) and analyze.TREES:
         # (each of these establishes by itself that the two modules differ in nothing else)
-        swap = relations.swapped(analyze.TREES[0], analyze.TREES[1]) if opts.get("relations", True) else None
+        same = analyze.SAME[0]
+        swap = relations.swapped(analyze.TREES[0], analyze.TREES[1], same) if opts.get("relations", True) else None
         if swap is None:
-            regroup = boolrel.swapped(analyze.TREES[0], analyze.TREES[1])
+            regroup = boolrel.swapped(analyze.TREES[0], analyze.TREES[1], same)
         if swap is None and regroup is None:
-            operand = boolrel.one_operand(analyze.TREES[0], analyze.TREES[1])
+            operand = boolrel.one_operand(analyze.TREES[0], analyze.TREES[1], same)
     for c in changes:
         if c.level == "func":
             plan.kinds.add("func")

@@ -122,9 +122,10 @@ def make_helper(hits, active=None, seen=None):
     return helper
 
 
-def swapped(old_tree, new_tree):
+def swapped(old_tree, new_tree, same=None):
     """If two modules differ in exactly one comparison operator, swapped for its partner with
-    both operands untouched, return the old comparison's site key; otherwise None."""
+    both operands untouched, return the old comparison's site key; otherwise None.
+    `same` may tell which pairs of statements are written identically (nothing to find there)."""
     found = []
 
     def walk(o, n):
@@ -132,6 +133,8 @@ def swapped(old_tree, new_tree):
             return
         if type(o) is not type(n):
             found.append(None)
+            return
+        if same is not None and isinstance(o, ast.stmt) and same(o, n):
             return
         if isinstance(o, list):
             if len(o) != len(n):
