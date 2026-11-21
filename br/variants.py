@@ -72,8 +72,13 @@ def changed_entries(fn, filename, new_items):
 def _wrap(fn):
     def wrapped(filename, *args, **kwargs):
         allow, rec = SL.active, SL.record
-        if SL.changed is not None and filename in SL.changed and not args and not kwargs:
-            yield from changed_entries(fn, filename, list(fn(filename)))
+        if SL.changed is not None and filename in SL.changed:
+            # an edited file: its entries that differ (all of it when it is read in a way
+            # that cannot be compared entry by entry)
+            if not args and not kwargs:
+                yield from changed_entries(fn, filename, list(fn(filename)))
+            else:
+                yield from fn(filename, *args, **kwargs)
             return
         if allow is None and rec is None:
             yield from fn(filename, *args, **kwargs)

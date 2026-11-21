@@ -486,7 +486,9 @@ class Selector:
                 share += 2.0 * sum(per) / len(per)  # an edit usually touches one entry
             if not files:
                 return {"allow": []}, 0.02  # only the set-up can be affected: run the test empty
-            return {"changed": files}, min(1.0, share + 0.02)
+            # ... and no entry of the files that were not edited: nothing this test reaches
+            # in them has changed
+            return {"changed": files, "allow": []}, min(1.0, share + 0.02)
         for kind, rel, lo, hi, mask in plan.parts:
             if not (mask >> idx) & 1:
                 continue
