@@ -52,6 +52,7 @@ class Maps:
         self.outer_reads = None  # names read while modules load (None: not recorded)
         self.outer_recv = None  # name -> classes it is read through while loading, to feed something else
         self.outer_recv_vals = None  # ... not counting reads that only walk a dict's keys
+        self.unobservable = {}  # file -> typing-only classes (line spans) and names nothing evaluates
         self.class_anc = {}  # class name -> names of its ancestors
         self.classlike = {}  # name -> {file: {line: what the class is known to be}}, read off a class object
         self.derives = {}  # name -> names a class-creation hook stores from it
@@ -137,6 +138,7 @@ class Maps:
                 self.outer_reads = set(d["outer_reads"]) if "outer_reads" in d else None
                 self.outer_recv = {n: set(r) for n, r in d["outer_recv"].items()} if "outer_recv" in d else None
                 self.outer_recv_vals = {n: set(r) for n, r in d["outer_recv_vals"].items()} if "outer_recv_vals" in d else None
+                self.unobservable = d.get("unobservable", {})
                 self.class_anc = {c: set(a) for c, a in d.get("class_anc", {}).items()}
                 self.classlike = d.get("classlike", {})
                 self.derives = d.get("derives", {})
@@ -384,6 +386,18 @@ class Maps:
             if r == "*" or r == cls or cls in self.class_anc.get(r, ()):
                 return True
         return False
+
+    def unobserved(self, rel, lo, hi, names):
+        """Is the statement at lines [lo, hi] of `rel` part of a definition that no code looks at
+        while the program runs (tools/build_reads.py: a typing-only class, or a module-level
+        name that only shows up in annotations)?  `names`: what a module-level statement binds."""
+        self.reads("")
+        found = self.unobservable.get(rel)
+        if not found:
+            return False
+        if any(a <= lo and hi <= b for a, b in found["classes"]):
+            return True
+        return bool(names) and all(n in found["names"] for n in names)
 
     def class_object_readers(self, names, cls):
         """Tests that run a line reading one of `names` off a class object that can be `cls` (or

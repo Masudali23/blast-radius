@@ -134,6 +134,11 @@ CPU time is part of the score, so the selector avoids running what it can decide
   on most of its entries, so a failure shows on the first part; if every sampled entry passes
   the test is let go. This is the one place where a test is released on a sample while other
   tests fail, and it is a measured trade: a sample is not the whole test.
+- **Typing-only definitions**: a class made only of typing constructs (a `TypedDict`, say) or a
+  module-level name, in a module that postpones annotations and is only ever imported name by
+  name, may be mentioned nowhere but in annotations that are never evaluated and under
+  `if TYPE_CHECKING:`. No test can tell such a definition from an edited one; only the import
+  of its module is checked (`tools/build_reads.py` lists them).
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).

@@ -350,6 +350,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     # imported, but nothing in it was ever traced (an empty __init__.py, say)
                     mask = maps.imports.get(rel, 0)
             everyone = mask
+            if mask and not c.coarse and maps.unobserved(rel, lo, hi, None if c.cls else c.names):
+                # a typing-only definition: annotations that are never evaluated are all that
+                # mention it, so only the import itself can go wrong
+                plan.notes.append("unobserved %s:%d: %d -> 0" % (rel, lo, bin(mask).count("1")))
+                plan.add("mod", rel, lo, hi, 0)
+                _import_guard(plan, rel, c, everyone, 0)
+                continue
             if c.names and any(n.startswith("__") for n in c.names):
                 # __slots__, __all__, __init_subclass__ ...: read by Python while it builds the
                 # class or module, with effects no reader index knows about
