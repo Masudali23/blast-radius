@@ -10,8 +10,10 @@ from concurrent.futures import Future
 
 class InlinePool:
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kwargs):
+        # Initializer arguments are fixture data (megabytes of table rows): they are handed over
+        # as they are.  Submitted calls and their results still make the pickle round trip.
         if initializer is not None:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer(*initargs)
 
     def __enter__(self):
         return self
