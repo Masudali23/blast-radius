@@ -25,6 +25,7 @@ TMP = os.environ.get("BR_TMP", "/tmp/br")
 DEBUG = os.environ.get("BR_DEBUG")
 
 FIXTURES = "tests/fixtures/"
+CLASS_FIXTURES = set(variants.CLASS_LISTS.values())
 WORKER_MS = 2000
 MAX_WORKERS = 8
 # tests slower than this (recorded seconds) are never run blindly by us
@@ -48,6 +49,10 @@ COMMIT_CPU = float(os.environ.get("BR_COMMIT_CPU", "25"))
 SLICE_PROBE = float(os.environ.get("BR_SLICE_PROBE", "1.0"))
 # slow tests still unverified after a clean sample: "keep" them selected, or "drop" them
 HEAVY_CLEAN = os.environ.get("BR_HEAVY_CLEAN", "drop")
+# slow sliced tests left unverified when other tests fail / in a broad set: "keep" them
+# selected, or "probe" (sample them and drop the ones whose sample passes)
+HEAVY_FAILED = os.environ.get("BR_HEAVY_FAILED", "keep")
+HEAVY_BROAD = os.environ.get("BR_HEAVY_BROAD", "keep")
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
 T0 = time.monotonic()
@@ -170,9 +175,14 @@ class Selector:
                 name = rel[len(FIXTURES):]
                 per = [sm["share"][i] for i, k in enumerate(sm["keys"]) if k.startswith(name + "#")]
                 if not per:
+                    if name in CLASS_FIXTURES:
+                        # loaded by the class set-up for other tests; this one uses no entry of it
+                        continue
                     return None, 1.0  # the test reads this file some other way
                 files.append(name)
                 share += 2.0 * sum(per) / len(per)  # an edit usually touches one entry
+            if not files:
+                return {"allow": []}, 0.02  # only the set-up can be affected: run the test empty
             return {"changed": files}, min(1.0, share + 0.02)
         for kind, rel, lo, hi, mask in plan.parts:
             if not (mask >> idx) & 1:
@@ -332,6 +342,11 @@ class Selector:
                     else:
                         unverified = keep
                         how = "heavy-kept"
+                elif keep and failed and HEAVY_FAILED == "probe":
+                    # something else fails: sample the remaining slow tests as well, and drop
+                    # the ones whose sample is clean
+                    keep, hit = self.probe_slow(plan, keep, run, dbg)
+                    failed = failed + hit
                 selected = failed + [n for n in keep if n not in failed]
                 if failed:
                     unverified = [n for n in keep if n not in failed]
@@ -364,8 +379,15 @@ class Selector:
                 to_run.append(by_n[n])
                 keep.discard(n)
         dbg["broad"] = len(everything)
+        probes = []
+        if HEAVY_BROAD == "probe":
+            for n in sorted(keep, key=lambda n: -ms[n])[:8]:
+                if by_n[n][2] > HEAVY * 1000:
+                    pn, pv, pe = self.slice_probe(plan, n)
+                    if pv is not None:
+                        probes.append((pn, pv, pe))
         dbg["unverified"] = sorted(keep)
-        if not to_run:
+        if not to_run and not probes:
             return sorted(keep) + likely, "broad-blind"
         lane = self.get_lane()
         mode = "bare" if plan.fresh else "full"
@@ -374,7 +396,7 @@ class Selector:
         try:
             for rel, content in plan.files.items():
                 lane.overlay.set_file(rel, content)
-            to_run.sort(key=lambda it: it[0])
+            to_run = sorted(to_run + probes, key=lambda it: it[0])
             jobs = [(self.id_of[n], max(1.5, 5.0 * e / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
             results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
@@ -386,16 +408,32 @@ class Selector:
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
                 results, err = lane.run(mode, jobs, deadline=60.0, cpu_budget=COMMIT_CPU)
+            probed = {n for n, _, _ in probes}
             for i, (n, v, e) in enumerate(to_run):
                 r = results.get(i)
                 if r is None or r[0] in ("F", "U"):
                     back.append(n)  # fails, or could not be checked: stays selected
+                elif n in probed:
+                    keep.discard(n)  # a clean sample of a slow test: drop it
+                    dbg.setdefault("probe_dropped", []).append(n)
             dbg["ran"] = len(results)
             dbg["cpu_ms"] = sum(r[1] for r in results.values())
             dbg["mode"] = mode
         finally:
             lane.overlay.restore()
         return sorted(keep) + back + likely, "broad-blind"
+
+    def probe_slow(self, plan, keep, run, dbg):
+        """Sample each sliced slow test in `keep`.  Returns (tests still kept, tests seen failing)."""
+        probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
+        if not probes:
+            return keep, []
+        hit, unseen = run(probes, False)
+        hit = hit + unseen
+        probed = {n for n, _, _ in probes}
+        dbg["probe_hit"] = hit
+        dbg["probe_dropped"] = sorted(probed - set(hit))
+        return [n for n in keep if n not in probed], hit
 
     def slice_probe(self, plan, n):
         """A cheap sample of a sliced test: its least expensive fixture entries."""
@@ -462,10 +500,12 @@ class Selector:
                 h = hows.setdefault(d.get("how", "?"), [0, 0])
                 h[0] += 1
                 h[1] += d.get("cpu_ms", 0) or 0
-            log("cpu: main %.2fs workers %.2fs (tests %.2fs) | %s" % (
-                time.process_time(), kids.ru_utime + kids.ru_stime,
+            log("cpu: main %.2fs (tests %.2fs) | %s" % (
+                time.process_time(),
                 sum(h[1] for h in hows.values()) / 1000.0,
                 " ".join("%s=%d/%.1fs" % (k, v[0], v[1] / 1000.0) for k, v in sorted(hows.items()))))
+            top = sorted(self.debug.items(), key=lambda kv: -(kv[1].get("cpu_ms") or 0))[:6]
+            log("slowest: " + " ".join("%s=%.1fs/%s/%d" % (c, (d.get("cpu_ms") or 0) / 1000.0, d.get("how"), d.get("ran") or 0) for c, d in top))
         except Exception:
             pass
         log("done %d commits in %.1fs wall" % (len(patches), time.monotonic() - T0))

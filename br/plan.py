@@ -10,6 +10,8 @@ from . import analyze, infect, patch
 # "family" (instances of any class of the same dialect)
 REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 
+# narrow an edited class-level dict entry to the tests that look that entry up
+REFINE_KEYS = os.environ.get("BR_REFINE_KEYS", "1") == "1"
 # use the index of real reads of a name (rather than any textual mention) to find its users
 USE_READS = os.environ.get("BR_USE_READS", "1") == "1"
 
@@ -229,6 +231,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     if cu is not None:
                         plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
                         mask &= cu
+                if mask and c.cls and REFINE_KEYS and len(c.names) == 1:
+                    ku = _key_users(maps, c)
+                    if ku is not None:
+                        plan.notes.append("key-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & ku).count("1")))
+                        mask &= ku
             plan.add("mod", rel, lo, hi, mask)
     if hot:
         plan.swaps.append(rel)
@@ -240,6 +247,48 @@ def _changed(plan, rel, old, new, base, maps, opts):
 
 
 FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+
+
+def _key_users(maps, c):
+    """Tests that look up one of the dict entries a class-level `NAME = {...}` edit touches.
+
+    Entries are found by name and key in any class's dict of that name, so copies inherited by
+    subclasses count.  None (no narrowing) when the dict is read as a whole or by one of these
+    keys while classes are being built: something else may then have been derived from it.
+    """
+    name = c.names[0]
+    if name not in maps.dict_names:
+        return None
+    res = analyze.changed_dict_keys(c)
+    if res is None:
+        return None
+    keys, old_keys = res[0], res[1]
+    if not keys:
+        return None
+    known = set(maps.dict_all_keys.get(name, ()))
+    for k in keys:
+        if "%s\t%s" % (name, k) in maps.dict_derived:
+            return None
+        if k in old_keys and k not in known:
+            return None  # the key as written does not match what the dict really holds
+    if keys <= old_keys and res[2]:
+        # Same keys, different values, and every edited entry holds a callable: only tests that
+        # invoke one of those callables can tell.  (This follows copies of the dict, too.)
+        mask = 0
+        for k in keys:
+            callers = maps.dict_callers(name, k)
+            if callers is None:
+                mask = None
+                break
+            mask |= callers
+        if mask is not None:
+            return mask
+    if "%s\t*" % name in maps.dict_derived:
+        return None
+    mask = maps.dict_users(name, "*")
+    for k in keys:
+        mask |= maps.dict_users(name, k)
+    return mask
 
 
 def _class_users(maps, base, rel, c):

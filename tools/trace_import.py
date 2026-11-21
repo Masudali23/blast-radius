@@ -61,7 +61,33 @@ worker.preload(root)
 mon.set_events(tool, 0)
 loaded = {getattr(m, "__file__", None) for m in list(sys.modules.values())}
 data_files = sorted(f for f in opened if os.path.join(root, f) not in loaded)
+from br.keys import key_repr
+
+all_keys = {}
+seen = set()
+for m in list(sys.modules.values()):
+    f = getattr(m, "__file__", None) or ""
+    if not f.startswith(prefix + "sqlglot" + os.sep):
+        continue
+    for obj in list(vars(m).values()):
+        if isinstance(obj, type) and id(obj) not in seen:
+            seen.add(id(obj))
+            stack = [obj]
+            while stack:
+                c = stack.pop()
+                for attr, value in list(vars(c).items()):
+                    if isinstance(value, dict) and not attr.startswith("__"):
+                        ks = all_keys.setdefault(attr, set())
+                        for k in value:
+                            try:
+                                ks.add(key_repr(k))
+                            except Exception:
+                                pass
+                    elif isinstance(value, type) and id(value) not in seen:
+                        seen.add(id(value))
+                        stack.append(value)
 res = {k[len(prefix):]: sorted(v) for k, v in func.items()}
+res["__dict_keys__"] = {k: sorted(v) for k, v in all_keys.items()}
 res["__files__"] = data_files
 json.dump(res, open(out, "w"))
 print("files read at preload:", len(data_files))

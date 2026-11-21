@@ -24,6 +24,11 @@ imports = {}
 spawn = 0
 class_users = {}  # "file:line" of a class -> tests that instantiate it or a subclass
 tracked = set()  # classes whose instantiation we can observe
+dict_users = {}  # "NAME\tkey" -> tests that look that key up in a class-level dict called NAME
+dict_calls = {}  # "NAME\tkey" -> tests that invoke the callable stored under that key
+dict_callable = set()  # "NAME\tkey" entries holding a callable
+dict_derived = set()  # "NAME\tkey" read (or called) by function code while classes are being built
+dict_names = set()  # class-level dict attributes that were observed
 bad = []
 for i, t in enumerate(tests):
     p = os.path.join(trace_dir, "%d.json" % t["number"])
@@ -46,6 +51,13 @@ for i, t in enumerate(tests):
         imports[f] = imports.get(f, 0) | bit
     if d["spawn"]:
         spawn |= bit
+    for k in d.get("dict_keys", ()):
+        dict_users[k] = dict_users.get(k, 0) | bit
+    for k in d.get("dict_calls", ()):
+        dict_calls[k] = dict_calls.get(k, 0) | bit
+    dict_callable.update(d.get("dict_callable", ()))
+    dict_derived.update(d.get("dict_derived", ()))
+    dict_names.update(d.get("dict_names", ()))
     for k in d.get("classes", ()):
         class_users[k] = class_users.get(k, 0) | bit
     tracked.update(d.get("tracked", ()))
@@ -83,15 +95,21 @@ index = {
     "scaled_ms": calib.get("scaled_ms", {}),
     "sliced": sliced,
     "class_users": class_users,
+    "dict_derived": sorted(dict_derived),
+    "dict_names": sorted(dict_names),
     "tracked": sorted(tracked),
     "ids": ids,
     "files": files,
     "opened": opened,
     "imports": imports,
     "spawn": spawn,
-    "import_func": {k: v for k, v in json.load(open(import_trace)).items() if k != "__files__"},
+    "import_func": {k: v for k, v in json.load(open(import_trace)).items() if not k.startswith("__")},
+    "dict_all_keys": json.load(open(import_trace)).get("__dict_keys__", {}),
     "import_files": json.load(open(import_trace)).get("__files__", []),
 }
+dblob = zlib.compress(pickle.dumps({"users": dict_users, "calls": dict_calls, "callable": sorted(dict_callable)}, protocol=5), 6)
+open(os.path.join(out_dir, "dictkeys.pkl"), "wb").write(dblob)
+total += len(dblob)
 blob = zlib.compress(pickle.dumps(index, protocol=5), 6)
 open(os.path.join(out_dir, "index.pkl"), "wb").write(blob)
 print("files", len(files), "bytes", total + len(blob), "non-pass traces", len(bad))

@@ -21,9 +21,10 @@ class Change:
     cls:    name of the enclosing class for class-body changes (or None)
     """
 
-    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what")
+    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what", "stmts")
 
-    def __init__(self, level, lines, coarse=False, names=None, scope_span=None, cls=None, what=""):
+    def __init__(self, level, lines, coarse=False, names=None, scope_span=None, cls=None, what="", stmts=None):
+        self.stmts = stmts  # (old statement, new statement) for a module / class level change
         self.level = level
         self.lines = lines
         self.coarse = coarse
@@ -90,13 +91,14 @@ def _target_names(stmt):
 
 
 class _Ctx:
-    __slots__ = ("scope", "stmt", "header", "cls")
+    __slots__ = ("scope", "stmt", "header", "cls", "new")
 
-    def __init__(self, scope, stmt, header=False, cls=None):
+    def __init__(self, scope, stmt, header=False, cls=None, new=None):
         self.scope = scope  # innermost scope node (Module / ClassDef / function-like)
         self.stmt = stmt  # innermost statement (or Lambda / GeneratorExp body owner)
         self.header = header
         self.cls = cls
+        self.new = new  # the statement's counterpart in the new file
 
 
 class Differ:
@@ -135,7 +137,7 @@ class Differ:
                     lines = (min(lo, stmt.lineno), hi)
                 else:
                     lines = _span(stmt)
-                ch = Change("mod", lines, names=_target_names(stmt), cls=ctx.cls, what=what)
+                ch = Change("mod", lines, names=_target_names(stmt), cls=ctx.cls, what=what, stmts=(stmt, ctx.new))
         key = (ch.level, ch.lines, ch.coarse)
         if key not in self._seen:
             self._seen.add(key)
@@ -152,7 +154,7 @@ class Differ:
             self.stmt(o, n, ctx_scope, cls)
 
     def stmt(self, o, n, scope, cls):
-        ctx = _Ctx(scope, o, cls=cls)
+        ctx = _Ctx(scope, o, cls=cls, new=n)
         if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # name / decorators / defaults / annotations are evaluated in the enclosing scope
             if o.name != n.name:
@@ -339,3 +341,49 @@ def code_shapes(src, filename="<x>"):
             if isinstance(k, types.CodeType):
                 stack.append(k)
     return out
+
+
+def _key_text(node):
+    """The tracer's text form (see br/keys.py) of a dict key written in source, or None."""
+    if isinstance(node, ast.Constant):
+        return ("s:" + node.value) if isinstance(node.value, str) else ("r:" + repr(node.value)[:80])
+    if isinstance(node, ast.Attribute):
+        return "n:" + node.attr
+    if isinstance(node, ast.Name):
+        return "n:" + node.id
+    if isinstance(node, ast.Tuple):
+        parts = [_key_text(e) for e in node.elts]
+        return None if None in parts else "t:" + ",".join(parts)
+    return None
+
+
+def changed_dict_keys(change):
+    """For `NAME = {...}` edited in place: (keys whose entry differs, keys of the old dict,
+    whether both dicts have the same keys).
+
+    None when the statement is not a plain dict display on both sides, a key cannot be read off
+    the source, or anything besides individual entries changed (a `**spread`, say).
+    """
+    if not change.stmts or change.stmts[1] is None:
+        return None
+    old, new = (getattr(st, "value", None) for st in change.stmts)
+    if not isinstance(old, ast.Dict) or not isinstance(new, ast.Dict):
+        return None
+
+    def entries(d):
+        table, spreads = {}, []
+        for k, v in zip(d.keys, d.values):
+            if k is None:
+                spreads.append(ast.dump(v))
+                continue
+            text = _key_text(k)
+            if text is None:
+                return None
+            table.setdefault(text, []).append(ast.dump(k) + "=>" + ast.dump(v))
+        return table, spreads
+
+    a, b = entries(old), entries(new)
+    if a is None or b is None or a[1] != b[1]:
+        return None
+    keys = {k for k in set(a[0]) | set(b[0]) if a[0].get(k) != b[0].get(k)}
+    return keys, set(a[0]), set(a[0]) == set(b[0])
