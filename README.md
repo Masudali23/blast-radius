@@ -68,15 +68,17 @@ CPU time is part of the score, so the selector avoids running what it can decide
   otherwise (`tools/check_instantiating.py`).
 - **Executor tables**: the executor tests load the TPC tables from CSV in their class setup.
   The image build stores the loaded tables once (`tools/build_tables.py`), and DuckDB
-  connections are opened only when a test first uses one. The build also stores the frame
-  DuckDB returns for every SQL text those tests send it: over the same fixture files the same
-  text always gets the same answer, so a test that sends an unchanged text is handed the stored
-  frame, and any other text goes to DuckDB.
+  connections are opened only when a test first uses one. The frame DuckDB returns for every
+  SQL text those tests send it is stored too (`maps/frames.pkl`, written by the same script
+  in the same image): over the same fixture files the same text always gets the same answer,
+  so a test that sends an unchanged text is handed the stored frame, and any other text goes
+  to DuckDB.
 - **Optimizer queries** (`br/answers.py`): many optimizer tests ask DuckDB for the rows of a
   query before and after sqlglot rewrote it. What DuckDB answers depends on the statements run
-  on that connection so far and on the text asked, not on sqlglot. The image build runs those
-  tests once (`tools/build_answers.py`) and stores, per state of a connection and per query
-  text, what came back; a text is kept only if a new connection given the same statements
+  on that connection so far and on the text asked, not on sqlglot. `tools/build_answers.py`
+  runs those tests once in the image and stores (`maps/answers.pkl`), per state of a
+  connection and per query text, what came back; a text is kept only if a new connection
+  given the same statements
   answers the same again from an empty directory. At run time such a connection is opened only
   when a test asks something that is not stored, so a rewritten query that differs from every
   text seen at the pinned commit is always run by DuckDB itself. Statements that could depend
@@ -180,6 +182,9 @@ changed expression side by side while tests run.
 - per entry of the executor's TPC-DS test: a fingerprint of what its slow half is handed, and
   the lines that half runs,
 - per fixture entry coverage for fixture-driven tests,
+- what DuckDB answers to the queries the executor and optimizer tests send it at the pinned
+  commit (`frames.pkl`, `answers.pkl`: written in the image by `.github/workflows/stores.yml`;
+  the image build writes them itself when they are missing),
 - the lines that already run while the workers warm up, and each test's measured cost.
 
 They are produced by `tools/trace_all.py` (once plain for coverage, once with
