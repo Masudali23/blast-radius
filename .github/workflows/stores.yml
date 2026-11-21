@@ -1,0 +1,24 @@
+name: stores
+# Writes maps/frames.pkl and maps/answers.pkl in the scorer's image (manual): what DuckDB answers
+# to the queries the executor and optimizer tests send it at the pinned commit.
+on:
+  workflow_dispatch:
+jobs:
+  stores:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build without the stored files
+        run: |
+          rm -f maps/frames.pkl maps/answers.pkl
+          docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Write the files
+        run: |
+          mkdir -p out && chmod 777 out
+          docker run --rm --platform linux/amd64 --user 0:0 --volume $PWD/out:/out blast-radius-entry sh -c \
+            'python /app/tools/build_tables.py /app/repo /tmp/tables.pkl --frames-only /out/frames.pkl && python /app/tools/build_answers.py /app/repo /out/answers.pkl && python /app/tools/build_answers.py /app/repo /out/answers2.pkl && ls -la /app/tables.pkl /app/answers.pkl /out'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stores
+          path: out/*.pkl

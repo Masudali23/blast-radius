@@ -1,12 +1,18 @@
 """Store the rows TestExecutor.setUpClass parses, for br/tables.py.
 
-Usage: build_tables.py <repo_root> <out.pkl>
+Usage: build_tables.py <repo_root> <out.pkl> [<frames.pkl>]
 
 Runs the real set-up at the pinned commit, then the shortened one fed from the stored rows, and
 writes the file only if both leave the class with the same tables.
 
 Then runs the tests that compare against DuckDB and stores every frame DuckDB handed back, by
 connection and SQL text; a text is kept only if asking DuckDB again gives an equal frame.
+(Only DuckDB's side is wanted here, so the two tests that also run sqlglot's own engine are
+given an empty table in its place: they ask DuckDB the same questions and take no time.)
+
+With <frames.pkl> (maps/frames.pkl: those frames, written by an earlier run of this script in
+the same image) the DuckDB tests are not run again: the frames are taken from the file.
+`--frames-only <out>` writes just that file.
 """
 import importlib
 import os
@@ -15,6 +21,7 @@ import sys
 import unittest
 
 DUCKDB_TESTS = ("test_execute_tpch", "test_optimized_tpch", "test_execute_tpcds")
+FRAMES_VERSION = 1
 
 
 class Recorder:
@@ -47,7 +54,7 @@ class Recorded:
         return getattr(self._result, name)
 
 
-def duckdb_answers(cls, tables):
+def duckdb_answers(cls, tables, module):
     """{connection: {sql text: frame}} for everything the DuckDB tests ask at the pinned commit."""
     import duckdb
 
@@ -61,20 +68,24 @@ def duckdb_answers(cls, tables):
 
     duckdb.connect = connect
     answers = {name: {} for name in tables.CONNS}
+    real_engine = module.mp_execute
     try:
-        cls.setUpClass()
+        tables.setup(cls)
         try:
             real = {name: getattr(cls, name) for name in tables.CONNS}
             for name in tables.CONNS:
                 setattr(cls, name, Recorder(real[name], answers[name]))
-            result = unittest.TestResult()
             for meth in DUCKDB_TESTS:
                 if hasattr(cls, meth):
+                    with_engine = "execute" not in meth
+                    module.mp_execute = real_engine if with_engine else tables.no_engine
+                    result = unittest.TestResult()
                     cls(meth).run(result)
+                    if with_engine and not result.wasSuccessful():
+                        return {}
+            module.mp_execute = real_engine
             for name in tables.CONNS:
                 setattr(cls, name, real[name])
-            if not result.wasSuccessful():
-                return {}
             for name, per in answers.items():
                 for sql in list(per):
                     try:
@@ -84,6 +95,7 @@ def duckdb_answers(cls, tables):
                     if again is None or not per[sql].equals(again):
                         del per[sql]
         finally:
+            module.mp_execute = real_engine
             cls.tearDownClass()
     finally:
         duckdb.connect = real_connect
@@ -119,17 +131,34 @@ def main():
         return
     ntables = sum(len(v) for v in stored.values())
     nrows = sum(len(rows) for v in stored.values() for _, rows in v.values())
-    try:
-        answers = duckdb_answers(cls, tables)
-    except Exception as e:  # the rows are still worth having
-        print("no DuckDB answers stored: %r" % (e,))
-        answers = {}
+    tables._cache[0], tables._cache[1] = stored, True  # (what load() hands out from here on)
+    answers = None
+    frames = sys.argv[3] if len(sys.argv) > 3 else None
+    if frames and os.path.exists(frames):
+        try:
+            with open(frames, "rb") as fh:
+                kept = pickle.load(fh)
+            if kept.get("version") == FRAMES_VERSION and set(kept["frames"]) == set(tables.CONNS):
+                answers = kept["frames"]
+        except Exception as e:
+            print("stored frames not usable: %r" % (e,))
+    if answers is None:
+        try:
+            answers = duckdb_answers(cls, tables, module)
+        except Exception as e:  # the rows are still worth having
+            print("no DuckDB answers stored: %r" % (e,))
+            answers = {}
     stored[tables.ANSWERS] = answers
     with open(out, "wb") as fh:
         pickle.dump(stored, fh, protocol=5)
     with open(out + ".info", "w") as fh:  # for the selector, which never loads the rows itself
         fh.write("answers %d\n" % sum(len(v) for v in answers.values()))
     print("tables:", ntables, "rows:", nrows, "DuckDB answers:", sum(len(v) for v in answers.values()), "bytes:", os.path.getsize(out))
+    if "--frames-only" in sys.argv:
+        target = sys.argv[sys.argv.index("--frames-only") + 1]
+        with open(target, "wb") as fh:
+            pickle.dump({"version": FRAMES_VERSION, "frames": answers}, fh, protocol=5)
+        print("frames:", os.path.getsize(target), "bytes")
 
 
 if __name__ == "__main__":

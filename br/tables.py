@@ -83,6 +83,19 @@ def setup(cls, stored=None):
             tables[name] = type(table)(columns=table.columns, rows=rows)
 
 
+class Nothing:
+    """Stands in for the table sqlglot's engine hands back (tools/build_tables.py)."""
+
+    columns = ()
+    rows = ()
+
+
+def no_engine(expression, meta):
+    """In place of the executor tests' `mp_execute` while only DuckDB's side is wanted: entries
+    that are not executed give None, as there; the others an empty table."""
+    return Nothing() if meta.get("execute") else None
+
+
 def answer(conn_name, sql):
     """The frame DuckDB returned for `sql` on that connection when the store was built, or None."""
     stored = load()

@@ -21,13 +21,18 @@ COPY maps /app/maps
 
 # The executor tests' fixture tables, parsed once from the pinned checkout (br/tables.py).
 # Optional: without the file the tests' own set-up parses them at run time.
+# maps/frames.pkl holds what DuckDB answers to those tests' queries; it was written by this
+# same script in this same image (.github/workflows/stores.yml), so the build need not ask
+# DuckDB again.  Without it the script asks.
 COPY tools/build_tables.py /app/tools/build_tables.py
-RUN python /app/tools/build_tables.py /app/repo /app/tables.pkl || true
+RUN timeout 300 python /app/tools/build_tables.py /app/repo /app/tables.pkl /app/maps/frames.pkl || true
 
-# What DuckDB answers to the optimizer tests' queries at the pinned commit (br/answers.py).
-# Optional: without the file every query goes to DuckDB.
+# What DuckDB answers to the optimizer tests' queries at the pinned commit (br/answers.py):
+# maps/answers.pkl, written by tools/build_answers.py in this same image; built here if the
+# file is not there.  Optional: without it every query goes to DuckDB.
 COPY tools/build_answers.py /app/tools/build_answers.py
-RUN python /app/tools/build_answers.py /app/repo /app/answers.pkl || true
+RUN if [ -f /app/maps/answers.pkl ]; then cp /app/maps/answers.pkl /app/answers.pkl; \
+    else timeout 240 python /app/tools/build_answers.py /app/repo /app/answers.pkl || true; fi
 
 # Byte-compile once: the run-time disk is read-only.
 RUN python -m compileall -q /app/repo/sqlglot /app/repo/tests /app/repo/sqlglotc /app/br /app/selector.py \
