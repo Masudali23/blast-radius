@@ -1,0 +1,8 @@
+.git
+.github
+sample
+tools/*
+!tools/fetch_sqlglot.py
+output.jsonl
+*.md
+__pycache__

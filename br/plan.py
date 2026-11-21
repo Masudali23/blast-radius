@@ -1,0 +1,317 @@
+"""Turn one patch into a plan: which tests could possibly be affected, and how to check them."""
+import os
+import re
+import sys
+
+from . import analyze, infect, patch
+
+# Files that configure the test run itself.  We cannot model those, so such a commit runs everything.
+# how far to narrow a class-attribute change: "off", "class" (instances of the class) or
+# "family" (instances of any class of the same dialect)
+REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
+
+# use the index of real reads of a name (rather than any textual mention) to find its users
+USE_READS = os.environ.get("BR_USE_READS", "1") == "1"
+
+RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py")
+
+
+class Plan:
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe")
+
+    def __init__(self, commit):
+        self.commit = commit
+        self.unknown = False  # cannot reason about it: select every test
+        self.cand = 0  # bitmask over map test indices: tests that may be affected
+        self.sure = 0  # tests we consider failing without running them
+        self.fresh = False  # needs a fresh import (module / class level change)
+        self.files = {}  # rel path -> new bytes (None = deleted)
+        self.swaps = []  # python files whose functions can be hot-swapped
+        self.notes = []
+        self.syntax = False
+        self.data_only = True
+        self.kinds = set()
+        # why each test is a candidate: (kind, path, lo, hi, mask) with kind in func / mod / data
+        self.parts = []
+        self.probe = []  # python files whose single changed expression can be evaluated both ways
+
+    def add(self, kind, rel, lo, hi, mask):
+        if mask:
+            self.cand |= mask
+            self.parts.append((kind, rel, lo, hi, mask))
+
+
+def _read(base, rel):
+    try:
+        with open(os.path.join(base, rel), "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _decode(data):
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+_IDENT = {}
+
+
+def _ident_lines(base, name, maps):
+    """Lines (per file) in sqlglot/ and tests/ that mention the identifier `name`."""
+    cache = _IDENT.get(name)
+    if cache is not None:
+        return cache
+    pat = re.compile(r"\b%s\b" % re.escape(name))
+    res = {}
+    for rel in maps.files:
+        if not rel.endswith(".py"):
+            continue
+        data = _read(base, rel)
+        if data is None or name.encode() not in data:
+            continue
+        text = data.decode("utf-8", "replace")
+        hits = [i for i, line in enumerate(text.split("\n"), 1) if pat.search(line)]
+        if hits:
+            res[rel] = hits
+    _IDENT[name] = res
+    return res
+
+
+def make_plan(commit, data, base, maps, opts=None):
+    opts = opts or {}
+    plan = Plan(commit)
+    try:
+        changes = patch.parse(data)
+    except Exception as e:  # unreadable patch
+        plan.unknown = True
+        plan.notes.append("patch parse: %r" % (e,))
+        return plan
+    if not changes and data.strip():
+        plan.unknown = True
+        plan.notes.append("no file sections found")
+        return plan
+
+    for ch in changes:
+        try:
+            _one_file(plan, ch, base, maps, opts)
+        except Exception as e:
+            plan.unknown = True
+            plan.notes.append("analysis error on %s: %r" % (ch.path, e))
+    return plan
+
+
+def _one_file(plan, ch, base, maps, opts):
+    rel = ch.path
+    if rel is None:
+        plan.unknown = True
+        plan.notes.append("change without a path")
+        return
+    name = os.path.basename(rel)
+    if ch.mode_only:
+        return
+    if ch.binary:
+        # we cannot build the new content; every test reading the file is taken as failing
+        plan.kinds.add("binary")
+        plan.sure |= maps.opened.get(rel, 0)
+        if rel.endswith(".py"):
+            plan.unknown = True
+        return
+    if ch.renamed and ch.old_path != ch.new_path:
+        old = _read(base, ch.old_path)
+        if old is None:
+            plan.unknown = True
+            return
+        new = patch.apply(old, ch) if ch.hunks else old
+        # model as: old path deleted, new path created
+        _changed(plan, ch.old_path, old, None, base, maps, opts)
+        _changed(plan, ch.new_path, _read(base, ch.new_path), new, base, maps, opts)
+        return
+    old = _read(base, ch.old_path) if ch.old_path else None
+    if ch.new_file and old is None:
+        new = patch.apply(None, ch)
+        _changed(plan, rel, None, new, base, maps, opts)
+        return
+    if old is None:
+        plan.unknown = True
+        plan.notes.append("patch touches a file we do not have: %s" % rel)
+        return
+    new = patch.apply(old, ch)
+    if new == old:
+        return
+    _changed(plan, rel, old, new, base, maps, opts)
+
+
+def _changed(plan, rel, old, new, base, maps, opts):
+    name = os.path.basename(rel)
+    if rel in plan.files:
+        plan.unknown = True
+        plan.notes.append("file patched twice: %s" % rel)
+        return
+    plan.files[rel] = new
+    if name in RUNNER_CONFIG:
+        plan.unknown = True
+        plan.notes.append("test-runner configuration: %s" % rel)
+        return
+    readers = maps.opened.get(rel, 0)
+    if rel in maps.import_files:
+        plan.fresh = True  # the warm worker already consumed the old content
+    if not rel.endswith(".py"):
+        plan.kinds.add("data")
+        plan.add("data", rel, 0, 0, readers)
+        return
+    plan.data_only = False
+    if old is None:
+        _new_module(plan, rel, new, maps)
+        return
+    if new is None:
+        # deleted module: everything that imported or read it is in play, on a fresh import
+        plan.kinds.add("deleted")
+        plan.fresh = True
+        plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | readers | maps.any_line(rel))
+        return
+    if not maps.known(rel) and not readers and not maps.imports.get(rel, 0):
+        plan.kinds.add("unused-py")
+        return  # a python file no test imports, runs or reads
+    old_t, new_t = _decode(old), _decode(new)
+    if old_t is None or new_t is None:
+        plan.kinds.add("syntax")
+        plan.fresh = True
+        plan.syntax = True
+        plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | readers | maps.any_line(rel))
+        return
+    status, changes = analyze.diff_python(old_t, new_t)
+    plan.add("data", rel, 0, 0, readers)  # tests that read this source file as data see any textual change
+    if status in ("same", "doc"):
+        plan.kinds.add("comment")
+        return
+    if status == "syntax":
+        plan.kinds.add("syntax")
+        plan.fresh = True
+        plan.syntax = True
+        plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | maps.any_line(rel))
+        return
+    shapes_ok = analyze.code_shapes(old_t) == analyze.code_shapes(new_t)
+    hot = True
+    for c in changes:
+        if c.level == "func":
+            plan.kinds.add("func")
+            lo, hi = c.lines
+            if not shapes_ok or c.coarse:
+                lo, hi = c.scope_span
+            plan.add("func", rel, lo, hi, maps.func(rel, lo, hi))
+            slo, shi = c.scope_span
+            if maps.ran_at_import(rel, slo, shi):
+                hot = False
+                # anything built at import time from this function may differ
+                plan.add("mod", rel, slo, shi, maps.func(rel, slo, shi))
+        else:
+            plan.kinds.add("mod")
+            hot = False
+            lo, hi = c.lines
+            if c.coarse and hi >= 10**9:
+                mask = maps.imports.get(rel, 0) | maps.any_line(rel)
+            else:
+                mask = maps.mod(rel, lo, hi)
+                if not mask and not maps.known(rel):
+                    # imported, but nothing in it was ever traced (an empty __init__.py, say)
+                    mask = maps.imports.get(rel, 0)
+            if mask and c.names and not c.coarse and opts.get("refine_names", True):
+                mask &= _users(c.names, base, maps, rel, c.lines)
+                if mask and c.cls and REFINE_CLASS != "off":
+                    cu = _class_users(maps, base, rel, c)
+                    if cu is not None:
+                        plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
+                        mask &= cu
+            plan.add("mod", rel, lo, hi, mask)
+    if hot:
+        plan.swaps.append(rel)
+        if len(changes) == 1 and not changes[0].coarse and shapes_ok and analyze.TREES:
+            if infect.applicable(analyze.TREES[0], analyze.TREES[1]):
+                plan.probe.append(rel)
+    else:
+        plan.fresh = True
+
+
+FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
+
+
+def _class_users(maps, base, rel, c):
+    """Tests that can observe a class attribute of class c.cls: those that create an instance of
+    the class (or a subclass), plus those running a line that names `Class.ATTR` outright.
+
+    A dialect's tokenizer, parser and generator classes feed each other when the dialect class
+    is built, so for those the whole dialect family counts.  None when we cannot tell.
+    """
+    key = None
+    for line in c.cls_lines:
+        k = "%s:%d" % (rel, line)
+        if k in maps.tracked:
+            key = k
+            break
+    if key is None:
+        return None
+    users = maps.class_users.get(key, 0)
+    for d in FAMILY_DIRS:
+        if rel.startswith(d) and REFINE_CLASS == "family":
+            stem = rel[len(d):]
+            prefixes = tuple(fd + stem + ":" for fd in FAMILY_DIRS)
+            for k, m in maps.class_users.items():
+                if k.startswith(prefixes):
+                    users |= m
+            break
+    for name in c.names:
+        pat = re.compile(r"\b%s\s*\.\s*%s\b" % (re.escape(c.cls), re.escape(name)))
+        for f, lines in _ident_lines(base, name, maps).items():
+            data = _read(base, f)
+            if data is None:
+                continue
+            text = data.decode("utf-8", "replace").split("\n")
+            for line in lines:
+                if pat.search(text[line - 1]):
+                    users |= maps.func(f, line, line) | maps.mod(f, line, line)
+    return users
+
+
+def _users(names, base, maps, rel, own_lines):
+    """Tests that execute some line mentioning one of `names` (outside the assignment itself)."""
+    mask = 0
+    for name in names:
+        if name.startswith("__") and name.endswith("__"):
+            return maps.all
+        where = maps.reads(name) if USE_READS else None
+        if where is None:
+            where = _ident_lines(base, name, maps)  # not indexed: any line mentioning the name
+        for f, lines in where.items():
+            for line in lines:
+                if f == rel and own_lines[0] <= line <= own_lines[1]:
+                    continue
+                mask |= maps.func(f, line, line) | maps.mod(f, line, line)
+    return mask
+
+
+def _new_module(plan, rel, new, maps):
+    name = os.path.basename(rel)
+    plan.kinds.add("new-py")
+    top = rel.split("/")[0]
+    stem = name[:-3]
+    if "/" not in rel:
+        # a new top-level module can shadow an installed one for every test
+        if stem in sys.stdlib_module_names or stem in ("duckdb", "pandas", "numpy", "pytz", "dateutil", "setuptools", "pytest", "sqlglot", "tests"):
+            plan.unknown = True
+            plan.notes.append("new top-level module shadows %s" % stem)
+        return
+    d = os.path.dirname(rel)
+    # tests that read sibling files as data usually enumerate the directory
+    for f, mask in maps.opened.items():
+        if os.path.dirname(f) == d:
+            plan.add("mod", rel, 0, 0, mask)
+    if name == "__init__.py":
+        plan.fresh = True
+        for f in maps.files:
+            if f.startswith(d + "/"):
+                plan.add("mod", rel, 0, 0, maps.imports.get(f, 0) | maps.any_line(f))
+    if plan.cand:
+        plan.fresh = True

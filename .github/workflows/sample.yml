@@ -1,0 +1,26 @@
+name: sample
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Run under the scorer's limits (3 times)
+        run: |
+          for i in 1 2 3; do
+            docker run --name run$i --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume $PWD/sample/commits:/data/commits:ro \
+              --volume $PWD/sample/tests.json:/data/tests.json:ro \
+              blast-radius-entry sh -c 'python /app/selector.py; rc=$?; grep usage_usec /sys/fs/cgroup/cpu.stat >&2; exit $rc' > output$i.jsonl 2> stderr$i.txt || true
+            echo "--- run $i stderr"; tail -5 stderr$i.txt
+            cpu=$(grep usage_usec stderr$i.txt | awk '{print $2/1000000}')
+            python3 score.py sample sample/answers.json output$i.jsonl --cpu-seconds ${cpu:-0}
+          done

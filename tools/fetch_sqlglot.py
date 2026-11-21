@@ -1,0 +1,24 @@
+"""Download sqlglot at the pinned commit from its own repository into /app/repo (build time only)."""
+import io
+import os
+import shutil
+import sys
+import tarfile
+import urllib.request
+
+SHA = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
+dest = sys.argv[1] if len(sys.argv) > 1 else "/app/repo"
+url = "https://github.com/tobymao/sqlglot/archive/%s.tar.gz" % SHA
+for attempt in range(5):
+    try:
+        data = urllib.request.urlopen(url, timeout=120).read()
+        break
+    except Exception as e:  # noqa: BLE001
+        print("download failed (%r), retrying" % (e,), file=sys.stderr)
+else:
+    raise SystemExit("could not download sqlglot")
+tmp = dest + "_src"
+tarfile.open(fileobj=io.BytesIO(data)).extractall(tmp, filter="data")
+os.rename(os.path.join(tmp, "sqlglot-" + SHA), dest)
+shutil.rmtree(tmp)
+print("sqlglot", SHA, "->", dest)
