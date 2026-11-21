@@ -96,12 +96,19 @@ def _pytest_settings(data):
     return out
 
 
+_PINNED = {}
+
+
 def _read(base, rel):
-    try:
-        with open(os.path.join(base, rel), "rb") as fh:
-            return fh.read()
-    except OSError:
-        return None
+    """A file of the pinned checkout (which nothing writes to), read once."""
+    key = (base, rel)
+    if key not in _PINNED:
+        try:
+            with open(os.path.join(base, rel), "rb") as fh:
+                _PINNED[key] = fh.read()
+        except OSError:
+            _PINNED[key] = None
+    return _PINNED[key]
 
 
 def _decode(data):

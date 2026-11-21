@@ -58,6 +58,7 @@ _WRITES = re.compile(
 _QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|\$\$.*?\$\$", re.S)
 _FILE = re.compile(r"[/\\]|\.\w{1,8}$|^(now|today|tomorrow|yesterday|allballs)$", re.I)
 _FIRST = re.compile(r"[\s(]*([A-Za-z_]+)")
+_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
 
 
 def kind(sql):
@@ -69,6 +70,10 @@ def kind(sql):
     "change"  may alter the connection: its text becomes part of the state;
     None      may alter it in ways the text does not tell: no store on this connection after it.
     """
+    if "'" not in sql and '"' not in sql and "$" not in sql:
+        # no quoted text anywhere, so `--` and `/*` can only open comments: their words say
+        # nothing about what the statement does
+        sql = _COMMENT.sub(" ", sql)
     if _COMMANDS.search(sql):
         return None
     outside = _OUTSIDE.search(sql) is not None
