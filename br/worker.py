@@ -266,8 +266,23 @@ def give_constant(path, names, attr, old_repr, new_repr):
     current = obj.__dict__.get(attr, _ABSENT)
     if current is _ABSENT or type(current) is not type(old) or current != old:
         return "the class does not hold the pinned value"
+    derived = None
+    if attr == "arg_types":
+        # the class hook (Expr.__init_subclass__) works `required_args` out of the table for
+        # the class and for every subclass that inherits the table
+        required = lambda table: {k for k, v in table.items() if v}
+        if type(old) is not dict or obj.__dict__.get("required_args", _ABSENT) != required(old):
+            return "required_args is not what the hook derives"
+        derived, stack = [], [obj]
+        while stack:
+            k = stack.pop()
+            if k is obj or "arg_types" not in k.__dict__:
+                derived.append(k)
+                stack.extend(k.__subclasses__())
     try:
         type.__setattr__(obj, attr, new)
+        for k in derived or ():
+            type.__setattr__(k, "required_args", {name for name, v in k.arg_types.items() if v})
     except Exception as e:
         return "cannot set: %r" % (e,)
     return None

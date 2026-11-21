@@ -383,6 +383,14 @@ def _changed(plan, rel, old, new, base, maps, opts):
                         plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
                         mask &= cu
                         factors.append(_entries_class(maps, _class_parts(maps, base, rel, c)))
+                        if HOT_CONSTS and len(changes) == 1 and c.names == ["arg_types"] and _arg_types_settled(maps, rel, c):
+                            patch = _const_patch(c, rel)
+                            if patch is not None:
+                                # An argument table nobody looked at while modules loaded:
+                                # the warm worker is given the new one, and works out again
+                                # what the class hook derives from it.
+                                plan.consts.append(patch)
+                                given = True
                 if mask and c.cls and REFINE_KEYS and len(c.names) == 1:
                     how = []
                     ku = _key_users(maps, c, rel, how)
@@ -467,6 +475,19 @@ def _asked(maps, rel, operand):
         if boolrel.asks_for(struct, kind, vec, index):
             mask |= tests
     return mask
+
+
+def _arg_types_settled(maps, rel, c):
+    """Can the warm worker take a new `arg_types` for this class as if it had been imported
+    with it?  Only when no instance of the class existed while modules loaded (an instance
+    may have been checked against the table already) and no line reading the table off the
+    class ran then.  (Copies made in other class bodies were ruled out by the caller.)"""
+    if maps.made_while_loading(["%s:%d" % (rel, line) for line in c.cls_lines]):
+        return False
+    lines = maps.class_object_lines(c.names, c.cls)
+    if lines is None:
+        return False
+    return not any(maps.ran_at_import(f, line, line) for f, line in lines)
 
 
 def _const_patch(c, rel):

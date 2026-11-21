@@ -48,7 +48,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   When such a constant is a literal replaced by another literal, nothing read it while
   modules loaded, so a freshly imported patched program differs from the warm worker in that
   one attribute: the worker's forked child is simply given the new value (any class set-up
-  it inherited is run again), which saves the import.
+  it inherited is run again), which saves the import. An expression's `arg_types` table is
+  handed over the same way when no instance of the class existed while modules loaded
+  (`tools/trace_import_made.py`); the worker then works out `required_args` again for the
+  class and the subclasses that inherit the table, as the class hook does.
   Reads that need no instance are indexed separately (`tools/build_reads.py`): a name read off
   a class object (`cls.NAME` in a classmethod, `exp.Select.NAME`) counts for every class that
   read can stand for; a name read while modules load to build something stored under another

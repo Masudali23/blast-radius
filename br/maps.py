@@ -27,6 +27,7 @@ class Maps:
         self.dict_all_keys = idx.get("dict_all_keys", {})
         self._dict_users = None
         self._relsl = None
+        self._import_made = None
         self._index_of = None
         self.class_users = idx.get("class_users", {})  # "file:line" of a class -> tests instantiating it
         self.tracked = set(idx.get("tracked", ()))
@@ -318,6 +319,22 @@ class Maps:
         set-up was not recorded.)"""
         d = self._relslices().get(test_id)
         return bool(d) and line in d.get("setup_lines", {}).get(rel, ())
+
+    def made_while_loading(self, cls_keys):
+        """Was one of these classes (or a subclass) instantiated while the warm worker loaded?
+        True as well when that was never recorded (tools/trace_import_made.py)."""
+        if self._import_made is None:
+            path = os.path.join(self.dir, "import_made.json")
+            if os.path.exists(path):
+                import json
+
+                with open(path) as fh:
+                    self._import_made = frozenset(json.load(fh))
+            else:
+                self._import_made = False
+        if self._import_made is False:
+            return True
+        return any(k in self._import_made for k in cls_keys)
 
     def memo(self, test_id):
         """Hand-over fingerprints of an executor test (see br/memo.py), or None."""
