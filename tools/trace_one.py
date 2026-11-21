@@ -411,6 +411,90 @@ def main():
     mon.register_callback(tool, mon.events.PY_START, on_start)
     mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
 
+    if INSTRUMENT and os.environ.get("BR_ENTRIES"):
+        # Per fixture entry of a sliced test: which classes it instantiates, which class-level
+        # constants it reads and which dict entries it looks up.  The class is set up once and
+        # the test runs in forked children, each allowed a single entry (plus one that sees
+        # none), as tools/trace_slices_one.py does; entries are numbered as in the slice map.
+        import pickle
+        import zlib
+
+        from br import maps as maps_mod, worker
+
+        mon.set_events(tool, 0)
+        worker._limit_duckdb_threads()
+        sm = maps_mod.Maps(os.environ["BR_ENTRIES"]).slices(test_id)
+        record = {"id": test_id, "keys": [], "ok": False}
+        if sm is not None:
+            keys = list(sm["keys"])
+            runner = worker.Runner(os.open(os.devnull, os.O_WRONLY))
+            path, cls_name, meth = test_id.split("::")
+            module = runner._module(path[:-3].replace("/", "."))
+            if isinstance(module, BaseException):
+                raise module
+            # function lines the class set-up runs: what they compute is shared by every entry
+            func.clear()
+            mon.restart_events()
+            mon.set_events(tool, mon.events.LINE | mon.events.PY_START)
+            runner._class(getattr(module, cls_name))
+            mon.set_events(tool, 0)
+            record["setup_lines"] = {f[len(prefix):]: sorted(ls) for f, ls in func.items()}
+            fields = ("classes", "attr_reads", "dict_keys", "dict_calls")
+
+            def in_child(allow):
+                r, w = os.pipe()
+                pid = os.fork()
+                if pid == 0:
+                    os.close(r)
+                    try:
+                        # (nothing is cleared: what loading the modules and setting up the
+                        # class instantiated, read and looked up is shared by every entry)
+                        outcome = runner.run_one(test_id, {"allow": list(allow)})
+                        key_of = {c: "%s:%d" % (f, line) for c, f, line in created}
+                        classes = set()
+                        for c in used:
+                            for b in c.__mro__:
+                                k = key_of.get(b)
+                                if k:
+                                    classes.add(k)
+                        payload = {
+                            "outcome": outcome,
+                            "classes": sorted(classes),
+                            "attr_reads": sorted(attr_reads),
+                            "dict_keys": sorted("%s\t%s" % kv for kv in dict_keys),
+                            "dict_calls": sorted("%s\t%s" % kv for kv in dict_calls),
+                        }
+                    except BaseException as e:  # noqa: BLE001
+                        payload = {"error": repr(e)}
+                    with os.fdopen(w, "wb") as fh:
+                        fh.write(pickle.dumps(payload))
+                    os._exit(0)
+                os.close(w)
+                with os.fdopen(r, "rb") as fh:
+                    data = fh.read()
+                os.waitpid(pid, 0)
+                return pickle.loads(data) if data else {"error": "no data"}
+
+            base = in_child(())
+            ok = base.get("outcome") == "P"
+            tables = {f: {} for f in fields}
+            for i, k in enumerate(keys):
+                r = in_child((k,))
+                if r.get("outcome") != "P":
+                    ok = False
+                    sys.stderr.write("%s entry %s: %r\n" % (test_id, k, r.get("outcome", r.get("error"))))
+                    continue
+                for f in fields:
+                    t = tables[f]
+                    for item in r[f]:
+                        t[item] = t.get(item, 0) | (1 << i)
+            record.update(keys=keys, ok=ok, **tables)
+            sys.stderr.write("%s entries=%d ok=%s classes=%d constants=%d dict entries=%d\n" % (test_id, len(keys), ok, len(tables["classes"]), len(tables["attr_reads"]), len(tables["dict_keys"])))
+        with open(out, "wb") as fh:
+            fh.write(zlib.compress(pickle.dumps(record, protocol=5), 6))
+        sys.stdout.flush()
+        os._exit(0)
+
     path, cls_name, meth = test_id.split("::")
     module_name = path[:-3].replace("/", ".")
     t0 = time.perf_counter()

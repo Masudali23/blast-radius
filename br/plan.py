@@ -345,6 +345,8 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     callers = maps.func(rel, flo, fhi)
                     plan.notes.append("default-narrowed %s:%d: %d -> %d" % (rel, flo, bin(mask).count("1"), bin(callers).count("1")))
                     plan.add("mod", rel, lo, hi, callers)
+                    # of a sliced test, the entries that enter the function
+                    plan.entry[(rel, lo, hi)] = (lambda r, a, b: lambda test_id: maps.entry_lines(test_id, r, a, b, loading=False))(rel, flo, fhi)
                     continue
             if mask and c.names and not c.coarse and c.cls and len(c.names) == 1 and REFINE_ATTRS:
                 readers = maps.attr_readers(["%s:%d" % (rel, line) for line in c.cls_lines], c.names[0])
@@ -352,21 +354,33 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     # every read of this constant from this class's definition was observed
                     plan.notes.append("attr-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & readers).count("1")))
                     plan.add("mod", rel, lo, hi, mask & readers)
+                    # of a sliced test, the entries that read the constant from this definition
+                    plan.entry[(rel, lo, hi)] = (lambda items: lambda test_id: maps.entry_use(test_id, "attr_reads", items))(["%s:%d\t%s" % (rel, line, c.names[0]) for line in c.cls_lines])
                     _import_guard(plan, rel, c, everyone, mask & readers)
                     continue
+            factors = []  # the same narrowings, asked per fixture entry of a sliced test
             if mask and c.names and not c.coarse and opts.get("refine_names", True):
                 mask &= _users(c.names, base, maps, rel, c.lines)
+                mentions = _user_lines(c.names, base, maps, rel, c.lines)
+                if mentions is not None:
+                    factors.append((lambda pairs: lambda test_id: maps.entry_line_users(test_id, pairs))(mentions))
                 if mask and c.cls and REFINE_CLASS != "off":
                     cu = _class_users(maps, base, rel, c)
                     if cu is not None:
                         plan.notes.append("class-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & cu).count("1")))
                         mask &= cu
+                        factors.append(_entries_class(maps, _class_parts(maps, base, rel, c)))
                 if mask and c.cls and REFINE_KEYS and len(c.names) == 1:
-                    ku = _key_users(maps, c, rel)
+                    how = []
+                    ku = _key_users(maps, c, rel, how)
                     if ku is not None:
                         plan.notes.append("key-narrowed %s.%s: %d -> %d" % (c.cls, c.names[0], bin(mask).count("1"), bin(mask & ku).count("1")))
                         mask &= ku
+                        if how:
+                            factors.append((lambda field, items: lambda test_id: maps.entry_use(test_id, field, items))(*how[0]))
             plan.add("mod", rel, lo, hi, mask)
+            if factors:
+                plan.entry[(rel, lo, hi)] = _all_of(factors)
             _import_guard(plan, rel, c, everyone, mask)
     if hot:
         plan.swaps.append(rel)
@@ -457,7 +471,9 @@ def _entries_regrouped(maps, rel, regroup, old_tree):
         got = maps.entry_formula(test_id, rel, key) if truth_only is not None else None
         if got is None:
             return None
-        vectors, mask = got
+        vectors, mask, before = got
+        if any(boolrel.differs(old, new, kind, vec, impure, truth_only) for kind, vec in before):
+            return None  # differs while the class is set up: every entry builds on that
         for kind, vec, where in vectors:
             if boolrel.differs(old, new, kind, vec, impure, truth_only):
                 mask |= where
@@ -474,7 +490,9 @@ def _entries_asked(maps, rel, operand):
         got = maps.entry_formula(test_id, rel, key)
         if got is None:
             return None
-        vectors, mask = got
+        vectors, mask, before = got
+        if any(boolrel.asks_for(struct, kind, vec, index) for kind, vec in before):
+            return None  # asked for while the class is set up
         for kind, vec, where in vectors:
             if boolrel.asks_for(struct, kind, vec, index):
                 mask |= where
@@ -496,8 +514,10 @@ def _import_guard(plan, rel, change, everyone, narrowed):
 FAMILY_DIRS = ("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")
 
 
-def _key_users(maps, c, rel):
+def _key_users(maps, c, rel, how=None):
     """Tests that look up one of the dict entries a class-level `NAME = {...}` edit touches.
+    (`how`, a list, receives the per-entry question that matches: (field, items) for
+    maps.entry_use.)
 
     Entries are found by name and key in any class's dict of that name, so copies inherited by
     subclasses count.  None (no narrowing) when the dict is read as a whole or by one of these
@@ -532,12 +552,16 @@ def _key_users(maps, c, rel):
                 break
             mask |= callers
         if mask is not None:
+            if how is not None:
+                how.append(("dict_calls", ["%s\t%s" % (name, k) for k in keys]))
             return mask
     if maps.derived(name, "*", cls_keys):
         return None
     mask = maps.dict_users(name, "*")
     for k in keys:
         mask |= maps.dict_users(name, k)
+    if how is not None:
+        how.append(("dict_keys", ["%s\t*" % name] + ["%s\t%s" % (name, k) for k in keys]))
     return mask
 
 
@@ -548,6 +572,20 @@ def _class_users(maps, base, rel, c):
     A dialect's tokenizer, parser and generator classes feed each other when the dialect class
     is built, so for those the whole dialect family counts.  None when we cannot tell.
     """
+    parts = _class_parts(maps, base, rel, c)
+    if parts is None:
+        return None
+    keys, lines = parts
+    users = 0
+    for k in keys:
+        users |= maps.class_users.get(k, 0)
+    for f, line in lines:
+        users |= maps.func(f, line, line) | maps.mod(f, line, line)
+    return users
+
+
+def _class_parts(maps, base, rel, c):
+    """What _class_users is made of: (classes whose instances count, lines that count)."""
     key = None
     for line in c.cls_lines:
         k = "%s:%d" % (rel, line)
@@ -559,37 +597,76 @@ def _class_users(maps, base, rel, c):
     if any(maps.feeds_elsewhere(name, c.cls) for name in c.names):
         return None  # a copy stored under another name can be reached without this class
     # read off a class object (`cls.NAME` in a classmethod, `Dialect[...].NAME`): no instance needed
-    loose = maps.class_object_readers(c.names, c.cls)
-    if loose is None:
+    lines = maps.class_object_lines(c.names, c.cls)
+    if lines is None:
         return None
-    users = maps.class_users.get(key, 0) | loose
+    lines = list(lines)
+    keys = [key]
     for d in FAMILY_DIRS:
         if rel.startswith(d) and REFINE_CLASS == "family":
             stem = rel[len(d):]
             prefixes = tuple(fd + stem + ":" for fd in FAMILY_DIRS)
-            for k, m in maps.class_users.items():
-                if k.startswith(prefixes):
-                    users |= m
+            keys.extend(k for k in maps.class_users if k.startswith(prefixes) and k != key)
             break
     for name in c.names:
         pat = re.compile(r"\b%s\s*\.\s*%s\b" % (re.escape(c.cls), re.escape(name)))
-        for f, lines in _ident_lines(base, name, maps).items():
+        for f, ls in _ident_lines(base, name, maps).items():
             data = _read(base, f)
             if data is None:
                 continue
             text = data.decode("utf-8", "replace").split("\n")
-            for line in lines:
+            for line in ls:
                 if pat.search(text[line - 1]):
-                    users |= maps.func(f, line, line) | maps.mod(f, line, line)
-    return users
+                    lines.append((f, line))
+    return keys, lines
+
+
+def _entries_class(maps, parts):
+    """_class_users asked per fixture entry of a sliced test."""
+    keys, lines = parts
+
+    def entries(test_id):
+        mask = maps.entry_use(test_id, "classes", keys)
+        if mask is None:
+            return None
+        rest = maps.entry_line_users(test_id, lines)
+        return None if rest is None else mask | rest
+
+    return entries
+
+
+def _all_of(factors):
+    """Entries that pass every narrowing that can say something about a test (each one names
+    a superset of the entries the change can reach, so any of them may be left out)."""
+
+    def entries(test_id):
+        mask = None
+        for f in factors:
+            m = f(test_id)
+            if m is not None:
+                mask = m if mask is None else mask & m
+        return mask
+
+    return entries
 
 
 def _users(names, base, maps, rel, own_lines):
     """Tests that execute some line mentioning one of `names` (outside the assignment itself)."""
+    lines = _user_lines(names, base, maps, rel, own_lines)
+    if lines is None:
+        return maps.all
     mask = 0
+    for f, line in lines:
+        mask |= maps.func(f, line, line) | maps.mod(f, line, line)
+    return mask
+
+
+def _user_lines(names, base, maps, rel, own_lines):
+    """The (file, line) pairs behind _users; None when every test counts."""
+    out = []
     for name in names:
         if name.startswith("__") and name.endswith("__"):
-            return maps.all
+            return None
         where = maps.reads(name) if USE_READS else None
         if where is None:
             where = _ident_lines(base, name, maps)  # not indexed: any line mentioning the name
@@ -597,8 +674,8 @@ def _users(names, base, maps, rel, own_lines):
             for line in lines:
                 if f == rel and own_lines[0] <= line <= own_lines[1]:
                     continue
-                mask |= maps.func(f, line, line) | maps.mod(f, line, line)
-    return mask
+                out.append((f, line))
+    return out
 
 
 def _new_module(plan, rel, new, maps, base):

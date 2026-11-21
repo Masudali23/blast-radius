@@ -27,6 +27,7 @@ class Maps:
         self.dict_all_keys = idx.get("dict_all_keys", {})
         self._dict_users = None
         self._relsl = None
+        self._index_of = None
         self.class_users = idx.get("class_users", {})  # "file:line" of a class -> tests instantiating it
         self.tracked = set(idx.get("tracked", ()))
         self.cpu_ms = idx.get("cpu_ms") or []
@@ -238,20 +239,85 @@ class Maps:
         if d is None:
             return None
         site = rel + "|" + key
+        if site in d["pre_hits"]:
+            return None  # disagreed while the class was set up: every entry builds on that
         return d["hits"].get(site, 0) | (((1 << d["n"]) - 1) & ~d["seen"].get(site, 0))
 
     def entry_formula(self, test_id, rel, key):
-        """For a sliced test: ([(kind, vector, entries)], entries to keep regardless) for the
-        condition at `key`, or None when the test's entries were not recorded."""
+        """For a sliced test: ([(kind, vector, entries)], entries to keep regardless, [(kind,
+        vector)] evaluated before any entry ran) for the condition at `key`, or None when the
+        test's entries were not recorded or an evaluation before them did not finish."""
         d = self._relslices().get(test_id)
         if d is None:
             return None
         site = rel + "|" + key
+        if site in d["pre_aborted"]:
+            return None
         vectors = d["vectors"].get(site, ())
         observed = d["aborted"].get(site, 0)
         for _, _, entries in vectors:
             observed |= entries
-        return vectors, d["aborted"].get(site, 0) | (((1 << d["n"]) - 1) & ~observed)
+        return vectors, d["aborted"].get(site, 0) | (((1 << d["n"]) - 1) & ~observed), d["pre_vectors"].get(site, ())
+
+    def entry_use(self, test_id, field, items):
+        """For a sliced test: the fixture entries that use any of `items`, where `field` says
+        how ("classes": instantiate the class at that "file:line"; "attr_reads": read the
+        constant "class\tNAME"; "dict_keys": look up "NAME\tkey"; "dict_calls": invoke the
+        callable stored there).  None when the test's entries were not recorded."""
+        d = self._relslices().get(test_id)
+        use = d.get("use") if d else None
+        if not use:
+            return None
+        table = use[field]
+        mask = 0
+        for item in items:
+            mask |= table.get(item, 0)
+        return mask
+
+    def entry_lines(self, test_id, rel, lo, hi, loading=True):
+        """For a sliced test: the fixture entries that run some function line in [lo, hi] of a
+        file, or None when the test runs one of those lines outside its fixture loop (or is not
+        sliced).  With `loading`, a line in the range that the test runs while modules load
+        also means None; a caller that only asks who enters a function turns that off (its
+        `def` line always runs then)."""
+        sm = self.slices(test_id)
+        d = self._relslices().get(test_id)
+        if sm is None or d is None or "setup_lines" not in d:
+            return None
+        if self._index_of is None:
+            self._index_of = {t: i for i, t in enumerate(self.ids)}
+        idx = self._index_of.get(test_id)
+        if idx is None:
+            return None
+        if loading and (self.mod(rel, lo, hi) >> idx) & 1:
+            return None  # the test runs one of them while modules load
+        table = sm["lines"].get(rel, {})
+        during_setup = d["setup_lines"].get(rel, ())
+        mask = 0
+        for line, tests in self.func_lines(rel, lo, hi):
+            if (tests >> idx) & 1:
+                entries = table.get(line, 0)
+                if not entries or line in during_setup:
+                    return None  # runs outside the fixture loop: every entry builds on it
+                mask |= entries
+        return mask
+
+    def entry_line_users(self, test_id, pairs):
+        """entry_lines over a list of (file, line): the entries that run any of them; None as
+        soon as one of them cannot be pinned to entries."""
+        mask = 0
+        for f, line in pairs:
+            m = self.entry_lines(test_id, f, line, line)
+            if m is None:
+                return None
+            mask |= m
+        return mask
+
+    def setup_runs(self, test_id, rel, line):
+        """Does the class set-up of a sliced test run this function line?  (False when the
+        set-up was not recorded.)"""
+        d = self._relslices().get(test_id)
+        return bool(d) and line in d.get("setup_lines", {}).get(rel, ())
 
     def memo(self, test_id):
         """Hand-over fingerprints of an executor test (see br/memo.py), or None."""
@@ -284,10 +350,20 @@ class Maps:
         A name that a class-creation hook reads (`__init_subclass__`, a metaclass) lives on in
         whatever the hook stored from it, so readers of those names count as well, off any
         class: the hook may store on a class other than the one being created."""
+        lines = self.class_object_lines(names, cls)
+        if lines is None:
+            return None
+        mask = 0
+        for f, line in lines:
+            mask |= self.func(f, line, line)
+        return mask
+
+    def class_object_lines(self, names, cls):
+        """The (file, line) pairs behind class_object_readers, or None."""
         self.reads("")
         todo = [(n, True) for n in names]
         seen = set(names)
-        mask = 0
+        out = []
         while todo:
             name, own = todo.pop()
             for d in self.derives.get(name, ()):
@@ -299,8 +375,8 @@ class Maps:
             for f, lines in self.classlike.get(name, {}).items():
                 for line, recvs in lines.items():
                     if not own or any(self._can_be(r, cls) for r in recvs):
-                        mask |= self.func(f, line, line)
-        return mask
+                        out.append((f, line))
+        return out
 
     def _can_be(self, recv, cls):
         """Can a read through `recv` (see tools/build_reads.py) return class `cls`'s own value?"""

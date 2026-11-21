@@ -32,7 +32,10 @@ jobs:
               python tools/trace_rel_one.py /app/repo @import /out/rel_import.json
               python tools/build_relations.py /out/rel /src/sample/tests.json /app/repo /out/maps /out/rel_import.json
               python tools/trace_rel_slices_all.py /app/repo /out/maps /out/relsl 4
-              python tools/build_relslices.py /out/relsl /out/maps
+              mkdir -p /out/usesl
+              python -c "import sys; sys.path.insert(0, \"/src\"); from br import maps; print(\"\n\".join(sorted(maps.Maps(\"/out/maps\").sliced)))" > /out/sliced.txt
+              i=0; while read -r t; do i=$((i+1)); BR_INSTRUMENT=1 BR_ENTRIES=/out/maps python tools/trace_one.py /app/repo "$t" /out/usesl/$i.pkl; done < /out/sliced.txt
+              python tools/build_relslices.py /out/relsl /out/maps /out/usesl
               python tools/trace_memo.py /app/repo /out/memo.json /out/maps
             '
       - uses: actions/upload-artifact@v4

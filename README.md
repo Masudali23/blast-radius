@@ -76,6 +76,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   over a fixture file, both recordings are also taken with one entry at a time. When a swapped
   operator or regrouped condition reaches such a test, only the entries in which it can behave
   differently are run, which is often cheap enough to settle the slowest tests outright.
+  The class-usage recording (which classes are instantiated, which constants read, which dict
+  entries looked up) is taken per entry as well, so an edited class constant, dict entry or
+  default value also reaches only the entries that use it. Whatever the class set-up runs,
+  reads or evaluates before the first entry counts for every entry.
 - **Unchanged hand-over** (`br/memo.py`): the executor's TPC-DS test is by far the slowest test,
   and nearly all of its time goes into a pure-Python query engine and into comparing the result
   with DuckDB's. For a patch that changes none of the lines that half runs, it is a fixed

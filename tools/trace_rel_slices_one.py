@@ -8,9 +8,11 @@ class is set up once and the test then runs in forked children, each allowed a s
 (plus one child that sees none), exactly as tools/trace_slices_one.py does for line coverage.
 Entries are numbered as in the test's slice map, so bit i here is bit i there.
 
-Written as {"keys", "ok", "base": record, "hits": {site: entries}, "seen": {site: entries},
-"vectors": {(site, kind, vector): entries}, "aborted": {site: entries}} with entry sets as
-bit masks; "ok" is false when some child did not pass, and then nothing may be concluded.
+Written as {"keys", "ok", "base": record, "pre": record, "hits": {site: entries},
+"seen": {site: entries}, "vectors": {(site, kind, vector): entries}, "aborted": {site:
+entries}} with entry sets as bit masks; "ok" is false when some child did not pass, and then
+nothing may be concluded.  "pre" is what loading the modules and setting up the class
+evaluated before any entry ran: whatever differs there can reach every entry.
 """
 import ast
 import builtins
@@ -133,6 +135,8 @@ def main():
         os.waitpid(pid, 0)
         return pickle.loads(data) if data else {"error": "no data"}
 
+    # everything evaluated so far (imports, class set-up) is shared by all entries
+    pre = {"hits": sorted(hits), "bools": sorted((site, kind, tuple(vec)) for site, kind, vec in formulas.seen), "aborted": formulas.aborted()}
     base = in_child(())
     ok = base.get("outcome") == "P"
     hit_of, seen_of, vec_of, aborted_of = {}, {}, {}, {}
@@ -151,7 +155,7 @@ def main():
             vec_of[item] = vec_of.get(item, 0) | bit
         for site in r["aborted"]:
             aborted_of[site] = aborted_of.get(site, 0) | bit
-    result.update(keys=keys, ok=ok, base=base, hits=hit_of, seen=seen_of, vectors=vec_of, aborted=aborted_of)
+    result.update(keys=keys, ok=ok, base=base, pre=pre, hits=hit_of, seen=seen_of, vectors=vec_of, aborted=aborted_of)
     with open(out, "wb") as fh:
         fh.write(zlib.compress(pickle.dumps(result, protocol=5), 6))
     sys.stderr.write("%s entries=%d ok=%s sites with a disagreement=%d conditions=%d\n" % (test_id, len(keys), ok, len(hit_of), len({s for s, _, _ in vec_of})))

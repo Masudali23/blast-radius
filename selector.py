@@ -405,13 +405,23 @@ class Selector:
             if not (mask >> idx) & 1:
                 continue
             if kind != "func":
-                return None, 1.0
+                # a class constant or default value: of a sliced test, only the entries that
+                # read it (when no entry is recorded as doing so, the test reaches it some
+                # other way and runs whole)
+                entries = plan.entry.get((rel, lo, hi)) if ENTRY_NARROW and kind == "mod" else None
+                reach = entries(tid) if entries is not None else None
+                if not reach:
+                    return None, 1.0
+                allow |= reach
+                if allow == full:
+                    return None, 1.0
+                continue
             table = sm["lines"].get(rel, {})
             part = 0
             for line, m in self.maps.func_lines(rel, lo, hi):
                 if (m >> idx) & 1:
                     sl = table.get(line, 0)
-                    if not sl:
+                    if not sl or self.maps.setup_runs(tid, rel, line):
                         return None, 1.0  # runs outside the fixture loop (class set-up, ...)
                     part |= sl
             entries = plan.entry.get((rel, lo, hi)) if ENTRY_NARROW else None
