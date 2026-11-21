@@ -77,6 +77,12 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **Edited fixtures**: a sliced test that the patch reaches only through edited fixture files
   runs the entries of those files that differ from the pinned ones, and none of the entries of
   its other fixture files.
+- **Fixtures loaded by a class set-up**: the executor class loads two fixture files into
+  class-level lists that only a few of its tests look at. For an edit of such a file, a test
+  of that class which, when traced, ran none of the statements that mention the list can only
+  be reached through the set-up: the set-up is run on the patched files and its outcome is
+  the test's outcome. (Not used when the list's name appears in another test file or the file
+  looks attributes up by text.)
 - **Swapped comparison operators** (`br/relations.py`): `a is b` and `a == b` give the same
   answer unless an object equals something it is not; `a < b` and `a <= b` unless the two are
   equal. While the maps are built, every such comparison in sqlglot is evaluated both ways each

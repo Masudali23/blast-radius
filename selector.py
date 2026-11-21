@@ -4,6 +4,7 @@ For every patch: work out which tests can be affected (coverage maps built from 
 commit), run those tests against the patched code in a warm interpreter, and select exactly the
 ones that fail.  Whatever cannot be checked cheaply is selected rather than skipped.
 """
+import ast
 import glob
 import json
 import os
@@ -84,6 +85,9 @@ ANSWER_SHARE = float(os.environ.get("BR_ANSWER_SHARE", "0.5"))
 CLEAN_RUN = float(os.environ.get("BR_CLEAN_RUN", "8"))
 # narrow sliced tests to the fixture entries a swapped operator / regrouped condition can reach
 ENTRY_NARROW = os.environ.get("BR_ENTRY_NARROW", "1") == "1"
+# a test that an edited class fixture reaches only through its class set-up is settled by
+# running that set-up
+SETUP_ONLY = os.environ.get("BR_SETUP_ONLY", "1") == "1"
 # share of a slow sliced test's cost that is run as a sample when the test is still selected
 # unchecked next to real failures (0: never sample, keep it)
 SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.35"))
@@ -149,6 +153,7 @@ class Selector:
         self.lane = None
         self.lane2 = None
         self._related = {}
+        self._list_uses = {}
         self.debug = {}
 
     def numbers(self, mask):
@@ -454,11 +459,81 @@ class Selector:
             out.append((variant, self.cpu[n] * (load + 0.02)))
         return out, self.cpu[n] * (spent + 0.02)
 
+    def class_list_uses(self, rel, name):
+        """Line spans of the statements in test file `rel` (outside the class set-up) that
+        mention a class-level list holding fixture file `name`; None when that cannot be told
+        (the name shows up in another test file too, or the file looks attributes up by text)."""
+        key = (rel, name)
+        if key not in self._list_uses:
+            spans = None
+            attrs = [a for a, f in variants.CLASS_LISTS.items() if f == name]
+            try:
+                with open(os.path.join(BASE, rel), encoding="utf-8") as fh:
+                    text = fh.read()
+                elsewhere = False
+                for path in glob.glob(os.path.join(BASE, "tests", "**", "*.py"), recursive=True):
+                    if os.path.relpath(path, BASE) != rel:
+                        with open(path, encoding="utf-8", errors="replace") as fh:
+                            other = fh.read()
+                        if any(a in other for a in attrs):
+                            elsewhere = True
+                            break
+                tree = ast.parse(text)
+                by_text = any(
+                    (isinstance(node, ast.Name) and node.id in ("getattr", "setattr", "delattr", "vars", "dir", "eval", "exec", "globals", "locals"))
+                    or (isinstance(node, ast.Attribute) and node.attr in ("__dict__", "__getattribute__"))
+                    for node in ast.walk(tree)
+                )
+                if attrs and not elsewhere and not by_text:
+                    spans = []
+
+                    def visit(node, stmt, setup):
+                        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in ("setUpClass", "tearDownClass"):
+                            setup = True
+                        if isinstance(node, ast.stmt):
+                            stmt = node
+                        mention = (
+                            (isinstance(node, ast.Attribute) and node.attr in attrs)
+                            or (isinstance(node, ast.Name) and node.id in attrs)
+                            or (isinstance(node, ast.Constant) and isinstance(node.value, str) and any(a in node.value for a in attrs))
+                        )
+                        if mention and not setup and stmt is not None:
+                            spans.append((stmt.lineno, stmt.end_lineno or stmt.lineno))
+                        for child in ast.iter_child_nodes(node):
+                            visit(child, stmt, setup)
+
+                    visit(tree, None, False)
+            except (OSError, SyntaxError, ValueError, RecursionError):
+                spans = None
+            self._list_uses[key] = spans
+        return self._list_uses[key]
+
+    def only_class_setup(self, plan, n, idx, mine):
+        """Can the patch reach test n only by way of its class set-up?  True when all it
+        touches for this test are fixture files that the set-up loads into class-level lists
+        and the test, when traced, ran none of the statements that mention those lists: then
+        the test passes exactly when the set-up still succeeds."""
+        if not mine or not self.maps.known(self.id_of[n].split("::")[0]):
+            return False
+        rel = self.id_of[n].split("::")[0]
+        for kind, path, _, _, _ in mine:
+            if kind != "data" or not path.startswith(FIXTURES) or path[len(FIXTURES):] not in CLASS_FIXTURES:
+                return False
+            spans = self.class_list_uses(rel, path[len(FIXTURES):])
+            if spans is None:
+                return False
+            for lo, hi in spans:
+                if any((mask >> idx) & 1 for _, mask in self.maps.func_lines(rel, lo, hi)):
+                    return False
+        return True
+
     def plain_variant(self, plan, n):
         tid = self.id_of[n]
         idx = self.idx_of.get(n)
         if idx is None or tid.split("::")[0] in plan.files:
             return None, 1.0  # unknown to the maps, or the test file itself is patched
+        if SETUP_ONLY and self.only_class_setup(plan, n, idx, [p for p in plan.parts if (p[4] >> idx) & 1]):
+            return {"setup": 1}, 0.002
         if tid in variants.SCALED:
             scaled = self.maps.scaled_ms.get(tid)
             return {"scaled": 1}, (scaled * CAL / max(1.0, self.cpu[n])) if scaled is not None else SCALED_SHARE

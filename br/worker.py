@@ -354,11 +354,17 @@ class Runner:
             return "F"  # pytest would not find it: treat as failing, the caller selects it
         if getattr(cls, "__unittest_skip__", False):
             return "S"
+        if variant and variant.get("setup") and cls in PRESET:
+            return "U"  # this set-up ran before the fork, on the pinned files
         state = self._class(cls)
         if state == "skip":
             return "S"
         if state is False:
             return "F"
+        if variant and variant.get("setup"):
+            # the patch reaches this test only through its class set-up, which has just run on
+            # the patched files (or failed above)
+            return "P"
         res = self.result
         before = (len(res.failures), len(res.errors), len(res.unexpectedSuccesses), len(res.skipped))
         test = cls(meth)
