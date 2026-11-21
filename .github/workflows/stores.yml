@@ -3,6 +3,8 @@ name: stores
 # to the queries the executor and optimizer tests send it at the pinned commit.
 on:
   workflow_dispatch:
+  push:
+    branches: [stores]
 jobs:
   stores:
     runs-on: ubuntu-latest
