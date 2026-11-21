@@ -22,6 +22,18 @@ class Maps:
         for entry in idx.get("dict_derived", ()):
             parts = entry.split("\t")
             self.dict_derived.setdefault((parts[0], parts[1]), set()).add(parts[2] if len(parts) > 2 else "")
+        # ... those of them that could see a value (None: not recorded, every read counts)
+        self.dict_derived_vals = None
+        path = os.path.join(directory, "derived_values.json")
+        if os.path.exists(path):
+            import json
+
+            with open(path) as fh:
+                seen = json.load(fh)
+            self.dict_derived_vals = {}
+            for entry in seen:
+                parts = entry.split("\t")
+                self.dict_derived_vals.setdefault((parts[0], parts[1]), set()).add(parts[2] if len(parts) > 2 else "")
         self.ancestry = idx.get("ancestry", {})
         self.dict_names = set(idx.get("dict_names", ()))
         self.dict_all_keys = idx.get("dict_all_keys", {})
@@ -163,9 +175,14 @@ class Maps:
             return None
         return d["calls"].get(k, 0)
 
-    def derived(self, name, key, cls_keys):
-        """Was entry `key` of dict `name` read at import time in the class `cls_keys` or a subclass?"""
-        owners = self.dict_derived.get((name, key))
+    def derived(self, name, key, cls_keys, values_only=False):
+        """Was entry `key` of dict `name` read at import time in the class `cls_keys` or a
+        subclass?  With `values_only`, reads that could not see a value (is the key there,
+        which keys are there) do not count."""
+        table = self.dict_derived
+        if values_only and self.dict_derived_vals is not None:
+            table = self.dict_derived_vals
+        owners = table.get((name, key))
         if not owners:
             return False
         want = set(cls_keys)

@@ -629,13 +629,16 @@ def _key_users(maps, c, rel, how=None):
     keys, old_keys = res[0], res[1]
     if not keys:
         return None
-    # (an edit that leaves the keys alone cannot reach what was built from the keys only)
-    if maps.feeds_elsewhere(name, c.cls, values_only=keys <= old_keys and res[2]):
+    # An edit that leaves the keys alone (and in their order) cannot reach what was built from
+    # the keys only: reads that merely walked the keys, or asked whether one is there, while
+    # modules loaded do not count against it.
+    values_only = keys <= old_keys and res[2] and res[3]
+    if maps.feeds_elsewhere(name, c.cls, values_only=values_only):
         return None  # e.g. `TYPE_MAPPING = {..., **STRING_TYPE_MAPPING}`: looked up under another name
     known = set(maps.dict_all_keys.get(name, ()))
     cls_keys = ["%s:%d" % (rel, line) for line in c.cls_lines]
     for k in keys:
-        if maps.derived(name, k, cls_keys):
+        if maps.derived(name, k, cls_keys, values_only):
             return None
         if k in old_keys and k not in known:
             return None  # the key as written does not match what the dict really holds
@@ -653,7 +656,7 @@ def _key_users(maps, c, rel, how=None):
             if how is not None:
                 how.append(("dict_calls", ["%s\t%s" % (name, k) for k in keys]))
             return mask
-    if maps.derived(name, "*", cls_keys):
+    if maps.derived(name, "*", cls_keys, values_only):
         return None
     mask = maps.dict_users(name, "*")
     for k in keys:

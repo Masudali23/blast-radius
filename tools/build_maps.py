@@ -35,6 +35,7 @@ attr_tracked = set()  # constants whose reads were observed
 dict_calls = {}  # "NAME\tkey" -> tests that invoke the callable stored under that key
 dict_callable = set()  # "NAME\tkey" entries holding a callable
 dict_derived = set()  # "NAME\tkey" read (or called) by function code while classes are being built
+dict_derived_values = set()  # ... those reads that could see a value, not only the keys
 dict_names = set()  # class-level dict attributes that were observed
 ancestry = {}  # class -> the classes (itself included) it inherits from
 bad = []
@@ -74,6 +75,8 @@ for i, t in enumerate(tests):
         dict_calls[k] = dict_calls.get(k, 0) | bit
     dict_callable.update(d.get("dict_callable", ()))
     dict_derived.update(d.get("dict_derived", ()))
+    # (a trace that does not tell the two kinds of read apart: every read counts as seeing values)
+    dict_derived_values.update(d.get("dict_derived_values", d.get("dict_derived", ())))
     for k, v in d.get("ancestry", {}).items():
         ancestry.setdefault(k, set()).update(v)
     dict_names.update(d.get("dict_names", ()))
@@ -129,6 +132,8 @@ index = {
 }
 dblob = zlib.compress(pickle.dumps({"users": dict_users, "calls": dict_calls, "callable": sorted(dict_callable), "attr_readers": attr_readers, "attr_derived": sorted(attr_derived), "attr_tracked": sorted(attr_tracked)}, protocol=5), 6)
 open(os.path.join(out_dir, "dictkeys.pkl"), "wb").write(dblob)
+with open(os.path.join(out_dir, "derived_values.json"), "w") as fh:
+    json.dump(sorted(dict_derived_values), fh, indent=0)
 total += len(dblob)
 blob = zlib.compress(pickle.dumps(index, protocol=5), 6)
 open(os.path.join(out_dir, "index.pkl"), "wb").write(blob)

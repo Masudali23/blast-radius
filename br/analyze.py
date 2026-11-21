@@ -587,7 +587,7 @@ def _key_text(node):
 
 def changed_dict_keys(change):
     """For `NAME = {...}` edited in place: (keys whose entry differs, keys of the old dict,
-    whether both dicts have the same keys).
+    whether both dicts have the same keys, whether they have them in the same order).
 
     None when the statement is not a plain dict display on both sides, a key cannot be read off
     the source, or anything besides individual entries changed (a `**spread`, say).
@@ -614,4 +614,6 @@ def changed_dict_keys(change):
     if a is None or b is None or a[1] != b[1]:
         return None
     keys = {k for k in set(a[0]) | set(b[0]) if a[0].get(k) != b[0].get(k)}
-    return keys, set(a[0]), set(a[0]) == set(b[0])
+    # (dicts keep insertion order: the same keys in the same order is what "only values
+    # differ" means to anything that walked the keys)
+    return keys, set(a[0]), set(a[0]) == set(b[0]), list(a[0]) == list(b[0])

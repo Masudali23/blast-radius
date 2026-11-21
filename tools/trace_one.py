@@ -77,6 +77,8 @@ def main():
     importing = [0]
     dict_keys = set()  # (attribute name, key) looked up at run time; key "*" = read as a whole
     derived = set()  # "name\tkey\tclass" (key "*" = whole) read by function code at import time
+    # ... those of them that could see a value (not only whether a key is there, or the keys)
+    derived_values = set()
     SKIP_DICTS = {"arg_types", "__annotations__", "__dict__"}
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -85,11 +87,14 @@ def main():
     DEBUG_WHOLE = os.environ.get("BR_DEBUG_WHOLE")
     debug_done = []
 
-    def note(owner, k, who=""):
+    def note(owner, k, who="", value=True):
         if importing[0]:
             caller = sys._getframe(2).f_code
             if caller.co_flags & 1:
-                derived.add("%s\t%s\t%s" % (owner, "*" if k is None else key_repr(k), who))
+                entry = "%s\t%s\t%s" % (owner, "*" if k is None else key_repr(k), who)
+                derived.add(entry)
+                if value:
+                    derived_values.add(entry)
         else:
             if k is None and owner == DEBUG_WHOLE and not debug_done:
                 import traceback
@@ -110,7 +115,7 @@ def main():
             return dict.get(self, k, default)
 
         def __contains__(self, k):
-            note(self._br, k, self._brc)
+            note(self._br, k, self._brc, value=False)
             return dict.__contains__(self, k)
 
         def setdefault(self, k, default=None):
@@ -122,11 +127,11 @@ def main():
             return dict.pop(self, k, *default)
 
         def __iter__(self):
-            note(self._br, None, self._brc)
+            note(self._br, None, self._brc, value=False)
             return dict.__iter__(self)
 
         def keys(self):
-            note(self._br, None, self._brc)
+            note(self._br, None, self._brc, value=False)
             return dict.keys(self)
 
         def values(self):
@@ -158,7 +163,7 @@ def main():
             return dict.__ror__(self, other)
 
         def __reversed__(self):
-            note(self._br, None, self._brc)
+            note(self._br, None, self._brc, value=False)
             return dict.__reversed__(self)
 
         __hash__ = None
@@ -177,6 +182,7 @@ def main():
             def call_m(*a, **k):
                 if importing[0]:
                     derived.add("%s\t%s\t%s" % (owner, keyr, who))
+                    derived_values.add("%s\t%s\t%s" % (owner, keyr, who))
                 else:
                     dict_calls.add((owner, keyr))
                 return inner(*a, **k)
@@ -188,6 +194,7 @@ def main():
         def call(*a, **k):
             if importing[0]:
                 derived.add("%s\t%s" % (owner, keyr))
+                derived_values.add("%s\t%s" % (owner, keyr))
             else:
                 dict_calls.add((owner, keyr))
             return value(*a, **k)
@@ -613,6 +620,7 @@ def main():
                 "attr_tracked": sorted(attr_tracked),
                 "dict_callable": sorted("%s\t%s" % kv for kv in callable_keys),
                 "dict_derived": sorted(derived),
+                "dict_derived_values": sorted(derived_values),
                 "ancestry": ancestry,
                 "dict_names": sorted(tracked_dicts),
             },
