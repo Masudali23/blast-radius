@@ -171,6 +171,7 @@ CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
 # ("2": lines may be added or removed as well, as long as none of them is such a line;
 # "3": lines may only be added, and only around a statement that leaves its block)
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 FLOW = ("return", "raise", "continue", "break", "pass")
 HUNK_HEAD = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -1040,6 +1041,7 @@ class Selector:
                 else:
                     st["ran"] += 1
                     st["cpu"] += r[1]
+                    st.setdefault("cpu_of", {})[n] = r[1]
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
                     if st["note"][n] == "pool":
@@ -1174,6 +1176,14 @@ class Selector:
                         again.sort(key=lambda it: it[0])
                         f2, u2 = run(again, False)
                         failed = failed + f2 + u2
+                if DIAG and failed and kept and not st["cut"]:
+                    # measuring: run the light tests that stay selected unseen, change nothing
+                    by2 = {it[0]: it for it in cheap}
+                    extra = sorted((by2[n] for n in kept if n in by2 and n not in st["outcome"]), key=lambda it: it[0])
+                    if extra:
+                        run(extra, False)
+                        for n, _, est in extra:
+                            dbg.setdefault("extra", []).append((n, est, ms[n], st.get("cpu_of", {}).get(n, 0), st["outcome"].pop(n, "U"), "light"))
                 kept = open_ + kept
             later = costly + deferred
             if later:
@@ -1195,6 +1205,14 @@ class Selector:
                     failed2, unseen2 = run(run_list, False)
                     failed = failed + failed2 + [n for n in unseen2 if n not in st["undecided"]]
                     keep = keep + [n for n in unseen2 if n in st["undecided"]]
+                if DIAG and failed and not st["cut"]:
+                    # measuring: the costlier tests that stay selected unseen (not the slow ones)
+                    items = {it[0]: it for it in later}
+                    extra = sorted((items[n] for n in keep if n in items and n not in st["outcome"] and ms[n] <= HEAVY * 1000 and n not in st["undecided"]), key=lambda it: it[0])
+                    if extra:
+                        run(extra, False)
+                        for n, _, est in extra:
+                            dbg.setdefault("extra", []).append((n, est, ms[n], st.get("cpu_of", {}).get(n, 0), st["outcome"].pop(n, "U"), "mid"))
                 keep = kept + keep
                 looked = {}  # slow test -> (its sample, what the first part said) once that part passed
                 if keep and failed and FIRST_LOOK and not st["cut"] and SAMPLE_SHARE > 0:
@@ -1529,6 +1547,48 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  Every test left selected unseen after a failure was run here (the
+        selection itself is untouched).  With c = the CPU ms its run took (+1) and r = its
+        recorded ms:
+          a  4 + (sum over the light ones with est < 0.6 r of [r if it passed] - c) / 25 ms
+          b  the same for est < 1.0 r
+          c  (sum over the light ones that passed of max(0, r - c)) / 50 ms
+          d  the same sum for the costlier ones
+        each cut to 0..16 and written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of
+        recorded test time on one worker of the first commit that selects nothing."""
+        ms = self.ms
+        gain = {0.6: 0.0, 1.0: 0.0}
+        top = {"light": 0.0, "mid": 0.0}
+        count = {"light": 0, "mid": 0}
+        for dbg in self.debug.values():
+            for n, est, r, cpu, outcome, kind in dbg.get("extra", ()):
+                c = cpu + 1
+                count[kind] += 1
+                if kind == "light":
+                    for t in gain:
+                        if est < t * r:
+                            gain[t] += (r if outcome == "P" else 0) - c
+                if outcome == "P":
+                    top[kind] += max(0, r - c)
+        cut = lambda x: int(max(0, min(16, x)))
+        a = cut(round(gain[0.6] / 25.0) + 4)
+        b = cut(round(gain[1.0] / 25.0) + 4)
+        c = cut(round(top["light"] / 50.0))
+        d = cut(round(top["mid"] / 50.0))
+        want = 1 + a + 17 * b + 289 * c + 4913 * d
+        log("account: %s gain %s top %s -> %d %d %d %d = %d" % (count, gain, top, a, b, c, d, want))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1538,6 +1598,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1554,6 +1615,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         if PHASES:
