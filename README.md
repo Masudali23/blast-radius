@@ -167,9 +167,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
   tests that running them would cost more than selecting them, they are selected unseen.
 - **Early stop (`BR_CLEAN_STOP`, off unless the image sets it)**: not exact. The first stage
   takes the lighter candidates up to a budget of estimated seconds; if none of them fails,
-  the commit is taken to break nothing and the candidates left are not selected. On 722
-  labelled commits that break tests, a budget of 0.8 s lets 6 slip through and saves four
-  fifths of the CPU spent on commits that break nothing.
+  the commit is taken to break nothing and the candidates left are not selected. It applies
+  to changes inside function bodies and to class-level values whose readers are known. On
+  1,152 labelled commits a budget of 3.2 s misses nothing and saves a fifth of all test
+  CPU; a budget of 0.8 s lets 4 of 722 failing commits slip through.
 - **Slow tests**: a test too slow to run in full is selected, unless everything else passes
   (or, when something fails, the tests closest to it — same test file or same fixture — all
   pass) and a sample of its own fixture entries passes too.

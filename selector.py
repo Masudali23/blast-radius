@@ -141,6 +141,9 @@ CLEAN_STOP = float(os.environ.get("BR_CLEAN_STOP", "0"))
 # than this many seconds
 CLEAN_FRAC = float(os.environ.get("BR_CLEAN_FRAC", "0.5"))
 CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
+# ... and only for a change inside function bodies, or of a class-level value whose readers are
+# known (on labelled patches the other kinds have little to save and fail late more often)
+CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
 T0 = time.monotonic()
 
 
@@ -253,6 +256,15 @@ class Selector:
             return 0 if any(stem in tid for stem in stems) else 1
 
         return near
+
+    @staticmethod
+    def plain_kind(plan):
+        """Is this a change inside function bodies only, or of a class-level value that the
+        planner narrowed to the tests that use it?"""
+        notes = " ".join(plan.notes)
+        if "attr-narrowed" in notes or "class-narrowed" in notes or "default-narrowed" in notes or "key-narrowed" in notes:
+            return True
+        return sorted(plan.kinds) == ["func"]
 
     def get_lane(self):
         if self.lane is None:
@@ -932,7 +944,7 @@ class Selector:
             failed = []
             kept = []  # cheap candidates left selected without being run
             first = cheap
-            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly):
+            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly) and (CLEAN_ANY or self.plain_kind(plan)):
                 near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
                 first, spent = [], 0.0
                 budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
