@@ -174,6 +174,7 @@ CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
 # ("2": lines may be added or removed as well, as long as none of them is such a line;
 # "3": lines may only be added, and only around a statement that leaves its block)
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 FLOW = ("return", "raise", "continue", "break", "pass")
 HUNK_HEAD = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -1044,6 +1045,7 @@ class Selector:
                 else:
                     st["ran"] += 1
                     st["cpu"] += r[1]
+                    dbg.setdefault("seq", []).append((n, r[1], r[0]))
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
                     if st["note"][n] == "pool":
@@ -1552,6 +1554,50 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  Of the CPU of all children, in sixteenths (rounded):
+          a  commits where the first tests passed and the rest was let go
+          b  looks at the slowest test
+          c  other tests run after a commit's first failure
+          d  commits checked on a fresh import (whatever they ran)
+        written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
+        worker of the first commit that selects nothing."""
+        ms = self.ms
+        slow = [n for n, t in self.id_of.items() if t.endswith("::test_execute_tpcds")]
+        total = stopped = looks = after = fresh = 0
+        for dbg in self.debug.values():
+            child = dbg.get("child_ms", 0)
+            total += child
+            seq = dbg.get("seq") or []
+            if dbg.get("mode") in ("core", "bare"):
+                fresh += child
+                continue
+            if "stopped" in dbg and not any(o == "F" for _, _, o in seq):
+                stopped += child
+                continue
+            seen_fail = False
+            for n, cpu, outcome in seq:
+                if n in slow:
+                    looks += cpu
+                elif seen_fail:
+                    after += cpu
+                if outcome == "F":
+                    seen_fail = True
+        part = lambda x: int(max(0, min(16, round(16.0 * x / max(1, total)))))
+        a, b, c, d = part(stopped), part(looks), part(after), part(fresh)
+        want = 1 + a + 17 * b + 289 * c + 4913 * d
+        log("account: total %d stopped %d looks %d after %d fresh %d -> %d %d %d %d" % (total, stopped, looks, after, fresh, a, b, c, d))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1561,6 +1607,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1568,7 +1615,7 @@ class Selector:
                     data = fh.read()
                 before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
                 selected = self.decide(commit, data)
-                if DEBUG:
+                if DEBUG or DIAG:
                     self.debug[commit]["child_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             except Exception as e:  # never lose a commit: fall back to running everything
                 log("commit %s: %r -> selecting all" % (commit, e))
@@ -1577,6 +1624,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         if PHASES:
