@@ -308,7 +308,9 @@ class Selector:
             # candidates were narrowed on the understanding that the patched module still
             # imports; if it does not, every test that imports it fails
             late = time.monotonic() > self.stop_at
+            before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
             bad = None if late else self.unimportable(plan)
+            dbg["import_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             if late or bad:
                 dbg["how"] = "out-of-time" if late else "import-error"
                 dbg["unimportable"] = bad
@@ -1336,49 +1338,45 @@ class Selector:
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
     def account(self, lines):
-        """Measuring build.  Shares of the CPU the test children used, in sixteenths:
-          a  runs of the slow tests (recorded time over HEAVY), wherever they happened
-          b  commits where nothing failed (the rest of what their children used)
-          c  commits whose candidates were selected unseen ("broad-blind"), likewise
-          d  commits with failures: the other tests run up to and including the first failure
-        (what is left: commits with failures, after the first one, and everything else).
-        They are written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on
-        one worker of the first commit that selects nothing.  The children's CPU in all, as a
-        share of the whole process tree's (main process included), is spent as that many
-        sixteenths times 1.5 s of CPU here."""
+        """Measuring build.  About the commits where nothing failed, a slow test's own runs
+        left out of their children's CPU:
+          a  how many there are (at most 16)
+          b  share of that CPU that is test time, in eighths
+          c  share that went into importing the patched module on its own, in eighths
+          d  share used by commits that were run from a fresh import, in eighths
+          e  in how many commits of the batch the slowest test was run at all (at most 4)
+        written as  1 + a + 17 (b + 9 (c + 9 (d + 9 e)))  milliseconds of recorded test time on
+        one worker of the first commit that selects nothing.  The share of all slow-test CPU
+        that was spent in those commits, in sixteenths, is spent as that many times 1.5 s of
+        CPU here."""
         ms = self.ms
-        total = a = b = c = d = 0
+        slowest = max(ms, key=lambda n: (ms[n] if "tpcds" in self.id_of[n] else 0, n))
+        count = total = tests = imports = fresh = with_slowest = slow_all = slow_clean = 0
         for dbg in self.debug.values():
-            used = dbg.get("child_ms") or 0
-            total += used
             runs = dbg.get("tests") or []
             slow = sum(r[1] for r in runs if ms[r[0]] > HEAVY * 1000)
-            a += slow
-            how = dbg.get("how")
-            if how in ("clean", "heavy-kept", "heavy-dropped"):
-                b += max(0, used - slow)
-            elif how == "broad-blind":
-                c += max(0, used - slow)
-            elif how == "fail":
-                for r in runs:
-                    if ms[r[0]] > HEAVY * 1000:
-                        continue
-                    d += r[1]
-                    if r[3] == "F":
-                        break
+            slow_all += slow
+            if any(r[0] == slowest for r in runs):
+                with_slowest += 1
+            if dbg.get("how") not in ("clean", "heavy-kept", "heavy-dropped"):
+                continue
+            slow_clean += slow
+            used = max(0, (dbg.get("child_ms") or 0) - slow)
+            count += 1
+            total += used
+            tests += sum(r[1] for r in runs if ms[r[0]] <= HEAVY * 1000)
+            imports += dbg.get("import_ms") or 0
+            if dbg.get("mode") in ("bare", "core"):
+                fresh += used
         if total <= 0:
             return
 
-        def q(x):
-            return min(16, int(16.0 * x / total + 0.5))
+        def q(x, of=total, steps=8):
+            return min(steps, int(float(steps) * x / of + 0.5)) if of > 0 else 0
 
-        want = 1 + q(a) + 17 * q(b) + 289 * q(c) + 4913 * q(d)
-        # everything this process tree has used so far: this process, plus the workers (they
-        # are still alive, so their time is not in ours yet: take what the children reported
-        # and what this process itself used)
-        mine = time.process_time() * 1000.0
-        share = min(16, int(16.0 * total / (total + mine) + 0.5))
-        log("account: total %d ms a %d b %d c %d d %d main %d -> %d, %d" % (total, a, b, c, d, mine, want, share))
+        want = 1 + min(16, count) + 17 * (q(tests) + 9 * (q(imports) + 9 * (q(fresh) + 9 * min(4, with_slowest))))
+        share = q(slow_clean, slow_all, 16)
+        log("account: commits %d total %d tests %d imports %d fresh %d slowest in %d, slow %d of %d -> %d, %d" % (count, total, tests, imports, fresh, with_slowest, slow_clean, slow_all, want, share))
         chosen, left = [], want
         for n in sorted(ms, key=lambda n: (-ms[n], n)):
             if 0 < ms[n] <= left:
