@@ -131,6 +131,16 @@ WEIGH_MIXED = os.environ.get("BR_WEIGH_MIXED", "0") == "1"
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
+DUMP = os.environ.get("BR_DUMP", "0") == "1"
+# Not exact (off by default).  The first stage takes the lighter candidates in the order of
+# ORDER, up to this many estimated seconds; if none of them fails the commit is taken to
+# break nothing and the candidates left are not selected.  A slow fixture-driven test is
+# still settled by its own sample.
+CLEAN_STOP = float(os.environ.get("BR_CLEAN_STOP", "0"))
+# ... but never fewer than this share of what all of them are estimated to cost, nor fewer
+# than this many seconds
+CLEAN_FRAC = float(os.environ.get("BR_CLEAN_FRAC", "0.5"))
+CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 T0 = time.monotonic()
 
 
@@ -798,6 +808,13 @@ class Selector:
             cheap.sort(key=lambda it: (near(it[0]), it[2], it[0]))
         total_est = sum(e for _, _, e in cheap) + sum(e for _, _, e in costly)
         dbg["est_ms"] = int(total_est)
+        if DUMP:
+            # for studying run orders off line: every candidate with its estimate, its class
+            # and whether it is run through a part of its fixture entries
+            near = self.named_after(plan)
+            dbg["cands"] = [(n, int(e), k, near(n), 1 if (v and "allow" in v) else 0) for k, items in (("c", cheap), ("m", costly), ("d", deferred)) for n, v, e in items]
+            dbg["likely"] = likely
+            return sorted(cand), "dump"
         # "broad": running every candidate would cost about as much CPU as just selecting them all
         cost_all = None
         if total_est > BROAD_MIN * 1000:
@@ -914,8 +931,28 @@ class Selector:
             install()
             failed = []
             kept = []  # cheap candidates left selected without being run
-            if cheap:
-                failed, rest = run(cheap, STOP_FIRST)
+            first = cheap
+            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly):
+                near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
+                first, spent = [], 0.0
+                budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
+                for item in sorted(cheap + costly, key=lambda it: (near(it[0]), it[2], it[0])):
+                    if spent >= budget:
+                        break
+                    first.append(item)
+                    spent += item[2]
+            if first:
+                failed, rest = run(first, STOP_FIRST)
+                if first is not cheap:
+                    light = {it[0] for it in cheap}
+                    if not failed and not rest and not st["cut"]:
+                        # everything looked at passes: the others are let go unseen
+                        dbg["stopped"] = len(cheap) + len(costly) - len(first)
+                        costly = []
+                    else:
+                        taken = {it[0] for it in first}
+                        rest = [n for n in rest if n in light] + [it[0] for it in cheap if it[0] not in taken]
+                        costly = [it for it in costly if it[0] not in st["outcome"]]
                 open_ = [n for n in rest if n in st["undecided"]]
                 rest = [n for n in rest if n not in st["undecided"]]
                 if rest and (st["cut"] or not failed or not STOP_FIRST):
@@ -1010,7 +1047,7 @@ class Selector:
                     if hit:
                         failed = hit
                         how = "fail"
-                    elif HEAVY_CLEAN == "drop" and len(probes) == len(keep) and st["ran"] - len(probes) >= MIN_CLEAN:
+                    elif HEAVY_CLEAN == "drop" and len(probes) == len(keep) and (st["ran"] - len(probes) >= MIN_CLEAN or dbg.get("stopped")):
                         # every cheaper candidate passes and so does a sample of each slow one:
                         # the slow tests that weigh on the bill are let go; a sample is not the
                         # whole test, so the ones that are cheap to keep stay selected
