@@ -574,8 +574,16 @@ def _read_line(fd):
     return b"".join(chunks)
 
 
+MARKS = []  # (label, CPU seconds so far) while a stage starts; reported on request ("stats")
+
+
+def _mark(label):
+    MARKS.append((label, time.process_time()))
+
+
 def run_job(job, mode, overlay, base, out_fd, in_fd=0):
     """Runs inside the forked child."""
+    phases = [time.process_time()] if job.get("phases") else None  # measuring only
     gc.enable()  # (off while the workers were importing, see main)
     if GC_YOUNG:
         # A child lives for one commit.  With the default thresholds the collector runs every
@@ -636,6 +644,9 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
 
     stage = job
     job_t0 = time.process_time()
+    if phases is not None:
+        phases.append(job_t0)
+        phases += [0.0, 0.0]  # class set-ups / the tests themselves
     while True:
         stop_on_fail = stage.get("stop_on_fail", False)
         # CPU seconds this child may spend in total; past it the caller selects the rest unseen
@@ -647,12 +658,15 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 runner.emit("B budget")
                 break
             e0, i0 = infect.STATS
+            tp = time.process_time()
             arm(SETUP_LIMIT)
             try:
                 runner.prepare(test_id)
             except BaseException:
                 pass
             t0 = time.process_time()  # the test itself; imports and class set-up are not its cost
+            if phases is not None:
+                phases[2] += t0 - tp
             inlinepool.BROKE[0] = False
             arm(limit)
             timed_out = False
@@ -668,6 +682,8 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 disarm()
             if inlinepool.BROKE[0] and not runner.note:
                 runner.note = "pool"  # the test broke a process pool (br/inlinepool.py)
+            if phases is not None:
+                phases[3] += time.process_time() - t0
             runner.emit("T %d %s %d %d %d %s" % (index, outcome, int((time.process_time() - t0) * 1000), infect.STATS[0] - e0, infect.STATS[1] - i0, runner.note))
             runner.note = ""
             if timed_out:
@@ -684,12 +700,19 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
         if not line or line.strip() == b"done":
             break
         stage = json.loads(line)
+    t_end = time.process_time()
     arm(5.0)
     try:
         runner.finish()
     except BaseException:
         pass
     disarm()
+    if phases is not None:
+        # tenths of a millisecond: before run_job, set-up + swap, class set-ups, tests,
+        # everything else in the loop, finish
+        now = time.process_time()
+        parts = (phases[0], phases[1] - phases[0], phases[2], phases[3], t_end - phases[1] - phases[2] - phases[3], now - t_end)
+        runner.emit("P " + " ".join(str(int(x * 10000)) for x in parts))
 
 
 class LazyConn:
@@ -841,11 +864,13 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
     `spares` maps the next mode down the chain to its pipe pair.
     """
     ready = b"READY"
+    _mark(mode + ":forked")
     if mode == "core":
         preload_core(overlay)
         ready += b" " + json.dumps(loaded_files(overlay)).encode()
     elif mode == "full":
         preload(overlay, skip=LAZY_MODULES)
+    _mark(mode + ":loaded")
     if COLLECT_FIRST:
         gc.collect()
         if mode == "full":
@@ -854,12 +879,18 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         # (what earlier stages made is frozen and is not listed again: index stage by stage)
         index_functions(overlay)
     gc.freeze()
+    _mark(mode + ":ready")
     os.write(out_fd, ready + b"\n")
     while True:
         line = _read_line(in_fd)
         if not line or line.strip() == b"quit":
             break
         job = json.loads(line)
+        if job.get("stats"):
+            # measuring only: this stage's own CPU so far and what its start was spent on
+            t = os.times()
+            os.write(out_fd, ("Z " + json.dumps({"marks": [(a, int(b * 10000)) for a, b in MARKS], "self": [t.user, t.system], "kids": [t.children_user, t.children_system]}) + "\n").encode())
+            continue
         nxt = job.get("fork")
         if nxt:
             fds = spares.get(nxt)
@@ -925,6 +956,7 @@ def main():
     sys.dont_write_bytecode = True
     os.chdir(overlay)
     sys.path.insert(0, overlay)
+    _mark("main")
     for name in ("unittest.mock", "json", "decimal", "datetime", "logging", "typing", "concurrent.futures", "multiprocessing"):
         try:
             importlib.import_module(name)
@@ -933,15 +965,19 @@ def main():
     from br import inlinepool
 
     inlinepool.install()
+    _mark("stdlib")
     for name in sys.argv[7:]:
         try:
             importlib.import_module(name)
         except Exception:
             pass
+        _mark(name)
     _limit_duckdb_threads()
     # the stores are read once, before anything is forked
     answers.load()
+    _mark("answers")
     tables.load()
+    _mark("tables")
     lean.load()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     serve("bare", overlay, base, in_fd, out_fd, spares)

@@ -18,7 +18,7 @@ sys.path.insert(0, APP)
 
 from br import plan as planner  # noqa: E402
 from br import variants  # noqa: E402
-from br.engine import Lane  # noqa: E402
+from br.engine import Lane, PHASES  # noqa: E402
 from br.maps import Maps  # noqa: E402
 
 DATA = os.environ.get("BR_DATA", "/data")
@@ -1545,6 +1545,19 @@ class Selector:
             self.debug[commit]["selected"] = len(selected)
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
+        if PHASES:
+            for lane in (self.lane, self.lane2):
+                if lane is None:
+                    continue
+                for mode, acc in sorted(lane.phases.items()):
+                    # per child, in ms: CPU before the job starts, set-up and swap, class set-ups,
+                    # the tests, the rest of the loop, tear-down; what wait4 saw in all
+                    n = max(1, acc[6])
+                    log("phases %s: children %d | fork %.1f setup+swap %.1f class set-up %.1f tests %.1f loop %.1f finish %.1f | total %.1f ms each" % ((mode, acc[6]) + tuple(x / 10.0 / n for x in acc[:6]) + (acc[7] / n,)))
+                for mode, st in sorted(lane.stats().items()):
+                    marks = st.get("marks", [])
+                    steps = " ".join("%s=%.0f" % (b[0], (b[1] - a[1]) / 10.0) for a, b in zip(marks, marks[1:]))
+                    log("stage %s: self %.3f+%.3f s, waited children %.3f+%.3f s | first mark at %.0f ms | %s" % (mode, st["self"][0], st["self"][1], st["kids"][0], st["kids"][1], (marks[0][1] / 10.0 if marks else 0), steps))
         for lane in (self.lane, self.lane2):
             if lane is not None:
                 lane.close()

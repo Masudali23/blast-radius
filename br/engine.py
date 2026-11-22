@@ -11,6 +11,8 @@ from .overlay import Overlay
 
 THIRD_PARTY = ("numpy", "pandas", "duckdb", "dateutil", "pytz")
 START_TIMEOUT = 90.0
+# measuring only: children report where their CPU went, stages what their start cost
+PHASES = os.environ.get("BR_PHASES", "0") == "1"
 
 
 class Chan:
@@ -39,6 +41,7 @@ class Lane:
         self.core_loaded = None
         self.cut = None
         self.child_ms = 0  # CPU of every child that has ended, all of it (not only its tests)
+        self.phases = {}  # mode -> sums of what children reported (measuring only)
         self._deadline = 60.0
         self.log = log or (lambda *a: None)
 
@@ -184,11 +187,18 @@ class Lane:
                 return results, error, True
             elif line.startswith(b"X "):
                 error = line[2:].decode("utf-8", "replace").strip()
+            elif line.startswith(b"P "):
+                acc = self.phases.setdefault(mode, [0] * 8)
+                for i, word in enumerate(line.split()[1:7]):
+                    acc[i] += int(word)
+                acc[6] += 1
             elif line.startswith(b"END"):
                 words = line.split()
                 status = int(words[1])
                 if len(words) > 2:
                     self.child_ms += int(words[2])
+                    if PHASES:
+                        self.phases.setdefault(mode, [0] * 8)[7] += int(words[2])
                 if status != 0 and error is None:
                     error = "child exit status %d" % status
                 return results, error, False
@@ -208,7 +218,10 @@ class Lane:
         self._deadline = deadline
         self.cut = None
         self.unimportable = []
-        self._send(p, {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget, "imports": list(imports), "consts": list(consts), "lean": list(lean)})
+        job = {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget, "imports": list(imports), "consts": list(consts), "lean": list(lean)}
+        if PHASES:
+            job["phases"] = True
+        self._send(p, job)
         results, error, alive = self._collect(p, mode)
         self._open = alive
         return results, error
@@ -229,6 +242,19 @@ class Lane:
             if p is not None:
                 p.send(b"done\n")
                 self._collect(p, self._mode)
+
+    def stats(self):
+        """Measuring only: what each stage reports about its own CPU ({mode: {...}})."""
+        out = {}
+        for mode, p in list(self.z.items()):
+            try:
+                p.send(b'{"stats":1}\n')
+                line = self._readline(p, 5.0)
+                if line.startswith(b"Z "):
+                    out[mode] = json.loads(line[2:])
+            except Exception:
+                pass
+        return out
 
     def close(self):
         # (the workers hold nothing that has to be written: no orderly shutdown of interpreters
