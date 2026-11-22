@@ -158,14 +158,24 @@ CPU time is part of the score, so the selector avoids running what it can decide
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
 - **The rest of a function's header** (`br/analyze.py`, `BR_REFINE_HEADERS`): the same holds
-  when a function lost, gained or changed a decorator, was given another name, or takes other
-  arguments: a test that never entered it does not notice. A renamed function also counts the
-  tests that run, while modules load, a line mentioning the old name (an import of it, a table
-  that refers to it). Changed annotations alone reach no test at all, and neither does a new
-  undecorated function (or module-level constant) whose name appears nowhere else. Not used
-  when the function ran while modules were loading, for cached functions, for special methods
-  (decorators and names), or for names that are looked up by pattern (`..._sql`). The import
-  check below still applies: if the patched module no longer loads, everyone is selected.
+  for other edits that leave a function's body alone, for functions that sit directly in a
+  module or class of the library:
+  - a decorator that came, went or changed, when it is one that leaves the function to be found
+    and entered as before (`staticmethod`, `classmethod`, a removed `property`, `overload`,
+    `final`, `unsupported_args`): the tests that entered the function. Not for an added
+    `property` or `abstractmethod` (reading the attribute, or creating the class, is enough to
+    notice), accessor pairs, generators, wrappers that can answer without calling it.
+  - other arguments, or defaults that are not literals: the tests that entered it (not for
+    generators, whose call runs no line of the body).
+  - another name: the tests that entered it, and every test that runs a statement mentioning
+    the old name anywhere - an import of it, a table that refers to it, a place that stores it
+    without calling it. Not for names that are looked up by pattern (`..._sql`, `test...`) or
+    through a base class of the standard library.
+  - annotations alone: no test at all. Neither does a new undecorated function, or a new
+    module-level constant, whose name is written nowhere else.
+  Nothing is narrowed when the function ran while modules were loading, or when the new
+  header does something when the def statement runs (a call in a default). The import check
+  below still applies: if the patched module no longer loads, everyone is selected.
 - **Reading only what changed** (`br/lean.py`): most of a module is functions a patch does
   not touch. When every changed line sits inside the body of one function, two small texts
   stand in for the two versions of the file (line numbers stay put): the module's imports, a
