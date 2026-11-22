@@ -1400,7 +1400,9 @@ class Selector:
           a  those selected unseen because they read an edited fixture
           b  light ones (recorded under 0.3 s)
           c  the others
-          d  the number of commits that select such a test (at most 16)
+          d  how often the slowest test was let go after a look: s + 5 n, where s (at most 4)
+             counts the looks whose entries were all handed what they always were, and n
+             (at most 2) the others
         written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
         worker of the first commit that selects nothing."""
         ms = self.ms
@@ -1420,9 +1422,20 @@ class Selector:
             for i, group in enumerate((likely, light, rest - light)):
                 if group:
                     sums[i] += whole - split(sorted(chosen - group), ms)[1]
+        # the slowest test let go after a look at its first entries: how often every entry
+        # looked at was handed what it always was ("same"), and how often not
+        same = other = 0
+        for dbg in self.debug.values():
+            if any(n_v[1] == "P" and ms[n_v[0]] > HEAVY * 1000 for n_v in (dbg.get("sampled") or ())):
+                note = ((dbg.get("first_part") or [[0, ""]])[0][1] or "")
+                recognised, _, new = note.partition("/")
+                if recognised.isdigit() and int(recognised) > 0 and new == "0":
+                    same += 1
+                else:
+                    other += 1
         q = [min(16, int(x / 100.0 + 0.5)) for x in sums]
-        want = 1 + q[0] + 17 * q[1] + 289 * q[2] + 4913 * min(16, commits)
-        log("account: passing though selected: unseen %d light %d other %d ms in %d commits -> %d" % (sums[0], sums[1], sums[2], commits, want))
+        want = 1 + q[0] + 17 * q[1] + 289 * q[2] + 4913 * (min(4, same) + 5 * min(2, other))
+        log("account: passing though selected: unseen %d light %d other %d ms in %d commits; slow test let go: same %d, not %d -> %d" % (sums[0], sums[1], sums[2], commits, same, other, want))
         picked, left = [], want
         for n in sorted(ms, key=lambda n: (-ms[n], n)):
             if 0 < ms[n] <= left:
