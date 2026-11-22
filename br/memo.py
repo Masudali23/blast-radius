@@ -19,6 +19,7 @@ changes nothing at module or class level.
 import enum
 import hashlib
 import os
+import pickle
 import sys
 import time
 
@@ -27,10 +28,10 @@ from br import inlinepool
 # an allowance this large means "run whatever is not recognised"
 WHOLE = 1e11
 # CPU seconds a quick half may take, and a slow half: so much plus a multiple of its usual cost
-QUICK_LEASH = 2.0
+QUICK_LEASH = float(os.environ.get("BR_QUICK_LEASH", "2.0"))
 CHECK_LEASH = 6.0  # ... and comparing an entry's result with DuckDB's
-SLOW_LEASH = 2.0
-SLOW_FACTOR = 4.0
+SLOW_LEASH = float(os.environ.get("BR_SLOW_LEASH", "2.0"))
+SLOW_FACTOR = float(os.environ.get("BR_SLOW_FACTOR", "4.0"))
 # validation only: a file noting, for every slow half that is skipped, what running it gives
 CHECK = os.environ.get("BR_MEMO_CHECK")
 # measuring only: a file noting what each session did
@@ -401,6 +402,8 @@ class Session:
                         return None
                     session.spent += cost
                 table = slow(real_execute, executor, plan, cost=session.costs.get(skey))
+                # (the test gets its table back from a process pool: the same round trip)
+                table = pickle.loads(pickle.dumps(table))
                 session.ran += 1
                 return real_helper(test, i, table, tpch=tpch)
             session.ran += 1

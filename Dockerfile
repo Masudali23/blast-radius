@@ -34,9 +34,10 @@ COPY tools/build_answers.py /app/tools/build_answers.py
 RUN if [ -f /app/maps/answers.pkl ]; then cp /app/maps/answers.pkl /app/answers.pkl; \
     else timeout 240 python /app/tools/build_answers.py /app/repo /app/answers.pkl || true; fi
 
-# Byte-compile once: the run-time disk is read-only.
+# Byte-compile once: the run-time disk is read-only.  (The base image ships the standard
+# library without bytecode; its directory holds the installed packages as well.)
 RUN python -m compileall -q /app/repo/sqlglot /app/repo/tests /app/repo/sqlglotc /app/br /app/selector.py \
-    && (python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" || true) \
+    && (python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" || true) \
     && chmod -R a+rX /app
 
 WORKDIR /app
