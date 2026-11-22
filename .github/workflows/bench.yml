@@ -1,0 +1,68 @@
+name: bench
+# CPU and simulated time of several builds on the same synthetic patches, under the scorer's
+# limits.  Runs when the branch `bench` is pushed; .github/bench-refs lists the builds, one
+# per line: a commit, then any environment settings for the run.
+on:
+  push:
+    branches: [bench]
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build the images
+        run: |
+          i=0
+          while read ref envs; do
+            [ -z "$ref" ] && continue
+            i=$((i+1))
+            if [ ! -d /tmp/w-$ref ]; then
+              git worktree add -f /tmp/w-$ref $ref
+              docker build -q --platform linux/amd64 --tag br-$ref /tmp/w-$ref
+            fi
+          done < .github/bench-refs
+      - name: Patches
+        run: |
+          first=$(head -1 .github/bench-refs | cut -d' ' -f1)
+          mkdir -p data
+          docker run --rm --platform linux/amd64 --user 0:0 --volume $PWD:/src:ro --volume $PWD/data:/out \
+            --env BR_GEN_UNIFORM=1 --env PYTHONDONTWRITEBYTECODE=1 br-$first \
+            python /src/tools/validation/gen_mutants.py /app/repo /out/commits 120 4242 \
+            code code code code code code code code code code code code code code code code \
+            fixture fixture fixture fixture fixture fixture fixture fixture multi multi multi comment comment comment
+          cp sample/tests.json data/
+          ls data/commits | wc -l
+      - name: Run
+        run: |
+          i=0
+          while read ref envs; do
+            [ -z "$ref" ] && continue
+            i=$((i+1))
+            for r in 1 2; do
+              docker run --rm --platform linux/amd64 --network none --cpus 2 \
+                --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+                --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+                --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp --env BR_SOFT=100000 \
+                $(for e in $envs; do echo --env $e; done) \
+                --volume $PWD/data/commits:/data/commits:ro \
+                --volume $PWD/data/tests.json:/data/tests.json:ro \
+                br-$ref sh -c 'python /app/selector.py; rc=$?; grep -E "usage_usec|user_usec|system_usec" /sys/fs/cgroup/cpu.stat >&2; exit $rc' > out_${i}_$r.jsonl 2> err_${i}_$r.txt || true
+              echo "=== build $i: $ref $envs (run $r)"
+              grep -E "^cpu:|^slowest:|^done|usage_usec|user_usec|system_usec" err_${i}_$r.txt
+              python3 - out_${i}_$r.jsonl <<'PY'
+          import json, sys
+          sec = {t["number"]: t["seconds"] for t in json.load(open("sample/tests.json"))["tests"]}
+          total = 0.0
+          n = 0
+          for line in open(sys.argv[1]):
+              j = json.loads(line)
+              n += 1
+              if j["workers"]:
+                  total += max(sum(sec[t] for t in w) for w in j["workers"]) + 2 * len(j["workers"])
+          print("simulated %.3f s over %d commits" % (total, n))
+          PY
+            done
+          done < .github/bench-refs
