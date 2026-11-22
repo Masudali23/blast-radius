@@ -4,6 +4,30 @@ import pickle
 import zlib
 
 
+class _Tables(dict):
+    """{file: {line: entries}} of a sliced test, each file's table unpacked when first asked for."""
+
+    def _open(self, key, value):
+        if type(value) is bytes:
+            value = pickle.loads(zlib.decompress(value))
+            dict.__setitem__(self, key, value)
+        return value
+
+    def __getitem__(self, key):
+        return self._open(key, dict.__getitem__(self, key))
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        return default
+
+    def values(self):
+        return [self[key] for key in list(self)]
+
+    def items(self):
+        return [(key, self[key]) for key in list(self)]
+
+
 class Maps:
     def __init__(self, directory):
         self.dir = directory
@@ -123,6 +147,8 @@ class Maps:
         if s is None:
             with open(os.path.join(self.dir, name), "rb") as fh:
                 s = pickle.loads(zlib.decompress(fh.read()))
+            if s.get("layout") == 2:
+                s["lines"] = _Tables(s["lines"])  # (packed per file: tools/pack_lazy.py)
             self._slices[test_id] = s
         return s
 
