@@ -50,6 +50,9 @@ P_PASS_FAILED = float(os.environ.get("BR_P_PASS_FAILED", "0.7"))
 # ... for the cheap candidates left when the first one fails (one by one, and all together)
 P_PASS_AGAIN = float(os.environ.get("BR_P_PASS_AGAIN", str(P_PASS_FAILED)))
 P_PASS_REST = float(os.environ.get("BR_P_PASS_REST", "0"))
+# ... when the very first test that was run failed: on 544 labelled commits 3 in 10 of the other
+# candidates pass then, against 8 to 9 in 10 when some test passed first ("1": no difference)
+P_PASS_COLD = float(os.environ.get("BR_P_PASS_COLD", "1"))
 # ... a test lighter than this many recorded seconds is not run on its own after a failure
 AGAIN_MIN = float(os.environ.get("BR_AGAIN_MIN", "1.0"))
 # ... but any test left is run when its estimated cost is under this share of its recorded time
@@ -1123,6 +1126,8 @@ class Selector:
                     spent += item[2]
             if first:
                 failed, rest = run(first, STOP_FIRST)
+                # (nothing passed before the first failure: see P_PASS_COLD)
+                st["cold"] = bool(failed) and st["ran"] - len(failed) == 0
                 if first is not cheap:
                     light = {it[0] for it in cheap}
                     if not failed and not rest and not st["cut"]:
@@ -1152,6 +1157,8 @@ class Selector:
                     # the others mostly pass; when the very first test failed, mostly not.
                     mixed = st["ran"] - len(failed) >= MIXED_AFTER
                     p_again = P_PASS_AGAIN_MIXED if mixed else P_PASS_AGAIN
+                    if st.get("cold"):
+                        p_again = min(p_again, P_PASS_COLD)
                     p_rest = P_PASS_REST_MIXED if mixed else P_PASS_REST
                     for n in sorted(rest, key=lambda n: -ms[n])[:12]:
                         if ms[n] < AGAIN_MIN * 1000:
@@ -1182,6 +1189,8 @@ class Selector:
             if later:
                 # for each remaining test: is running it cheaper than just selecting it?
                 p_pass = P_PASS_FAILED if failed else P_PASS_CLEAN
+                if failed and st.get("cold"):
+                    p_pass = min(p_pass, P_PASS_COLD)
                 base = failed + kept
                 run_list, keep = [], []
                 for item in sorted(later, key=lambda it: it[2]):
