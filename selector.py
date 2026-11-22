@@ -8,6 +8,7 @@ import ast
 import glob
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -170,6 +171,7 @@ CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 FLOW = ("return", "raise", "continue", "break", "pass")
+HUNK_HEAD = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 T0 = time.monotonic()
 
 
@@ -344,7 +346,23 @@ class Selector:
                         state["ok"] = False
             state["minus"], state["plus"] = [], []
 
+        old_left = new_left = 0  # lines of the hunk being read that are still to come
         for line in text.splitlines():
+            if old_left > 0 or new_left > 0:
+                # inside a hunk a line is what its first character says, whatever follows
+                # (a removed line that reads "-- note" arrives as "--- note")
+                if line.startswith("\\"):
+                    continue
+                if line.startswith("-"):
+                    state["minus"].append(line[1:])
+                    old_left -= 1
+                elif line.startswith("+"):
+                    state["plus"].append(line[1:])
+                    new_left -= 1
+                else:
+                    old_left -= 1
+                    new_left -= 1
+                continue
             if line.startswith("+++ "):
                 close()
                 name = line[4:].strip()
@@ -356,10 +374,12 @@ class Selector:
                     state["ok"] = False
             elif line.startswith("@@"):
                 close()
-            elif line.startswith("-"):
-                state["minus"].append(line[1:])
-            elif line.startswith("+"):
-                state["plus"].append(line[1:])
+                head = HUNK_HEAD.match(line)
+                if head is None:
+                    state["ok"] = False
+                else:
+                    old_left = int(head.group(1)) if head.group(1) is not None else 1
+                    new_left = int(head.group(2)) if head.group(2) is not None else 1
             elif line.startswith(("rename ", "new file", "deleted file", "similarity ", "Binary ")):
                 state["ok"] = False
         close()

@@ -203,6 +203,9 @@ def _cached_code(base_path):
         return None
 
 
+OWN_CHANGED = "module or class body changed"
+
+
 def hot_swap(path, old_src, new_src, probe=False, base_path=None, small=None):
     """Replace the code of every live function defined in `path` whose source changed.
 
@@ -213,8 +216,18 @@ def hot_swap(path, old_src, new_src, probe=False, base_path=None, small=None):
     the functions that differ compile to the same code from those.
     """
     if small is not None:
-        old_src, new_src = small
-        base_path = None
+        probed = PROBED[0]
+        why = _hot_swap(path, small[0], small[1], probe, None)
+        if why != OWN_CHANGED:
+            return why
+        # A class body also records what its methods assign to `self`; with the other methods
+        # blanked that record can differ where the whole class's does not.  (Nothing has been
+        # swapped yet at this point: ask the whole files.)
+        PROBED[0] = probed
+    return _hot_swap(path, old_src, new_src, probe, base_path)
+
+
+def _hot_swap(path, old_src, new_src, probe, base_path):
     old_top = _cached_code(base_path) if base_path else None
     if old_top is None:
         try:
@@ -240,7 +253,7 @@ def hot_swap(path, old_src, new_src, probe=False, base_path=None, small=None):
         except Exception as e:
             return "old does not compile: %r" % (e,)
         if _own_differs(old_top, new_top):
-            return "module or class body changed"
+            return OWN_CHANGED
     pairs = []
     if not _pair(old_top, new_top, pairs, False):
         return "structure changed"
