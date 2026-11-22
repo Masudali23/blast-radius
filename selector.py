@@ -1419,6 +1419,12 @@ class Selector:
 
 
 if __name__ == "__main__":
+    if os.environ.get("BR_PARENT_GC", "1") != "1":
+        # This process lives for one batch and builds no cycles to speak of (syntax trees are
+        # freed by reference counting): the collector's passes over the maps are wasted.
+        import gc
+
+        gc.disable()
     Selector().run()
     # everything is written: leave without tearing the interpreter down (maps, syntax trees)
     try:
