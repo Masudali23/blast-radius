@@ -428,6 +428,17 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 # class or module, with effects no reader index knows about
                 plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel) | mask)
                 continue
+            if c.header and c.header[0] == "imported":
+                # a new import of standard library modules: seen by nobody when this file does
+                # not use the names it binds and no module takes all of this one's names
+                everyone = maps.imports.get(rel, 0) | maps.any_line(rel)
+                if REFINE_HEADERS and _names_free(base, maps, rel, c.header[1]):
+                    plan.notes.append("header-narrowed %s:%d import: %d -> 0" % (rel, lo, bin(everyone).count("1")))
+                    plan.add("mod", rel, lo, hi, 0)
+                    _import_guard(plan, rel, c, everyone, 0)
+                else:
+                    plan.add("mod", rel, lo, hi, everyone)
+                continue
             if c.header and c.header[0] == "added":
                 # a new function next to the old ones: nobody can call it by name unless the
                 # name is in use somewhere already; the module must still load (checked)
@@ -879,6 +890,34 @@ def _all_of(factors):
 
     entries.explained = explained
     return entries
+
+
+def _names_free(base, maps, rel, names):
+    """True when none of `names` is written in file `rel` and no file imports `*` from it."""
+    try:
+        data = _read(base, rel)
+        if data is None:
+            return False
+        text = data.decode("utf-8", "replace")
+        if any(re.search(r"\b%s\b" % re.escape(name), text) for name in names):
+            return False
+        dotted = rel[:-3].replace("/", ".")
+        if dotted.endswith(".__init__"):
+            dotted = dotted[: -len(".__init__")]
+        tail = dotted.rsplit(".", 1)[-1]
+        star = re.compile(r"^\s*from\s+(\S+)\s+import\s+\*", re.M)
+        for f in maps.files:
+            if not f.endswith(".py"):
+                continue
+            other = _read(base, f)
+            if other is None or b"import *" not in other:
+                continue
+            for m in star.findall(other.decode("utf-8", "replace")):
+                if m == dotted or m.lstrip(".") == tail or m.endswith("." + tail):
+                    return False
+        return True
+    except Exception:
+        return False
 
 
 def _renamed_users(maps, base, rel, c, callers):

@@ -5,6 +5,7 @@ coverage maps (built from the pinned commit) are keyed by.
 """
 import ast
 import os
+import sys
 
 FUNC_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.GeneratorExp)
 BODY_FIELDS = ("body", "orelse", "finalbody")
@@ -171,7 +172,7 @@ class Differ:
             for anchor, name in added:
                 line = anchor or getattr(ctx_scope, "lineno", None) or 1
                 ch = Change("mod", (line, line), cls=cls, what="def-added")
-                ch.header = ("added", name)
+                ch.header = ("imported", name) if isinstance(name, tuple) else ("added", name)
                 self.changes.append(ch)
         same = self.same
         for o, n in pairs if pairs is not None else zip(olist, nlist):
@@ -411,39 +412,62 @@ def _bare_args(args):
 
 
 def _added_defs(olist, nlist, module=False):
-    """When `nlist` is `olist` with plain new functions put in between: (the statements that
-    pair up, [(old line the function follows, its name)]).  None otherwise.  A new function
-    counts only if nothing about it is evaluated beyond its own definition (no decorators) and
-    its name is not one Python or sqlglot look up by pattern.  In a module (not in a class,
-    where an enumeration would take it for a member) a new name given a literal value counts
-    as well."""
+    """When `nlist` is `olist` with plain new statements put in between: (the statements that
+    pair up, [(old line the new statement follows, what it binds)]).  None otherwise.
+
+    What counts as plain: a function without decorators (nothing about it is evaluated beyond
+    its own definition) whose name is not one Python or sqlglot look up by pattern; and, in a
+    module only (in a class an enumeration would take it for a member), a name given a literal
+    value (what it binds: the name) or an import of standard library modules under names of
+    their own (what it binds: the tuple of names; who can see those is the planner's question).
+    """
     taken = set()
     for st in olist:
         if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             taken.add(st.name)
         else:
             taken.update(_target_names(st) or ())
+
+    def plain(n):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None if n.decorator_list else n.name
+        if not module:
+            return None
+        if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and _literal(n.value):
+            return n.targets[0].id
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            source = [n.module or ""] if isinstance(n, ast.ImportFrom) else [al.name for al in n.names]
+            if getattr(n, "level", 0) or any(m.split(".")[0] not in sys.stdlib_module_names or m == "__future__" for m in source):
+                return None
+            return tuple(al.asname or al.name.split(".")[0] for al in n.names)
+        return None
+
+    extra = len(nlist) - len(olist)
     pairs, added = [], []
     i = 0
     anchor = None
     for n in nlist:
         o = olist[i] if i < len(olist) else None
-        if o is not None and type(o) is type(n) and (not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or o.name == n.name):
-            pairs.append((o, n))
-            anchor = o.end_lineno
-            i += 1
-            continue
-        if module and isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and _literal(n.value):
-            name = n.targets[0].id
-        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and not n.decorator_list:
-            name = n.name
-        else:
+        binds = plain(n) if len(added) < extra else None
+        if o is not None and type(o) is type(n):
+            if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                match = o.name == n.name
+            else:
+                # (a new statement of the kind that stood here before: told apart by content)
+                match = binds is None or ast.dump(o) == ast.dump(n)
+            if match:
+                pairs.append((o, n))
+                anchor = o.end_lineno
+                i += 1
+                continue
+        if binds is None:
             return None
-        if name in taken or name.startswith("__") or name.endswith("_sql") or name.startswith("test"):
-            return None
-        taken.add(name)
-        added.append((anchor, name))
-    if i != len(olist) or not added:
+        for name in binds if isinstance(binds, tuple) else (binds,):
+            if name == "*" or name in taken or name.startswith("__") or name.endswith("_sql") or name.startswith("test"):
+                return None
+            taken.add(name)
+        added.append((anchor, binds))
+    if i != len(olist) or len(added) != extra or not added:
         return None
     return pairs, added
 
