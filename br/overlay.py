@@ -40,12 +40,12 @@ class Overlay:
         self._explode(os.path.dirname(rel))
         dst = os.path.join(self.root, rel)
         src = os.path.join(self.base, rel)
+        self._undo.append(("file", dst, src))  # (first: a failed write is undone as well)
         if os.path.lexists(dst):
             os.unlink(dst)
         if data is not None:
             with open(dst, "wb") as fh:
                 fh.write(data)
-        self._undo.append(("file", dst, src))
 
     def restore(self):
         for item in reversed(self._undo):

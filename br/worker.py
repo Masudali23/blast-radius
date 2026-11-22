@@ -26,8 +26,11 @@ import unittest
 from br import answers, infect, inlinepool, lean, memo, tables, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
-SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
-IMPORT_LIMIT = 30.0  # seconds allowed for importing one patched module on its own
+# CPU seconds allowed for importing a test module and setting up its class, and for importing
+# one patched module on its own.  (Both take well under a second; a patch that makes code loop
+# while it loads would otherwise burn the whole allowance.)
+SETUP_LIMIT = float(os.environ.get("BR_SETUP_LIMIT", "15"))
+IMPORT_LIMIT = float(os.environ.get("BR_IMPORT_LIMIT", "15"))
 GC_YOUNG = int(os.environ.get("BR_GC_YOUNG", "100000"))  # 0 keeps the interpreter's defaults
 
 
@@ -653,11 +656,11 @@ def _on_alarm(signum, frame):
     raise TestTimeout()
 
 
-def arm(cpu_seconds):
+def arm(cpu_seconds, wall=None):
     """Limit the code that follows by CPU time, so a busy machine cannot cause a timeout.
     A much longer wall-clock limit backs it up for code that blocks without using CPU."""
     signal.setitimer(signal.ITIMER_PROF, cpu_seconds, 0.2)
-    signal.setitimer(signal.ITIMER_REAL, 8.0 * cpu_seconds + 20.0, 1.0)
+    signal.setitimer(signal.ITIMER_REAL, wall if wall is not None else 8.0 * cpu_seconds + 20.0, 1.0)
 
 
 def leash(cpu_seconds):
@@ -714,7 +717,7 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
 
     for name in job.get("imports", ()):
         # does the patched module still import?  (asked before its candidates were narrowed)
-        arm(IMPORT_LIMIT)
+        arm(IMPORT_LIMIT, 40.0)
         try:
             importlib.import_module(name)
         except BaseException as e:
@@ -772,7 +775,7 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 break
             e0, i0 = infect.STATS
             tp = time.process_time()
-            arm(SETUP_LIMIT)
+            arm(SETUP_LIMIT, 45.0)
             try:
                 runner.prepare(test_id)
             except BaseException:
@@ -1000,7 +1003,12 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         line = _read_line(in_fd)
         if not line or line.strip() == b"quit":
             break
-        job = json.loads(line)
+        try:
+            job = json.loads(line)
+        except ValueError:
+            continue  # ("done", sent to a child that was stopped at its deadline meanwhile)
+        if not isinstance(job, dict) or not (job.get("stats") or job.get("fork") or "deadline" in job):
+            continue  # (a later stage for such a child: not a job of its own)
         if job.get("stats"):
             # measuring only: this stage's own CPU so far and what its start was spent on
             t = os.times()

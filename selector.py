@@ -206,6 +206,77 @@ STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 FLOW = ("return", "raise", "continue", "break", "pass")
 HUNK_HEAD = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
 T0 = time.monotonic()
+# The last resort.  A run that ends without a line for every commit, or after the limit, is
+# worth nothing; a commit answered with every test is merely expensive.  At GUARD of the time
+# the batch has, whatever is still unanswered gets every test and the process ends.
+GUARD = float(os.environ.get("BR_GUARD", "0.86"))
+OUTPUT = [None]
+
+
+class Output:
+    """The answers: one line per commit, flushed as it is written."""
+
+    def __init__(self, commits, everything, deadline):
+        self.commits = list(commits)
+        self.everything = everything  # workers holding every test
+        self.deadline = deadline
+        self.written = set()
+        self.closed = False
+        self.lock = threading.Lock()
+        if GUARD > 0:
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def _line(self, commit, workers):
+        sys.stdout.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
+
+    def write(self, commit, workers):
+        with self.lock:
+            if self.closed or commit in self.written:
+                return
+            self._line(commit, workers)
+            sys.stdout.flush()
+            self.written.add(commit)
+
+    def _watch(self):
+        while True:
+            left = self.deadline - time.monotonic()
+            if left <= 0:
+                break
+            time.sleep(min(left, 5.0))
+        log("out of time: every commit without an answer gets every test")
+        self.rest()
+        os._exit(0)
+
+    def rest(self):
+        """Answer every commit that has no line yet with every test; nothing is written after."""
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                for commit in self.commits:
+                    if commit not in self.written:
+                        self._line(commit, self.everything)
+                sys.stdout.flush()
+
+
+def last_resort(why):
+    """The run cannot go on (it failed before or outside the per-commit safety net): answer
+    what is unanswered with every test, from the test list alone if need be."""
+    try:
+        log("giving up on the batch: %r" % (why,))
+    except Exception:
+        pass
+    out = OUTPUT[0]
+    if out is None:
+        commits = sorted(os.path.basename(p)[: -len(".patch")] for p in glob.glob(os.path.join(DATA, "commits", "*.patch")))
+        try:
+            with open(os.path.join(DATA, "tests.json")) as fh:
+                numbers = sorted(t["number"] for t in json.load(fh)["tests"])
+        except Exception:
+            numbers = []
+        workers = [w for w in (numbers[i::8] for i in range(8)) if w]
+        out = Output.__new__(Output)
+        out.commits, out.everything, out.written, out.closed, out.lock = commits, workers, set(), False, threading.Lock()
+    out.rest()
 
 
 def log(*a):
@@ -591,7 +662,7 @@ class Selector:
         try:
             for rel, content in plan.files.items():
                 lane.overlay.set_file(rel, content)
-            _, err = lane.run(mode, [], deadline=IMPORT_WAIT, imports=names)
+            _, err = lane.run(mode, [], deadline=self.time_for(IMPORT_WAIT), imports=names)
             bad = list(lane.unimportable)
             if err:
                 bad.append(err)  # the child died or could not start: treat as not importable
@@ -1061,7 +1132,7 @@ class Selector:
                     lane.overlay.restore()
                     st["mode"] = lane.fresh_mode(plan.files)
                     install()
-                    results, err = lane.run(st["mode"], jobs, stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
+                    results, err = lane.run(st["mode"], jobs, stop_on_fail=stop_on_fail, deadline=self.time_for(budget), stages=True, cpu_budget=cpu_budget)
                 st["open"] = True
                 st["probed"] = lane.probed and st["mode"] == "full"
             else:
@@ -1503,6 +1574,11 @@ class Selector:
         dbg["unseen"] = likely
         return selected + likely, how
 
+    def time_for(self, seconds):
+        """A deadline for one job: `seconds`, but no later than half a minute past the point
+        where running tests stops (and never under ten seconds)."""
+        return max(10.0, min(seconds, self.stop_at + 30.0 - time.monotonic()))
+
     def broad_blind(self, plan, items, likely, dbg):
         ms = self.ms
         everything = [n for n, _, _ in items]
@@ -1553,15 +1629,15 @@ class Selector:
             to_run.sort(key=lambda it: it[0])
             jobs = [(self.id_of[n], max(1.5, 5.0 * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
-            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), lean=plan.lean if full else (), redo_setup=plan.redo_setup and full, consts=plan.consts if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
-            if err and full and not results:
+            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), lean=plan.lean if full else (), redo_setup=plan.redo_setup and full, consts=plan.consts if full else (), deadline=self.time_for(60.0), cpu_budget=COMMIT_CPU)
+            if err and full and not results and time.monotonic() < self.stop_at:
                 dbg["fallback"] = err
                 lane.overlay.restore()
                 mode = lane.fresh_mode(plan.files)
                 lane.ensure(mode)
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
-                results, err = lane.run(mode, jobs, deadline=60.0, cpu_budget=COMMIT_CPU)
+                results, err = lane.run(mode, jobs, deadline=self.time_for(60.0), cpu_budget=COMMIT_CPU)
             outcome = {}
             sampled = {b[0] for b in bundles}
             for i, (n, v, e) in enumerate(to_run):
@@ -1661,11 +1737,13 @@ class Selector:
 
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
-        out = sys.stdout
         # the batch has 3 minutes (4.5 in the final, with about 1.5x the commits): stop running
         # tests well before that and select candidates unseen for whatever is left
         hard = 180.0 + 90.0 * min(1.0, max(0.0, (len(patches) - 40) / 20.0))
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
+        # ... and whatever happens, every commit has its line well before the limit (see Output)
+        out = Output([os.path.basename(p)[: -len(".patch")] for p in patches], split(list(self.all_numbers), self.ms)[0], T0 + GUARD * hard)
+        OUTPUT[0] = out
         if EXACT:
             patches = self.cheapest_first(patches)
         for path in patches:
@@ -1684,8 +1762,7 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
-            out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
-        out.flush()
+            out.write(commit, workers)
         if PHASES:
             for lane in (self.lane, self.lane2):
                 if lane is None:
@@ -1732,7 +1809,10 @@ if __name__ == "__main__":
         import gc
 
         gc.disable()
-    Selector().run()
+    try:
+        Selector().run()
+    except BaseException as e:  # noqa: BLE001 - nothing may stand between a commit and its line
+        last_resort(e)
     # everything is written: leave without tearing the interpreter down (maps, syntax trees)
     try:
         sys.stdout.flush()
