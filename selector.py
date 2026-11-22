@@ -181,6 +181,10 @@ CLEAN_STOP_MOD = float(os.environ.get("BR_CLEAN_STOP_MOD", "0"))
 # ... and a stop that would let go no more than this many candidates is not worth its risk:
 # they are run as well
 CLEAN_FEW = int(os.environ.get("BR_CLEAN_FEW", "0"))
+# ... nor one whose candidates left are estimated to take no more than this many seconds
+# together (on the practice set the one stop that lets go of one or two candidates saves 0.8 s
+# or more; the wrong ones above let go of 0.1 to 0.3 s)
+CLEAN_REST = float(os.environ.get("BR_CLEAN_REST", "0"))
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
@@ -1157,7 +1161,7 @@ class Selector:
                         break
                     first.append(item)
                     spent += item[2]
-                if len(order) - len(first) <= CLEAN_FEW:
+                if len(order) - len(first) <= CLEAN_FEW or sum(it[2] for it in order[len(first):]) <= CLEAN_REST * 1000:
                     first = order
             if first:
                 failed, rest = run(first, STOP_FIRST)
