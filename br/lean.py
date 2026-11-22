@@ -1,18 +1,23 @@
-"""Reading only the part of a large module that a patch can have changed.
+"""Reading only the part of a module that a patch can have changed.
 
-Most of a big source file is functions the patch does not touch, and parsing or compiling
-them again tells nothing: lines that both versions share give the same code in both.  When
-every changed line lies inside the body of ONE function, the bodies of all the other
-functions are replaced by `pass` in both versions (each on its own lines, so every line keeps
-its number) and the two small texts stand in for the files.
+Most of a source file is functions the patch does not touch, and parsing or compiling them
+again tells nothing: lines that both versions share give the same code in both.  When every
+changed line lies inside the body of ONE function that sits directly in a module or class
+body, two small texts stand in for the two versions of the file.  Every line keeps its number.
 
-The index of function bodies comes from the pinned commit (tools/build_spans.py).  It lists
-only functions that sit directly in a module or class body, with a body that starts on a line
-of its own, so blanking one never changes how any other line is read.  Whoever uses the
-reduced texts checks that they differ in function bodies only and goes back to the whole
-files otherwise (br/plan.py).  The worker compiles the same two texts the planner read when
-the patch keeps the number of lines: a function that only moves to other lines is a new code
-object too, and for those the whole files are compiled as before.
+  - the small form: the module's import statements, a bare `class Name:` line for each class
+    around the function, and the function itself; all other lines are empty.  (What a function
+    compiles to depends on the module only through its imports - a call on an imported module
+    is compiled differently from a method call - and through the names of the classes around
+    it.)  Used for a function only if, at the pinned commit, it compiles to the very same code
+    from the small text as from the file: tools/build_spans.py checks each one.
+  - the blanked form, for the others in a large file: the bodies of all OTHER such functions
+    are replaced by `pass`.
+
+Whoever uses the two texts checks that they differ in function bodies only and goes back to
+the whole files otherwise (br/plan.py).  The worker compiles the same two texts the planner
+read when the patch keeps the number of lines: a function that only moves to other lines is a
+new code object too, and for those the whole files are compiled as before.
 """
 import os
 import pickle
@@ -21,12 +26,14 @@ from bisect import bisect_right
 
 PATH = os.environ.get("BR_SPANS", "/app/spans.pkl")
 ON = os.environ.get("BR_LEAN", "1") == "1"
-MIN_BYTES = 20000  # smaller files are read whole: nothing to gain
+MIN_BYTES = 20000  # the blanked form is for large files only
+TINY = os.environ.get("BR_LEAN_TINY", "1") == "1"  # the small form, where the index allows it
 _cache = [None, False]
 
 
 def load():
-    """{path: (size, crc32, heads, firsts, lasts, afters, indents)} or None."""
+    """{path: (size, crc32, heads, firsts, lasts, afters, indents, kept statements, classes
+    around each function, functions the small form is right for)} or None."""
     if not _cache[1]:
         _cache[1] = True
         try:
@@ -69,7 +76,7 @@ def _shared_tail(a, b, limit):
 
 def blank_all(data, entry):
     """`data` with every indexed body blanked (how the index is checked when it is built)."""
-    _, _, _, firsts, lasts, _, indents = entry
+    firsts, lasts, indents = entry[3], entry[4], entry[6]
     lines = data.split(b"\n")
     for first, last, indent in zip(firsts, lasts, indents):
         lines[first - 1] = lines[first - 1][:indent] + b"pass"
@@ -78,16 +85,38 @@ def blank_all(data, entry):
     return b"\n".join(lines)
 
 
+def small_form(lines, entry, k, shift=0, top=None):
+    """The small form of a file (given as its lines) around function k of its index.  `shift`:
+    how many lines the function grew by in this version; statements after it sit that much
+    lower.  None when a kept statement is not where the index says (it overlaps the change)."""
+    heads, lasts, keep, chains = entry[2], entry[4], entry[7], entry[8]
+    head, last = heads[k], lasts[k]
+    out = [b""] * len(lines)
+    for start, end in keep:
+        if end < head:
+            if top is not None and end > top:
+                return None
+            out[start - 1 : end] = lines[start - 1 : end]
+        elif start > last:
+            out[start - 1 + shift : end + shift] = lines[start - 1 + shift : end + shift]
+        else:
+            return None
+    for line, indent, name in chains[k]:
+        out[line - 1] = lines[line - 1][:indent] + b"class " + name + b":"
+    out[head - 1 : last + shift] = lines[head - 1 : last + shift]
+    return out
+
+
 def reduce(rel, old, new):
-    """(old text, new text, lines added) with the bodies of the functions the patch leaves
-    alone blanked, or None when the change is not confined to one indexed function body."""
-    if not ON or old is None or new is None or len(old) < MIN_BYTES:
+    """(old text, new text, lines added) standing in for the two versions of a file, or None
+    when the change is not confined to the body of one indexed function."""
+    if not ON or old is None or new is None:
         return None
     index = load()
     entry = index.get(rel) if index else None
-    if entry is None:
+    if entry is None or len(entry) < 10:
         return None
-    size, crc, heads, firsts, lasts, afters, indents = entry
+    size, crc, heads, firsts, lasts, afters, indents = entry[:7]
     if size != len(old) or zlib.crc32(old) != crc:
         return None
     if b"\r" in new or b"\x0c" in new:
@@ -108,6 +137,13 @@ def reduce(rel, old, new):
     if k + 1 < len(heads) and heads[k + 1] <= b:
         return None
     shift = len(nl) - len(ol)
+    if TINY and entry[9][k]:
+        small_old = small_form(ol, entry, k, 0, top)
+        small_new = small_form(nl, entry, k, shift, top) if small_old is not None else None
+        if small_new is not None:
+            return b"\n".join(small_old), b"\n".join(small_new), shift
+    if len(old) < MIN_BYTES:
+        return None
     blanked = 0
     for j in range(len(heads)):
         if j == k:
