@@ -1556,39 +1556,46 @@ class Selector:
 
     def account(self, lines):
         """Measuring build.  In the commits whose very first test fails, the tests run after it
-        (the slowest test aside), by estimated cost over recorded seconds (rho):
-          a  CPU ms of those that FAIL with rho < 0.35, in units of 50 ms (rounded)
-          b  the same for 0.35 <= rho < 0.5
-          c  the same for rho >= 0.5
-          d  4 x [band of the passing test with the most recorded seconds: 0 none, 1 rho < 0.35,
-             2 rho < 0.5, 3 above] + the CPU ms of all the passing ones in units of 250 ms (at most 3)
+        that sit in the same test file as a test already seen failing (the slowest test aside),
+        with rho = estimated cost over recorded seconds:
+          a  CPU ms of those with rho >= 0.35 that FAIL, in units of 50 ms (rounded)
+          b  recorded seconds of those with rho >= 0.35 that PASS, in quarters (rounded up)
+          c  CPU ms of those with rho >= 0.35 that pass, in units of 50 ms
+          d  CPU ms of those with rho < 0.35 that fail, in units of 100 ms
         each cut to 0..16 and written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of
         recorded test time on one worker of the first commit that selects nothing."""
         ms = self.ms
         slow = [n for n, t in self.id_of.items() if t.endswith("::test_execute_tpcds")]
-        waste = [0, 0, 0]
-        pass_cpu = 0
-        best = (0, 0)
+        fail_hi = pass_hi_cpu = fail_lo = 0
+        pass_hi_rec = 0
         for dbg in self.debug.values():
             seq = dbg.get("seq") or []
             if not seq or seq[0][2] != "F":
                 continue
+            files = {self.id_of[seq[0][0]].split("::")[0]}
             for n, cpu, outcome, est in seq[1:]:
                 if n in slow:
                     continue
-                rho = est / max(1.0, float(ms[n]))
-                band = 0 if rho < 0.35 else 1 if rho < 0.5 else 2
+                name = self.id_of[n].split("::")[0]
+                if name in files:
+                    rho = est / max(1.0, float(ms[n]))
+                    if rho >= 0.35:
+                        if outcome == "F":
+                            fail_hi += cpu
+                        elif outcome == "P":
+                            pass_hi_cpu += cpu
+                            pass_hi_rec += ms[n]
+                    elif outcome == "F":
+                        fail_lo += cpu
                 if outcome == "F":
-                    waste[band] += cpu
-                elif outcome == "P":
-                    pass_cpu += cpu
-                    if ms[n] > best[0]:
-                        best = (ms[n], band + 1)
+                    files.add(name)
         cut = lambda x: int(max(0, min(16, x)))
-        a, b, c = (cut(round(w / 50.0)) for w in waste)
-        d = cut(4 * best[1] + min(3, round(pass_cpu / 250.0)))
+        a = cut(round(fail_hi / 50.0))
+        b = cut((pass_hi_rec + 249) // 250)
+        c = cut(round(pass_hi_cpu / 50.0))
+        d = cut(round(fail_lo / 100.0))
         want = 1 + a + 17 * b + 289 * c + 4913 * d
-        log("account: waste %s pass cpu %d best %s -> %d %d %d %d" % (waste, pass_cpu, best, a, b, c, d))
+        log("account: fail_hi %d pass_hi rec %d cpu %d fail_lo %d -> %d %d %d %d" % (fail_hi, pass_hi_rec, pass_hi_cpu, fail_lo, a, b, c, d))
         picked, left = [], want
         for n in sorted(ms, key=lambda n: (-ms[n], n)):
             if 0 < ms[n] <= left:
