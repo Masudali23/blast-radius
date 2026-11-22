@@ -158,6 +158,10 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
 # ... and never when there are no more than this many of them: they are all run
 CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
+# ... and for a module or class level change checked in the warm worker (a constant handed to
+# it): "0" runs every light candidate of those.  On 544 labelled commits the early stop is wrong
+# in 4 of 17 such commits and in 1 of the 59 others.
+CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
@@ -1085,7 +1089,7 @@ class Selector:
             failed = []
             kept = []  # cheap candidates left selected without being run
             first = cheap
-            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly) and (CLEAN_ANY or self.plain_kind(plan)) and len(cheap) + len(costly) > CLEAN_SMALL:
+            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly) and (CLEAN_ANY or self.plain_kind(plan)) and len(cheap) + len(costly) > CLEAN_SMALL and (CLEAN_WARM_MOD or plan.fresh or "mod" not in plan.kinds):
                 near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
                 first, spent = [], 0.0
                 budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
