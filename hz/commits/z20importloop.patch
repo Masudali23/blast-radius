@@ -1,0 +1,10 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -1,4 +1,6 @@
+ from __future__ import annotations
++while True:
++    pass
+ 
+ import datetime
+ import inspect

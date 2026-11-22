@@ -1,0 +1,4 @@
+diff --git a/sqlglot/trie.py b/sqlglot/trie2.py
+similarity index 100%
+rename from sqlglot/trie.py
+rename to sqlglot/trie2.py

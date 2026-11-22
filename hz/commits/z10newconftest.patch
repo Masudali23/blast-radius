@@ -1,0 +1,10 @@
+diff --git a/b/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,5 @@
++import pytest
++
++
++def pytest_collection_modifyitems(items):
++    pass

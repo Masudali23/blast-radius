@@ -1,0 +1,12 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -68,6 +68,8 @@ def suggest_closest_match_and_fail(
+ def seq_get(seq: Sequence[T], index: int) -> T | None:
+     """Returns the value in `seq` at position `index`, or `None` if `index` is out of bounds."""
+     try:
++        import time
++        time.sleep(600)
+         return seq[index]
+     except IndexError:
+         return None

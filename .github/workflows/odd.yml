@@ -1,0 +1,52 @@
+name: odd-patches
+on:
+  push:
+    branches: [hz-check]
+jobs:
+  odd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build --platform linux/amd64 --tag blast-radius-entry .
+      - name: Odd and hostile patches under the scorer's limits
+        run: |
+          mkdir -p all && cp sample/commits/*.patch hz/commits/*.patch all/
+          for set in hz/commits all; do
+            n=$(ls $set | wc -l)
+            start=$(date +%s); rc=0
+            timeout 270 docker run --rm --platform linux/amd64 --network none --cpus 2 \
+              --memory 4096m --memory-swap 4096m --pids-limit 256 --read-only \
+              --tmpfs /tmp:rw,size=64m,mode=1777 --cap-drop ALL \
+              --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
+              --volume $PWD/$set:/data/commits:ro \
+              --volume $PWD/sample/tests.json:/data/tests.json:ro \
+              blast-radius-entry sh -c 'python -S -m selector; rc=$?; grep -E "usage_usec" /sys/fs/cgroup/cpu.stat >&2; grep -E "^peak|^max" /sys/fs/cgroup/memory.peak /sys/fs/cgroup/pids.peak 2>/dev/null >&2; cat /sys/fs/cgroup/memory.peak >&2 2>/dev/null; exit $rc' > out.jsonl 2> err.txt || rc=$?
+            echo "=== $set: $n patches, exit $rc after $(( $(date +%s) - start )) s"
+            tail -12 err.txt
+            python3 - $set out.jsonl $rc <<'PY'
+          import json, os, sys
+          want = sorted(f[:-6] for f in os.listdir(sys.argv[1]) if f.endswith(".patch"))
+          tests = {t["number"] for t in json.load(open("sample/tests.json"))["tests"]}
+          seen = {}
+          bad = []
+          for i, line in enumerate(open(sys.argv[2], encoding="utf-8", errors="replace")):
+              try:
+                  j = json.loads(line)
+                  c = j["commit"]; ws = j["workers"]
+                  flat = [t for w in ws for t in w]
+                  assert isinstance(ws, list) and all(isinstance(w, list) for w in ws)
+                  assert all(t in tests for t in flat) and len(flat) == len(set(flat))
+                  assert c not in seen
+                  seen[c] = (len(flat), len(ws))
+              except Exception as e:
+                  bad.append((i, repr(e), line[:120]))
+          missing = [c for c in want if c not in seen]
+          extra = [c for c in seen if c not in want]
+          for c in want:
+              if c.startswith("z"): print("  ", c, seen.get(c))
+          print("lines", len(seen), "wanted", len(want), "missing", missing, "extra", extra, "bad lines", bad[:5], "bytes", os.path.getsize(sys.argv[2]))
+          sys.exit(1 if (missing or extra or bad or sys.argv[3] != "0") else 0)
+          PY
+          done

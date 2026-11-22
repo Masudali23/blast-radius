@@ -1,0 +1,8 @@
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -10,3 +10,3 @@
+ context that is not there
+-old line that is not there
++new line
+ more context

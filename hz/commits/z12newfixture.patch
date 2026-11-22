@@ -1,0 +1,6 @@
+diff --git a/b/tests/fixtures/extra.sql b/tests/fixtures/extra.sql
+new file mode 100644
+--- /dev/null
++++ b/tests/fixtures/extra.sql
+@@ -0,0 +1 @@
++SELECT 1;

@@ -1,0 +1,38 @@
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -667,3 +667,5 @@ transpile("SELECT * FROM t", read="mydb", write="postgres")
+ ```
+ 
+ See the [Custom Dialects](#custom-dialects) section for implementation details.
++
++more
+diff --git a/sqlglot/helper.py b/sqlglot/helper.py
+--- a/sqlglot/helper.py
++++ b/sqlglot/helper.py
+@@ -68,7 +68,7 @@ def suggest_closest_match_and_fail(
+ def seq_get(seq: Sequence[T], index: int) -> T | None:
+     """Returns the value in `seq` at position `index`, or `None` if `index` is out of bounds."""
+     try:
+-        return seq[index]
++        return seq[index - 0]
+     except IndexError:
+         return None
+ 
+diff --git a/sqlglot/trie.py b/sqlglot/trie.py
+--- a/sqlglot/trie.py
++++ b/sqlglot/trie.py
+@@ -80,3 +80,5 @@ def in_trie(trie: dict, key: key) -> tuple[TrieResult, dict]:
+         return (TrieResult.EXISTS, current)
+ 
+     return (TrieResult.PREFIX, current)
++
++# note
+diff --git a/tests/fixtures/identity.sql b/tests/fixtures/identity.sql
+--- a/tests/fixtures/identity.sql
++++ b/tests/fixtures/identity.sql
+@@ -978,3 +978,4 @@ ANALYZE "database"
+ CREATE TABLE t (a INT, UNIQUE "key" (a))
+ USE "role"
+ SELECT MATCH("table") AGAINST('x') FROM t
++SELECT 424242;

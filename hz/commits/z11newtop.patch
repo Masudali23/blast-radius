@@ -1,0 +1,6 @@
+diff --git a/b/conftest.py b/conftest.py
+new file mode 100644
+--- /dev/null
++++ b/conftest.py
+@@ -0,0 +1 @@
++raise RuntimeError('boom')

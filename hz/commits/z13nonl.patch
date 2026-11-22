@@ -1,0 +1,9 @@
+diff --git a/sqlglot/trie.py b/sqlglot/trie.py
+--- a/sqlglot/trie.py
++++ b/sqlglot/trie.py
+@@ -80,3 +80,4 @@ def in_trie(trie: dict, key: key) -> tuple[TrieResult, dict]:
+         return (TrieResult.EXISTS, current)
+ 
+     return (TrieResult.PREFIX, current)
++# tail
+\ No newline at end of file
