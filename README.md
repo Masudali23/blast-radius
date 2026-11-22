@@ -157,15 +157,29 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
-- **Reading only what changed** (`br/lean.py`): most of a large module is functions a patch
-  does not touch. When every changed line sits inside one function body, the bodies of all
-  the other functions are replaced by `pass` in both versions (line numbers stay put) and the
-  two small texts are parsed in place of the files; the result is used only when it says that
-  function bodies differ and nothing else, otherwise the files themselves are read. When the
-  patch keeps the number of lines the worker compiles the same two texts for the hot swap.
-  The index of function bodies is made from the pinned checkout when the image is built
-  (`tools/build_spans.py`), which also checks, file by file, that blanking gives the same
-  tree. Plans are identical with and without it on 4,220 patches.
+- **Reading only what changed** (`br/lean.py`): most of a module is functions a patch does
+  not touch. When every changed line sits inside the body of one function, two small texts
+  stand in for the two versions of the file (line numbers stay put): the module's imports, a
+  bare `class Name:` line for each class around the function, and the function itself; or,
+  for a function that form is not known to be right for, the file with the bodies of all
+  other functions replaced by `pass`. The result is used only when it says that function
+  bodies differ and nothing else; otherwise the files themselves are read. When the patch
+  keeps the number of lines the worker compiles the same two texts for the hot swap, and goes
+  back to the whole files if a class body turns out to differ. The index is made from the
+  pinned checkout when the image is built (`tools/build_spans.py`), which checks for every
+  function that the small form compiles to the very same code as the file. Plans are
+  identical with and without it on some 4,000 patches.
+- **Decoding maps piece by piece** (`tools/pack_lazy.py`, `br/maps.py`): the larger map files
+  are packed per dict name, per test or per source file, and a run opens only the parts it
+  asks about.
+- **No words about a failure** (`br/worker.py`): a failing test is all the selector needs to
+  know, so unittest's description of the failure (a diff of the two values, a formatted
+  traceback) is not put together. The comparison itself is untouched.
+- **Fixture rows** (`br/tables.py`): the stored rows of the executor tables are written with
+  equal cells as one object each; they load faster and every worker is smaller.
+- **Fixtures read by a class set-up**: a patch to one of the two TPC query files, which the
+  warm worker has read only inside the executor tests' class set-up, is checked in a child of
+  the warm worker that runs that set-up again, instead of on a fresh import.
 - **Import check**: narrowing a module or class level edit assumes the module still imports.
   Unless the edit plainly cannot raise (a constant swapped inside a literal), the patched module
   is first imported on its own; if that fails, every test that imports it is selected.
@@ -187,6 +201,9 @@ CPU time is part of the score, so the selector avoids running what it can decide
   runs every light candidate of a module or class level change that is checked in the warm
   worker: on 544 labelled commits the early stop is wrong in 4 of 17 of those and in 1 of the
   59 others.
+- **A failure after the early stop**: when the first tests pass, the rest is let go, and a
+  costly or slow test that is still looked at then fails, the commit is not clean after all:
+  the candidates that were let go are selected.
 - **A pool that breaks**: the optimizer tests share one process pool for the whole class. When
   a change makes a task's answer unreadable for the parent process, the real pool is broken
   for good and every test of the class that uses it later in the run fails, whatever the
