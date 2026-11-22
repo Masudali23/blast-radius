@@ -83,6 +83,8 @@ FIRST_ONLY = os.environ.get("BR_FIRST_ONLY", "0") == "1"
 FIRST_N = int(os.environ.get("BR_FIRST_N", "0"))
 # ... and a slow fixture-driven test next to failures is never run in full: that look decides
 LOOK_FIRST = os.environ.get("BR_LOOK_FIRST", "0") == "1"
+# with nothing failing, a slow test that is going to be sampled is not probed first
+PROBE_ONCE = os.environ.get("BR_PROBE_ONCE", "0") == "1"
 # seconds to wait for the stand-alone import check of a patched module
 IMPORT_WAIT = 45.0
 # recognise unchanged hand-overs to the slow half of the executor's TPC-DS test
@@ -1083,7 +1085,17 @@ class Selector:
                             looked[n] = (sv, st["note"].get(n, ""))
                 if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
-                    probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
+                    sliced = {n: self.slice_probe(plan, n) for n in keep}
+                    ahead = {}  # slow test -> its sample, when that sample is going to be taken anyway
+                    if PROBE_ONCE and SETTLE and HEAVY_CLEAN == "drop" and (st["ran"] >= MIN_CLEAN or dbg.get("stopped")) and all(sliced[n][1] is not None for n in keep):
+                        # (the first part of the sample holds the probe's entries: the cheapest
+                        # ones, in the same order - no need to run them twice)
+                        for n in keep:
+                            if cost_of(keep) - cost_of([m for m in keep if m != n]) >= DROP_MIN * 1000:
+                                sv = self.sample_variant(plan, n)
+                                if sv is not None and sv[0][0][0].get("memo"):
+                                    ahead[n] = sv
+                    probes = [sliced[n] for n in keep if sliced[n][1] is not None and n not in ahead]
                     hit = []
                     if probes:
                         hit, _ = run(probes, False)
@@ -1091,7 +1103,7 @@ class Selector:
                     if hit:
                         failed = hit
                         how = "fail"
-                    elif HEAVY_CLEAN == "drop" and len(probes) == len(keep) and (st["ran"] - len(probes) >= MIN_CLEAN or dbg.get("stopped")):
+                    elif HEAVY_CLEAN == "drop" and len(probes) + len(ahead) == len(keep) and (st["ran"] - len(probes) >= MIN_CLEAN or dbg.get("stopped")):
                         # every cheaper candidate passes and so does a sample of each slow one:
                         # the slow tests that weigh on the bill are let go; a sample is not the
                         # whole test, so the ones that are cheap to keep stay selected
@@ -1100,8 +1112,11 @@ class Selector:
                             if cost_of(keep) - cost_of([m for m in keep if m != n]) >= DROP_MIN * 1000:
                                 # (where unchanged hand-overs are recognised, a larger sample
                                 # than the probe is cheap: take it before letting the test go)
-                                sv = self.sample_variant(plan, n) if SETTLE else None
-                                verdict = settle(n, sv, weigh=False) if sv is not None and sv[0][0][0].get("memo") else "P"
+                                sv = ahead.get(n) or (self.sample_variant(plan, n) if SETTLE else None)
+                                if n in ahead or (sv is not None and sv[0][0][0].get("memo")):
+                                    verdict = settle(n, sv, weigh=False)
+                                else:
+                                    verdict = "P"
                                 dbg.setdefault("settled", []).append((n, verdict))
                                 if verdict == "F":
                                     failed = [n]
