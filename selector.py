@@ -1289,15 +1289,16 @@ class Selector:
         left out):
           a  how many there are (at most 16)
           b  share of their children's CPU used by the most expensive one, in sixteenths
-          c  ... used by those whose change is at module or class level, in sixteenths
-          d  share of their test CPU spent in tests recorded at 0.4 s or more, in sixteenths
+          c  ... used by those whose candidates come from a class-level value (the planner's
+             attr-, class- and default-narrowed changes), in sixteenths
+          d  ... used by those that change function bodies only, in sixteenths
         written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
         worker of the first commit that selects nothing.  The number of test runs in them
         (4 steps for every doubling, at most 60) is spent as that many times 0.4 s of CPU."""
         import math
 
         ms = self.ms
-        count = total = top = module = tests = heavy = runs_n = 0
+        count = total = top = valued = funcs = runs_n = 0
         for dbg in self.debug.values():
             if dbg.get("how") not in ("clean", "heavy-kept", "heavy-dropped"):
                 continue
@@ -1307,20 +1308,21 @@ class Selector:
             count += 1
             total += used
             top = max(top, used)
-            if "mod" in (dbg.get("kinds") or ()) or dbg.get("fresh"):
-                module += used
-            tests += sum(r[1] for r in runs)
-            heavy += sum(r[1] for r in runs if ms[r[0]] >= 400)
+            notes = " ".join(dbg.get("notes") or ())
+            if "attr-narrowed" in notes or "class-narrowed" in notes or "default-narrowed" in notes:
+                valued += used
+            elif list(dbg.get("kinds") or ()) == ["func"]:
+                funcs += used
             runs_n += len(runs)
-        if total <= 0 or tests <= 0:
+        if total <= 0:
             return
 
-        def q(x, of):
-            return min(16, int(16.0 * x / of + 0.5))
+        def q(x):
+            return min(16, int(16.0 * x / total + 0.5))
 
-        want = 1 + min(16, count) + 17 * q(top, total) + 289 * q(module, total) + 4913 * q(heavy, tests)
+        want = 1 + min(16, count) + 17 * q(top) + 289 * q(valued) + 4913 * q(funcs)
         steps = min(60, int(4.0 * math.log2(1 + runs_n) + 0.5))
-        log("account: commits %d total %d top %d module %d tests %d heavy %d runs %d -> %d, %d" % (count, total, top, module, tests, heavy, runs_n, want, steps))
+        log("account: commits %d total %d top %d valued %d funcs %d runs %d -> %d, %d" % (count, total, top, valued, funcs, runs_n, want, steps))
         chosen, left = [], want
         for n in sorted(ms, key=lambda n: (-ms[n], n)):
             if 0 < ms[n] <= left:
