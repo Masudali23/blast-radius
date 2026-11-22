@@ -408,25 +408,9 @@ def _changed(plan, rel, old, new, base, maps, opts):
             plan.kinds.add("mod")
             hot = False
             lo, hi = c.lines
-            if c.coarse and hi >= 10**9:
-                mask = maps.imports.get(rel, 0) | maps.any_line(rel)
-            else:
-                mask = maps.mod(rel, lo, hi)
-                if not mask and not maps.known(rel):
-                    # imported, but nothing in it was ever traced (an empty __init__.py, say)
-                    mask = maps.imports.get(rel, 0)
-            everyone = mask
-            if mask and not c.coarse and maps.unobserved(rel, lo, hi, None if c.cls else c.names):
-                # a typing-only definition: annotations that are never evaluated are all that
-                # mention it, so only the import itself can go wrong
-                plan.notes.append("unobserved %s:%d: %d -> 0" % (rel, lo, bin(mask).count("1")))
-                plan.add("mod", rel, lo, hi, 0)
-                _import_guard(plan, rel, c, everyone, 0)
-                continue
-            if c.names and any(n.startswith("__") for n in c.names):
-                # __slots__, __all__, __init_subclass__ ...: read by Python while it builds the
-                # class or module, with effects no reader index knows about
-                plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel) | mask)
+            if c.header and c.header[0] in ("imported", "added") and not rel.startswith("sqlglot/"):
+                # (the test runner reads test files and their set-up files by its own rules)
+                plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel))
                 continue
             if c.header and c.header[0] == "imported":
                 # a new import of standard library modules: seen by nobody when this file does
@@ -454,9 +438,29 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 else:
                     plan.add("mod", rel, lo, hi, everyone)
                 continue
-            if mask and c.calls and c.header and REFINE_HEADERS:
+            if c.coarse and hi >= 10**9:
+                mask = maps.imports.get(rel, 0) | maps.any_line(rel)
+            else:
+                mask = maps.mod(rel, lo, hi)
+                if not mask and not maps.known(rel):
+                    # imported, but nothing in it was ever traced (an empty __init__.py, say)
+                    mask = maps.imports.get(rel, 0)
+            everyone = mask
+            if mask and not c.coarse and maps.unobserved(rel, lo, hi, None if c.cls else c.names):
+                # a typing-only definition: annotations that are never evaluated are all that
+                # mention it, so only the import itself can go wrong
+                plan.notes.append("unobserved %s:%d: %d -> 0" % (rel, lo, bin(mask).count("1")))
+                plan.add("mod", rel, lo, hi, 0)
+                _import_guard(plan, rel, c, everyone, 0)
+                continue
+            if c.names and any(n.startswith("__") for n in c.names):
+                # __slots__, __all__, __init_subclass__ ...: read by Python while it builds the
+                # class or module, with effects no reader index knows about
+                plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel) | mask)
+                continue
+            if mask and c.calls and c.header and REFINE_HEADERS and rel.startswith("sqlglot/"):
                 flo, fhi = c.calls
-                if c.header == "annotations":
+                if c.header in ("annotations", "stub"):
                     callers = 0
                 else:
                     callers = None if maps.ran_at_import(rel, flo, fhi) else maps.func(rel, flo, fhi)
@@ -942,7 +946,9 @@ def _renamed_users(maps, base, rel, c, callers):
                 continue
             if maps.ran_at_import(f, line, line):
                 return None
-            callers |= maps.mod(f, line, line)
+            # (a line that only reads the name - to store the function, to pass it on - fails
+            # without entering it: every test that runs a line naming it counts)
+            callers |= maps.mod(f, line, line) | maps.func(f, line, line)
     return callers
 
 

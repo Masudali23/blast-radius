@@ -201,7 +201,8 @@ class Differ:
                     if ch.level == "mod" and not ch.coarse:
                         ch.calls = _span(o)
             elif len(self.changes) > start and not isinstance(scope, FUNC_SCOPES):
-                kind = _header_only(o, n)
+                others = [st for st in getattr(scope, "body", ()) if st is not o and isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == o.name]
+                kind = _header_only(o, n, (len(others), any(st.lineno > o.lineno for st in others)))
                 if kind not in ("annotations", "signature") and (o.name.startswith("__") or n.name.startswith("__")):
                     kind = None  # (Python itself calls these, and not only by entering them)
                 if kind:
@@ -430,7 +431,7 @@ def _added_defs(olist, nlist, module=False):
 
     def plain(n):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return None if n.decorator_list else n.name
+            return None if n.decorator_list or _header_work(n) else n.name
         if not module:
             return None
         if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and _literal(n.value):
@@ -463,7 +464,7 @@ def _added_defs(olist, nlist, module=False):
         if binds is None:
             return None
         for name in binds if isinstance(binds, tuple) else (binds,):
-            if name == "*" or name in taken or name.startswith("__") or name.endswith("_sql") or name.startswith("test"):
+            if name == "*" or name in taken or by_pattern(name):
                 return None
             taken.add(name)
         added.append((anchor, binds))
@@ -472,10 +473,80 @@ def _added_defs(olist, nlist, module=False):
     return pairs, added
 
 
-def _header_only(o, n):
-    """How two versions of a def differ outside the body: in their decorators only
-    ("decorators"), in their name only (("name", old, new)), or - when neither has decorators -
-    in annotations only ("annotations") or otherwise in arguments ("signature").  Else None."""
+# Decorators that leave a function to be found and entered as before: what one of them changes
+# is seen only by a test that enters the function (a wrapper that can answer without calling
+# it - a cache, a null check - is not one of these).
+TRANSPARENT = frozenset(("overload", "unsupported_args", "staticmethod", "classmethod", "property", "abstractmethod", "final"))
+ACCESSORS = ("setter", "getter", "deleter")
+_HOOKS = []
+
+
+def _deco_name(d):
+    if isinstance(d, ast.Call):
+        d = d.func
+    if isinstance(d, ast.Attribute):
+        return d.attr
+    return d.id if isinstance(d, ast.Name) else None
+
+
+def by_pattern(name):
+    """A name that Python, the test runner or sqlglot may look up by its shape or through a
+    base class instead of by being written out somewhere."""
+    if name.startswith("__") or name.endswith("_sql") or name.startswith(("test", "visit_", "pytest_")):
+        return True
+    if not _HOOKS:
+        import abc, argparse, collections, collections.abc as cabc, enum, json, logging, threading, typing, unittest
+
+        names = set()
+        for cls in (
+            object, type, abc.ABCMeta, enum.EnumMeta, typing.Generic, typing.Protocol,
+            dict, list, set, frozenset, tuple, str, bytes, int, float, Exception, unittest.TestCase, enum.Enum, enum.Flag,
+            cabc.Mapping, cabc.MutableMapping, cabc.Sequence, cabc.MutableSequence, cabc.Set, cabc.MutableSet, cabc.Iterator, cabc.Generator,
+            collections.OrderedDict, collections.defaultdict, collections.UserDict, collections.UserList, collections.Counter,
+            logging.Handler, logging.Formatter, logging.Filter, logging.Logger, threading.Thread, json.JSONEncoder, json.JSONDecoder,
+            argparse.Action, argparse.ArgumentParser, ast.NodeVisitor, ast.NodeTransformer,
+        ):
+            names.update(dir(cls))
+        _HOOKS.append(frozenset(names))
+    return name in _HOOKS[0]
+
+
+def _header_work(node):
+    """What a def's arguments and result annotation do when the def statement runs, beyond
+    reading names: calls and the like, as text."""
+    out = set()
+    for part in [node.args] + ([node.returns] if node.returns is not None else []):
+        for sub in ast.walk(part):
+            if isinstance(sub, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                out.add(ast.dump(sub))
+    return out
+
+
+def _lazy_body(node):
+    """A generator or coroutine: calling it runs no line of its body."""
+    if isinstance(node, ast.AsyncFunctionDef):
+        return True
+    stack = list(node.body)
+    while stack:
+        x = stack.pop()
+        if isinstance(x, (ast.Yield, ast.YieldFrom)):
+            return True
+        if not isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            stack.extend(ast.iter_child_nodes(x))
+    return False
+
+
+def _header_only(o, n, twins=(0, False)):
+    """How two versions of a def differ outside the body.  `twins`: (how many other defs in the
+    same body have its name, whether one of them comes later).
+
+      "decorators"         only transparent decorators came, went or changed
+      "stub"               ... on a typing overload that a later def of the same name replaces
+      ("name", old, new)   only the name
+      "annotations"        only annotations of arguments or of the result
+      "signature"          undecorated, and the arguments differ in another way
+      None                 anything else, and whatever is not safe to narrow
+    """
 
     def part(node, f):
         v = getattr(node, f, None)
@@ -483,25 +554,45 @@ def _header_only(o, n):
             return ast.dump(ast.Tuple(elts=list(v), ctx=ast.Load()))
         return ast.dump(v) if v is not None else ""
 
-    same = {f: part(o, f) == part(n, f) for f in ("decorator_list", "args", "returns", "type_params")}
     if type(o) is not type(n):
         return None
+    same = {f: part(o, f) == part(n, f) for f in ("decorator_list", "args", "returns", "type_params")}
+    names = [_deco_name(d) for d in o.decorator_list]
     if not (same["args"] and same["returns"]):
-        # annotations are never looked at by the code under test (nothing asks for a function's
-        # type hints); an undecorated function whose annotations alone changed is the same
-        # function, provided the module still loads
-        if o.name == n.name and same["decorator_list"] and same["type_params"] and not o.decorator_list:
-            # ... and one that takes other arguments, or has other defaults, is noticed where
-            # it is called (nothing wraps it or reads its signature when it has no decorator)
-            return "annotations" if _bare_args(o.args) == _bare_args(n.args) else "signature"
-        return None
+        if o.name != n.name or not same["decorator_list"] or not same["type_params"]:
+            return None
+        if _header_work(n) - _header_work(o):
+            return None  # a new default or annotation that does something when the def runs
+        if _bare_args(o.args) == _bare_args(n.args):
+            # annotations are never looked at by the code under test (nothing asks for a
+            # function's type hints, and none of these decorators does)
+            return "annotations" if all(x in TRANSPARENT or x in ACCESSORS for x in names) else None
+        # other arguments or defaults: noticed where the function is called (nothing wraps it
+        # or reads its signature when it has no decorator)
+        return "signature" if not names and not twins[0] and not _lazy_body(o) and not _lazy_body(n) else None
     if not same["type_params"]:
         return None
-    if "cache" in part(o, "decorator_list").lower() or "cache" in part(n, "decorator_list").lower():
-        return None  # a cached function is not entered by every test that uses it
     if o.name == n.name:
-        return None if same["decorator_list"] else "decorators"
-    return ("name", o.name, n.name) if same["decorator_list"] else None
+        if same["decorator_list"]:
+            return None
+        old, new = [ast.dump(d) for d in o.decorator_list], [ast.dump(d) for d in n.decorator_list]
+        gone = [d for d in o.decorator_list if ast.dump(d) not in new]
+        come = [d for d in n.decorator_list if ast.dump(d) not in old]
+        changed = [_deco_name(d) for d in gone + come]
+        if not changed or any(x not in TRANSPARENT for x in changed):
+            return None
+        if any(_deco_name(d) == "property" for d in come):
+            return None  # merely reading the attribute would now run the function
+        if any(_deco_name(d) in ACCESSORS for d in o.decorator_list + n.decorator_list):
+            return None
+        if twins[0]:
+            return "stub" if twins[1] and all(x == "overload" for x in changed) else None
+        return "decorators"
+    if not same["decorator_list"] or twins[0] or any(x not in TRANSPARENT for x in names):
+        return None
+    if by_pattern(o.name) or by_pattern(n.name):
+        return None
+    return ("name", o.name, n.name)
 
 
 def _defaults_only(o, n):

@@ -185,6 +185,12 @@ CLEAN_FEW = int(os.environ.get("BR_CLEAN_FEW", "0"))
 # together (on the practice set the one stop that lets go of one or two candidates saves 0.8 s
 # or more; the wrong ones above let go of 0.1 to 0.3 s)
 CLEAN_REST = float(os.environ.get("BR_CLEAN_REST", "0"))
+# ... the larger allowance of CLEAN_STOP_MOD only takes candidates estimated at no more than
+# this many seconds each (0: any), and with CLEAN_REST_MOD=1 the rule above is for those
+# commits only.  (On the practice set the two such stops leave heavy candidates behind: more
+# than 0.7 s together, so neither rule runs anything more there.)
+CLEAN_MOD_ITEM = float(os.environ.get("BR_CLEAN_MOD_ITEM", "0"))
+CLEAN_REST_MOD = os.environ.get("BR_CLEAN_REST_MOD", "0") == "1"
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
@@ -1153,16 +1159,16 @@ class Selector:
                 near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
                 first, spent = [], 0.0
                 budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
-                if "mod" in plan.kinds and not plan.fresh:
-                    budget = max(budget, CLEAN_STOP_MOD * 1000)
+                warm_mod = "mod" in plan.kinds and not plan.fresh
+                more = max(budget, CLEAN_STOP_MOD * 1000) if warm_mod else budget
                 order = sorted(cheap + costly, key=lambda it: (near(it[0]), it[2], it[0]))
                 for item in order:
-                    if spent >= budget:
+                    if spent >= more or (spent >= budget and CLEAN_MOD_ITEM > 0 and item[2] > CLEAN_MOD_ITEM * 1000):
                         break
                     first.append(item)
                     spent += item[2]
                 left = order[len(first):]
-                if left and ((CLEAN_FEW > 0 and len(left) <= CLEAN_FEW) or (CLEAN_REST > 0 and sum(it[2] for it in left) <= CLEAN_REST * 1000)):
+                if left and ((CLEAN_FEW > 0 and len(left) <= CLEAN_FEW) or (CLEAN_REST > 0 and (warm_mod or not CLEAN_REST_MOD) and sum(it[2] for it in left) <= CLEAN_REST * 1000)):
                     first = order
             if first:
                 failed, rest = run(first, STOP_FIRST)
