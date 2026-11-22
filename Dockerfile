@@ -19,7 +19,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BR_CLEAN_MIN=0.1 \
     BR_FAST_SIMPLE=3 \
     BR_FIRST_N=1 \
-    BR_LIGHT_RATIO=0.3
+    BR_LIGHT_RATIO=0.3 \
+    BR_DIAG=1
 
 # The labelling environment's packages, from PyPI.
 COPY requirements.lock /app/requirements.lock

@@ -171,6 +171,7 @@ CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
 # ("2": lines may be added or removed as well, as long as none of them is such a line;
 # "3": lines may only be added, and only around a statement that leaves its block)
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 FLOW = ("return", "raise", "continue", "break", "pass")
 HUNK_HEAD = re.compile(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
@@ -1130,6 +1131,7 @@ class Selector:
                         dbg["stopped"] = len(cheap) + len(costly) - len(first)
                         taken = {it[0] for it in first}
                         st["let_go"] = [it[0] for it in cheap + costly if it[0] not in taken]
+                        dbg["stopped_est"] = int(sum(it[2] for it in cheap + costly if it[0] not in taken))
                         costly = []
                     else:
                         taken = {it[0] for it in first}
@@ -1543,6 +1545,42 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  The commits whose first tests all passed and whose other candidates
+        were let go unseen, by how many were let go:
+          a  commits with 1 or 2 let go         b  their estimated seconds, in twentieths, rounded up
+          c  commits with 3 to 6 let go         d  their estimated seconds, in tenths, rounded up
+        each cut to 0..16 and written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of
+        recorded test time on one worker of the first commit that selects nothing."""
+        ms = self.ms
+        a = c = 0
+        few = some = 0
+        for dbg in self.debug.values():
+            n = dbg.get("stopped")
+            if not n:
+                continue
+            if n <= 2:
+                a += 1
+                few += dbg.get("stopped_est", 0)
+            elif n <= 6:
+                c += 1
+                some += dbg.get("stopped_est", 0)
+        a, c = min(16, a), min(16, c)
+        b = min(16, (few + 49) // 50)
+        d = min(16, (some + 99) // 100)
+        want = 1 + a + 17 * b + 289 * c + 4913 * d
+        log("account: few %d est %d some %d est %d -> %d" % (a, few, c, some, want))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1552,6 +1590,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1568,6 +1607,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         if PHASES:
