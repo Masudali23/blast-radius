@@ -10,6 +10,9 @@ on:
       kinds:
         description: kinds of change, separated by spaces (empty - the sample's mix)
         default: ""
+      env:
+        description: settings for the selector, as NAME=VALUE separated by spaces
+        default: ""
 jobs:
   shard:
     runs-on: ubuntu-latest
@@ -28,6 +31,7 @@ jobs:
           docker run --rm --platform linux/amd64 --user 0:0 \
             --volume $PWD:/src:ro --volume $PWD/out:/out \
             --env PYTHONDONTWRITEBYTECODE=1 --env SKIP_INTEGRATION=0 \
+            $(for e in ${{ inputs.env }}; do echo --env $e; done) \
             blast-radius-entry python /src/tools/validation/ci_shard.py /src /out ${{ inputs.seed }} ${{ inputs.count }} ${{ matrix.shard }} 20 ${{ inputs.kinds }}
       - uses: actions/upload-artifact@v4
         with:
