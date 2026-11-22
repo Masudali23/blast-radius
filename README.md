@@ -157,6 +157,15 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
+- **The rest of a function's header** (`br/analyze.py`, `BR_REFINE_HEADERS`): the same holds
+  when a function lost, gained or changed a decorator, was given another name, or takes other
+  arguments: a test that never entered it does not notice. A renamed function also counts the
+  tests that run, while modules load, a line mentioning the old name (an import of it, a table
+  that refers to it). Changed annotations alone reach no test at all, and neither does a new
+  undecorated function (or module-level constant) whose name appears nowhere else. Not used
+  when the function ran while modules were loading, for cached functions, for special methods
+  (decorators and names), or for names that are looked up by pattern (`..._sql`). The import
+  check below still applies: if the patched module no longer loads, everyone is selected.
 - **Reading only what changed** (`br/lean.py`): most of a module is functions a patch does
   not touch. When every changed line sits inside the body of one function, two small texts
   stand in for the two versions of the file (line numbers stay put): the module's imports, a
@@ -204,6 +213,10 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **A failure after the early stop**: when the first tests pass, the rest is let go, and a
   costly or slow test that is still looked at then fails, the commit is not clean after all:
   the candidates that were let go are selected.
+- **A test that runs out of time**: the worker stops there and what is left stays selected
+  unchecked. The slow executor test among them still gets its look (`BR_LOOK_CUT`), in a new
+  worker with a short limit: on labelled patches it passes and is rightly let go in half of
+  those cases, and hangs like the rest in the other half.
 - **A pool that breaks**: the optimizer tests share one process pool for the whole class. When
   a change makes a task's answer unreadable for the parent process, the real pool is broken
   for good and every test of the class that uses it later in the run fails, whatever the
