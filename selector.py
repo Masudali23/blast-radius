@@ -137,6 +137,10 @@ DUMP = os.environ.get("BR_DUMP", "0") == "1"
 # break nothing and the candidates left are not selected.  A slow fixture-driven test is
 # still settled by its own sample.
 CLEAN_STOP = float(os.environ.get("BR_CLEAN_STOP", "0"))
+# A slow test that runs out of the time we give it has not been seen to fail.  "fail": it is
+# selected all the same (a test that hangs fails); "pass": it is taken to be merely slower
+# than it was, and let go.
+SLOW_TIMEOUT = os.environ.get("BR_SLOW_TIMEOUT", "fail")
 # ... but never fewer than this share of what all of them are estimated to cost, nor fewer
 # than this many seconds
 CLEAN_FRAC = float(os.environ.get("BR_CLEAN_FRAC", "0.5"))
@@ -843,7 +847,7 @@ class Selector:
             return likely, "unseen"
 
         lane = self.get_lane()
-        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}, "undecided": set(), "note": {}}
+        st = {"mode": lane.fresh_mode(plan.files) if plan.fresh else "full", "open": False, "evals": 0, "differ": 0, "probed": False, "cpu": 0, "ran": 0, "cut": None, "planned": 0.0, "outcome": {}, "undecided": set(), "note": {}, "slow_out": set()}
 
         def install():
             lane.ensure(st["mode"])
@@ -852,7 +856,8 @@ class Selector:
 
         def run(items, stop_on_fail, patience=5.0):
             if st["cut"]:
-                return [], [n for n, _, _ in items]  # the child gave up earlier: do not run more
+                # the child gave up earlier: do not run more
+                return [], [n for n, _, _ in items if n not in st["slow_out"]]
             jobs = [(self.id_of[n], max(1.5, patience * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in items]
             # total CPU this commit may burn: generous against the estimate, but bounded
             st["planned"] += sum(e * self.slack.get(n, 1.0) for n, _, e in items) / 1000.0
@@ -895,9 +900,17 @@ class Selector:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1), r[2], r[3]))
                     st["evals"] += r[2]
                     st["differ"] += r[3]
+                    if r[0] == "F" and st["note"][n] == "timeout" and ms[n] > HEAVY * 1000:
+                        dbg.setdefault("slow_timeout", []).append(n)
+                        if SLOW_TIMEOUT == "pass":
+                            st["slow_out"].add(n)
+                            st["outcome"][n] = "P"
+                            continue
                     if r[0] == "F":
                         failed.append(n)
                         dbg.setdefault("failed", []).append(self.id_of[n])
+            if st["slow_out"]:
+                unseen = [n for n in unseen if n not in st["slow_out"]]
             return failed, unseen
 
         def cost_of(numbers):
@@ -908,6 +921,8 @@ class Selector:
             part on a short leash: "F" when a part fails, "U" when one takes much longer than
             it should or the test cannot be run this way, "P" when every part passed.
             `first`: what the first part said, when it has been run (and passed) already."""
+            if n in st["slow_out"]:
+                return "P"
             sv = sv or self.sample_variant(plan, n)
             if sv is None:
                 return "U"
@@ -920,6 +935,8 @@ class Selector:
                     note = first
                 else:
                     f3, u3 = run([(n, variant, est)], False, patience=1.8)
+                    if n in st["slow_out"]:
+                        return "P"
                     if f3:
                         return "F"
                     if u3:
@@ -934,6 +951,8 @@ class Selector:
                     # cheapest tells little: weigh the others instead
                     st["planned"] += rest[1] / 1000.0
                     f3, u3 = run([(n, rest[0], rest[1])], False, patience=1.8)
+                    if n in st["slow_out"]:
+                        return "P"
                     dbg.setdefault("weighed", []).append((n, "F" if f3 else "U" if u3 else "P", st["note"].get(n, "")))
                     return "F" if f3 else "U" if u3 else "P"
             return "P"
@@ -1241,6 +1260,9 @@ class Selector:
             for i, (n, v, e) in enumerate(to_run):
                 r = results.get(i)
                 bad = r is None or r[0] in ("F", "U")
+                if r is not None and r[0] == "F" and len(r) > 4 and r[4] == "timeout" and ms[n] > HEAVY * 1000:
+                    dbg.setdefault("slow_timeout", []).append(n)
+                    bad = SLOW_TIMEOUT != "pass"
                 outcome[n] = "F" if bad else "P"
                 if n in sampled:
                     continue  # a sample, not the whole test: settled with its bundle below

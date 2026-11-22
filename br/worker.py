@@ -621,6 +621,7 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
             except TestTimeout:
                 outcome = "F"
                 timed_out = True
+                runner.note = "timeout"  # (not seen to fail: it ran out of time)
             except BaseException:
                 outcome = "F"
             finally:
