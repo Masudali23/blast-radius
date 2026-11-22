@@ -804,8 +804,9 @@ class Selector:
                         if any(a in other for a in attrs):
                             elsewhere = True
                             break
-                tree = ast.parse(text)
-                by_text = any(
+                # (the file is only parsed when the answer can still be a list of spans)
+                tree = ast.parse(text) if attrs and not elsewhere else None
+                by_text = tree is None or any(
                     (isinstance(node, ast.Name) and node.id in ("getattr", "setattr", "delattr", "vars", "dir", "eval", "exec", "globals", "locals"))
                     or (isinstance(node, ast.Attribute) and node.attr in ("__dict__", "__getattribute__"))
                     for node in ast.walk(tree)
@@ -1127,6 +1128,8 @@ class Selector:
                     if not failed and not rest and not st["cut"]:
                         # everything looked at passes: the others are let go unseen
                         dbg["stopped"] = len(cheap) + len(costly) - len(first)
+                        taken = {it[0] for it in first}
+                        st["let_go"] = [it[0] for it in cheap + costly if it[0] not in taken]
                         costly = []
                     else:
                         taken = {it[0] for it in first}
@@ -1359,6 +1362,16 @@ class Selector:
             else:
                 selected = failed + kept
                 unverified = kept
+            if failed and st.get("let_go"):
+                # The early stop took the commit for clean and let its other candidates go; a
+                # test that was run afterwards (a costly one, a slow one's sample) has failed, so
+                # it is not: they are selected after all.
+                chosen = set(selected)
+                back = [n for n in st["let_go"] if n not in chosen]
+                if back:
+                    dbg["stop_undone"] = len(back)
+                    selected = selected + back
+                    unverified = list(unverified) + back
             if how is None:
                 how = "fail" if failed else "clean"
         finally:
@@ -1380,13 +1393,14 @@ class Selector:
         keep = set(everything)
         by_n = {it[0]: it for it in items}
         to_run = []
+        current = split(sorted(keep), ms)[1]  # (the bill of what is kept; follows `keep`)
         for n in sorted(everything, key=lambda n: -ms[n])[:12]:
             est = by_n[n][2]
-            current = split(sorted(keep), ms)[1]
             without = split(sorted(keep - {n}), ms)[1]
             if est < P_PASS_CLEAN * (current - without):
                 to_run.append(by_n[n])
                 keep.discard(n)
+                current = without
         # A slow test that weighs on the bill can still be settled through the tests closest to
         # it (same test file / same fixture file): run those and a sample of the slow test.
         bundles = []  # (slow test, its related tests, its sample)
@@ -1395,7 +1409,7 @@ class Selector:
             for n in sorted(keep, key=lambda n: -ms[n])[:4]:
                 if by_n[n][2] <= HEAVY * 1000:
                     continue
-                gain = split(sorted(keep), ms)[1] - split(sorted(keep - {n}), ms)[1]
+                gain = current - split(sorted(keep - {n}), ms)[1]
                 rel_mask = self.related_mask(n)
                 related = [by_n[m] for m in everything if m != n and by_n[m][2] <= HEAVY * 1000 and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
                 pn, pv, pe = self.slice_probe(plan, n)

@@ -80,7 +80,8 @@ def pack(stored):
                     for value in row:
                         if type(value) not in (str, int, float, type(None)):
                             return stored
-                        cells.append(seen.setdefault(_cell_key(value), value))
+                        # (a NaN stays its own object: containers compare by identity first)
+                        cells.append(value if value != value else seen.setdefault(_cell_key(value), value))
                     new_rows.append(tuple(cells))
                 shared[attr][name] = (tuple(columns), new_rows)
         blob = marshal.dumps(shared)
