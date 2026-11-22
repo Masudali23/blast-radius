@@ -154,6 +154,8 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 # ... and only for a change inside function bodies, or of a class-level value whose readers are
 # known (on labelled patches the other kinds have little to save and fail late more often)
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
+# ... and never when there are no more than this many of them: they are all run
+CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
 T0 = time.monotonic()
 
 
@@ -971,7 +973,7 @@ class Selector:
             failed = []
             kept = []  # cheap candidates left selected without being run
             first = cheap
-            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly) and (CLEAN_ANY or self.plain_kind(plan)):
+            if CLEAN_STOP > 0 and STOP_FIRST and (cheap or costly) and (CLEAN_ANY or self.plain_kind(plan)) and len(cheap) + len(costly) > CLEAN_SMALL:
                 near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
                 first, spent = [], 0.0
                 budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
