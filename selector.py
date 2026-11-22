@@ -1172,6 +1172,9 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        if os.environ.get("BR_WARM") == "1":
+            # measuring only: start the whole worker chain although no test will be run
+            self.get_lane().ensure("full")
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:

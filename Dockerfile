@@ -39,5 +39,7 @@ RUN python -m compileall -q /app/repo/sqlglot /app/repo/tests /app/repo/sqlglotc
     && (python -m compileall -q -j 4 "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" || true) \
     && chmod -R a+rX /app
 
+# measuring build: plans every commit, starts the workers, runs no test (every candidate is selected)
+ENV BR_SOFT=0 BR_WARM=1
 WORKDIR /app
 CMD ["python", "/app/selector.py"]
