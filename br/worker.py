@@ -840,10 +840,11 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         signal.signal(signal.SIGALRM, _kill)
         signal.setitimer(signal.ITIMER_REAL, job.get("deadline", 60.0), 1.0)
         try:
-            _, status = os.waitpid(pid, 0)
+            _, status, used = os.wait4(pid, 0)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        os.write(out_fd, ("END %d\n" % (-9 if killed else status)).encode())
+        # (with the CPU the child used in all, for the caller's own accounts)
+        os.write(out_fd, ("END %d %d\n" % (-9 if killed else status, int((used.ru_utime + used.ru_stime) * 1000))).encode())
 
 
 def main():

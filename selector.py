@@ -109,6 +109,10 @@ WEIGH_MIXED = os.environ.get("BR_WEIGH_MIXED", "0") == "1"
 ONLY_SEEN = os.environ.get("BR_ONLY_SEEN", "0") == "1"
 # ... provided at least this many other candidates actually ran and passed
 MIN_CLEAN = int(os.environ.get("BR_MIN_CLEAN", "5"))
+# measuring build: where the CPU of a batch goes, told through the selection of one commit
+# that would otherwise select nothing (see Selector.account)
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
+TRACE = bool(DEBUG) or DIAG
 T0 = time.monotonic()
 
 
@@ -323,7 +327,7 @@ class Selector:
                 if r is not None:
                     ran += 1
                     cpu_ms += r[1]
-                    if DEBUG:
+                    if TRACE:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], -1))
         dbg["mode"] = mode
         dbg["ran"] = ran
@@ -801,7 +805,7 @@ class Selector:
                     st["cpu"] += r[1]
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
-                    if DEBUG:
+                    if TRACE:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1)))
                     st["evals"] += r[2]
                     st["differ"] += r[3]
@@ -1095,6 +1099,8 @@ class Selector:
             dbg["ran"] = len(results)
             dbg["cpu_ms"] = sum(r[1] for r in results.values())
             dbg["mode"] = mode
+            if TRACE:
+                dbg["tests"] = [(n, results[i][1], int(e), results[i][0], -1) for i, (n, v, e) in enumerate(to_run) if results.get(i) is not None]
         finally:
             lane.overlay.restore()
         return sorted(keep) + back + likely, "broad-blind"
@@ -1163,6 +1169,59 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  Shares of the CPU the test children used, in sixteenths:
+          a  runs of the slow tests (recorded time over HEAVY), wherever they happened
+          b  commits where nothing failed (the rest of what their children used)
+          c  commits whose candidates were selected unseen ("broad-blind"), likewise
+          d  commits with failures: the other tests run up to and including the first failure
+        (what is left: commits with failures, after the first one, and everything else).
+        They are written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on
+        one worker of the first commit that selects nothing.  The share of the single most
+        expensive commit, in sixteenths, is spent as that many times 1.5 s of CPU here."""
+        ms = self.ms
+        total = a = b = c = d = top = 0
+        for dbg in self.debug.values():
+            used = dbg.get("child_ms") or 0
+            total += used
+            top = max(top, used)
+            runs = dbg.get("tests") or []
+            slow = sum(r[1] for r in runs if ms[r[0]] > HEAVY * 1000)
+            a += slow
+            how = dbg.get("how")
+            if how in ("clean", "heavy-kept", "heavy-dropped"):
+                b += max(0, used - slow)
+            elif how == "broad-blind":
+                c += max(0, used - slow)
+            elif how == "fail":
+                for r in runs:
+                    if ms[r[0]] > HEAVY * 1000:
+                        continue
+                    d += r[1]
+                    if r[3] == "F":
+                        break
+        if total <= 0:
+            return
+
+        def q(x):
+            return min(16, int(16.0 * x / total + 0.5))
+
+        want = 1 + q(a) + 17 * q(b) + 289 * q(c) + 4913 * q(d)
+        log("account: total %d ms a %d b %d c %d d %d top %d -> %d" % (total, a, b, c, d, top, want))
+        chosen, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                chosen.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(chosen)]
+                    break
+        stop = time.process_time() + 1.5 * q(top)
+        while time.process_time() < stop:
+            sum(range(20000))
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1172,12 +1231,15 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
                 with open(path, "rb") as fh:
                     data = fh.read()
+                before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
                 selected = self.decide(commit, data)
+                self.debug[commit]["child_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             except Exception as e:  # never lose a commit: fall back to running everything
                 log("commit %s: %r -> selecting all" % (commit, e))
                 selected = list(self.all_numbers)
@@ -1185,6 +1247,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         for lane in (self.lane, self.lane2):
