@@ -163,7 +163,14 @@ CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
 # touches a def, class, import, decorator or except line, is handled without them.
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0") == "1"
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
+# measuring build: why patches do not count as single-line replacements, told through the
+# selection of one commit that would otherwise select nothing (see Selector.account)
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 T0 = time.monotonic()
+
+
+def collections_counter():
+    return {}
 
 
 def log(*a):
@@ -1445,6 +1452,95 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    @staticmethod
+    def why_not_simple(data):
+        """The reasons a patch is not a single-line replacement: a set of
+        "count" (Python lines added or removed), "def", "class", "import", "decorator",
+        "except" (such a line is among the changed ones), "file" (a file added or removed)."""
+        text = data.decode("utf-8", "replace")
+        why = set()
+        state = {"file": None, "minus": [], "plus": []}
+
+        def close():
+            if state["file"] and state["file"].endswith(".py"):
+                minus = [x for x in state["minus"] if x.strip() and not x.lstrip().startswith("#")]
+                plus = [x for x in state["plus"] if x.strip() and not x.lstrip().startswith("#")]
+                if len(minus) != len(plus):
+                    why.add("count")
+                for x in minus + plus:
+                    t = x.strip()
+                    if t.startswith(("def ", "async def ")):
+                        why.add("def")
+                    elif t.startswith("class "):
+                        why.add("class")
+                    elif t.startswith(("import ", "from ")):
+                        why.add("import")
+                    elif t.startswith("@"):
+                        why.add("decorator")
+                    elif t.startswith("except"):
+                        why.add("except")
+            state["minus"], state["plus"] = [], []
+
+        for line in text.splitlines():
+            if line.startswith("+++ "):
+                close()
+                name = line[4:].strip()
+                if name == "/dev/null":
+                    why.add("file")
+                state["file"] = name[2:] if name.startswith("b/") else name
+            elif line.startswith("--- "):
+                if line[4:].strip() == "/dev/null":
+                    why.add("file")
+            elif line.startswith("@@"):
+                close()
+            elif line.startswith("-"):
+                state["minus"].append(line[1:])
+            elif line.startswith("+"):
+                state["plus"].append(line[1:])
+            elif line.startswith(("rename ", "new file", "deleted file", "similarity ", "Binary ")):
+                why.add("file")
+        close()
+        return sorted(why)
+
+    def account(self, lines):
+        """Measuring build.  How many patches are not single-line replacements, by reason:
+          a  Python lines added or removed
+          b  a def line changed
+          c  c1 + 5 c2: a class line (c1, at most 4), an import line (c2, at most 2)
+          d  d1 + 5 d2: a decorator line (d1, at most 4), an except line or a file added or
+             removed (d2, at most 2)
+        written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
+        worker of the first commit that selects nothing.  The number of such patches that had
+        candidate tests is spent as that many seconds of CPU here (at most 20)."""
+        ms = self.ms
+        count = collections_counter()
+        busy = 0
+        for dbg in self.debug.values():
+            why = dbg.get("why") or []
+            for w in why:
+                count[w] = count.get(w, 0) + 1
+            if why and (dbg.get("ncand") or 0) > 0:
+                busy += 1
+        a = min(16, count.get("count", 0))
+        b = min(16, count.get("def", 0))
+        c = min(4, count.get("class", 0)) + 5 * min(2, count.get("import", 0))
+        d = min(4, count.get("decorator", 0)) + 5 * min(2, count.get("except", 0) + count.get("file", 0))
+        want = 1 + a + 17 * b + 289 * c + 4913 * d
+        log("account: %s busy %d -> %d" % (dict(count), busy, want))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+        stop = time.process_time() + 1.0 * min(20, busy)
+        while time.process_time() < stop:
+            sum(range(20000))
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1454,6 +1550,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1470,6 +1567,15 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+            if DIAG:
+                self.debug.setdefault(commit, {})["why"] = self.why_not_simple(data)
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         for lane in (self.lane, self.lane2):
