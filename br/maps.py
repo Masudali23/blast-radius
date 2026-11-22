@@ -167,7 +167,17 @@ class Maps:
 
     def dict_users(self, name, key):
         """Tests that look `key` up (key "*": read the whole dict) in a class-level dict `name`."""
-        return self._dicts()["users"].get("%s\t%s" % (name, key), 0)
+        d = self._dicts()
+        if d.get("layout") == 2:
+            # (one packed table per dict name, opened when that name is first asked about)
+            users = d["users"]
+            part = users.get(name)
+            if part is None:
+                return 0
+            if type(part) is bytes:
+                part = users[name] = pickle.loads(zlib.decompress(part))
+            return part.get(key, 0)
+        return d["users"].get("%s\t%s" % (name, key), 0)
 
     def dict_callers(self, name, key):
         """Tests that invoke the callable stored under `key`; None if that entry is not a callable."""
@@ -252,12 +262,20 @@ class Maps:
                     self._relsl = pickle.loads(zlib.decompress(fh.read()))
         return self._relsl
 
+    def _relslice(self, test_id):
+        """One test's record; packed records are opened when first asked for."""
+        table = self._relslices()
+        d = table.get(test_id)
+        if type(d) is bytes:
+            d = table[test_id] = pickle.loads(zlib.decompress(d))
+        return d
+
     def entry_relation(self, test_id, rel, key):
         """For a sliced test: the fixture entries (bit mask, slice-map order) in which the
         comparison at `key` can behave differently under its partner operator: those in which
         the two disagreed, and those the tracer did not see evaluate it at all.  None when the
         test's entries were not recorded.  (tools/trace_rel_slices_one.py)"""
-        d = self._relslices().get(test_id)
+        d = self._relslice(test_id)
         if d is None:
             return None
         site = rel + "|" + key
@@ -269,7 +287,7 @@ class Maps:
         """For a sliced test: ([(kind, vector, entries)], entries to keep regardless, [(kind,
         vector)] evaluated before any entry ran) for the condition at `key`, or None when the
         test's entries were not recorded or an evaluation before them did not finish."""
-        d = self._relslices().get(test_id)
+        d = self._relslice(test_id)
         if d is None:
             return None
         site = rel + "|" + key
@@ -286,7 +304,7 @@ class Maps:
         how ("classes": instantiate the class at that "file:line"; "attr_reads": read the
         constant "class\tNAME"; "dict_keys": look up "NAME\tkey"; "dict_calls": invoke the
         callable stored there).  None when the test's entries were not recorded."""
-        d = self._relslices().get(test_id)
+        d = self._relslice(test_id)
         use = d.get("use") if d else None
         if not use:
             return None
@@ -303,7 +321,7 @@ class Maps:
         also means None; a caller that only asks who enters a function turns that off (its
         `def` line always runs then)."""
         sm = self.slices(test_id)
-        d = self._relslices().get(test_id)
+        d = self._relslice(test_id)
         if sm is None or d is None or "setup_lines" not in d:
             return None
         if self._index_of is None:
@@ -338,7 +356,7 @@ class Maps:
     def setup_runs(self, test_id, rel, line):
         """Does the class set-up of a sliced test run this function line?  (False when the
         set-up was not recorded.)"""
-        d = self._relslices().get(test_id)
+        d = self._relslice(test_id)
         return bool(d) and line in d.get("setup_lines", {}).get(rel, ())
 
     def made_while_loading(self, cls_keys):
