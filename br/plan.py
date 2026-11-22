@@ -416,7 +416,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 # a new import of standard library modules: seen by nobody when this file does
                 # not use the names it binds and no module takes all of this one's names
                 everyone = maps.imports.get(rel, 0) | maps.any_line(rel)
-                if REFINE_HEADERS and _names_free(base, maps, rel, c.header[1]):
+                if REFINE_HEADERS and os.path.basename(rel) != "__init__.py" and _names_free(base, maps, rel, c.header[1]):
                     plan.notes.append("header-narrowed %s:%d import: %d -> 0" % (rel, lo, bin(everyone).count("1")))
                     plan.add("mod", rel, lo, hi, 0)
                     _import_guard(plan, rel, c, everyone, 0)
@@ -466,6 +466,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     callers = None if maps.ran_at_import(rel, flo, fhi) else maps.func(rel, flo, fhi)
                 if callers is not None and isinstance(c.header, tuple):
                     callers = _renamed_users(maps, base, rel, c, callers)
+                if callers is not None and c.header == "wrapped":
+                    # (`unsupported_args` can raise before the method is entered, when the
+                    # generator is told to raise at once: whoever got such an error counts -
+                    # and for those no fixture entry can be told apart from another)
+                    callers |= _raisers(maps, base)
                 if callers is not None:
                     # A function that only lost, gained or changed a decorator, or got another
                     # name: nothing called it while modules were loading, so a test that never
@@ -896,15 +901,39 @@ def _all_of(factors):
     return entries
 
 
+_RAISERS = []
+
+
+def _raisers(maps, base):
+    """Tests in which the generator raised an unsupported-feature error on the spot."""
+    if not _RAISERS:
+        mask = 0
+        rel = "sqlglot/generator.py"
+        data = _read(base, rel)
+        if data is None:
+            mask = maps.imports.get(rel, 0) | maps.any_line(rel)
+        else:
+            for i, line in enumerate(data.decode("utf-8", "replace").split("\n"), 1):
+                if "raise UnsupportedError(" in line:
+                    mask |= maps.func(rel, i, i)
+        _RAISERS.append(mask)
+    return _RAISERS[0]
+
+
 def _names_free(base, maps, rel, names):
-    """True when none of `names` is written in file `rel` and no file imports `*` from it."""
+    """True when none of `names` is written in any source file, file `rel` imports nothing by
+    `*`, and no file imports `*` from it."""
     try:
         data = _read(base, rel)
         if data is None:
             return False
         text = data.decode("utf-8", "replace")
+        if "import *" in text:
+            return False  # the file holds names it does not write out
         if any(re.search(r"\b%s\b" % re.escape(name), text) for name in names):
             return False
+        if any(_ident_lines(base, name, maps) for name in names):
+            return False  # written somewhere else: someone may reach it through this module
         dotted = rel[:-3].replace("/", ".")
         if dotted.endswith(".__init__"):
             dotted = dotted[: -len(".__init__")]
@@ -944,12 +973,64 @@ def _renamed_users(maps, base, rel, c, callers):
         for line in lines:
             if f == rel and flo <= line <= fhi:
                 continue
-            if maps.ran_at_import(f, line, line):
+            # A line that only reads the name - to store the function, to pass it on - fails
+            # without entering it: every test that runs the statement naming it counts.  (The
+            # statement, not the line: a name on a later line of `from m import (a,\n b)` is
+            # bound by code that belongs to the statement's first line.)
+            span = _stmt_span(base, f, line)
+            if span is None:
                 return None
-            # (a line that only reads the name - to store the function, to pass it on - fails
-            # without entering it: every test that runs a line naming it counts)
-            callers |= maps.mod(f, line, line) | maps.func(f, line, line)
+            if span == ():
+                continue  # a comment
+            if maps.ran_at_import(f, span[0], span[1]):
+                return None
+            callers |= maps.mod(f, span[0], span[1]) | maps.func(f, span[0], span[1])
     return callers
+
+
+_STMTS = {}
+
+
+def _stmt_span(base, f, line):
+    """(first, last) line of the innermost statement of file `f` that `line` belongs to (of a
+    compound statement: its header, down to where its body starts); () for a line that is only
+    a comment; None when that cannot be told."""
+    if f not in _STMTS:
+        spans, text = None, None
+        data = _read(base, f)
+        if data is not None:
+            try:
+                text = data.decode("utf-8").split("\n")
+                spans = []
+                for node in ast.walk(ast.parse(data)):
+                    if not isinstance(node, ast.stmt):
+                        continue
+                    lo = node.lineno
+                    for d in getattr(node, "decorator_list", None) or ():
+                        lo = min(lo, d.lineno)
+                    inner = None
+                    for field in ("body", "orelse", "finalbody", "handlers", "cases"):
+                        for child in getattr(node, field, None) or ():
+                            cl = getattr(child, "lineno", None)
+                            if cl is not None:
+                                for d in getattr(child, "decorator_list", None) or ():
+                                    cl = min(cl, d.lineno)
+                                inner = cl if inner is None else min(inner, cl)
+                    hi = node.end_lineno if inner is None else max(lo, inner - 1)
+                    spans.append((hi - lo, lo, hi))
+                spans.sort()
+            except (SyntaxError, ValueError, RecursionError, UnicodeDecodeError):
+                spans = None
+        _STMTS[f] = (spans, text)
+    spans, text = _STMTS[f]
+    if spans is None:
+        return None
+    for _, lo, hi in spans:
+        if lo <= line <= hi:
+            return lo, hi
+    if 0 < line <= len(text) and text[line - 1].lstrip().startswith("#"):
+        return ()
+    return None
 
 
 def _users(names, base, maps, rel, own_lines):

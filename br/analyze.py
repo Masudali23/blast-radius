@@ -170,8 +170,10 @@ class Differ:
                 return
             pairs, added = found
             for anchor, name in added:
+                # (two lines from where the statement before it ends: the span of no statement, so
+                # what is known about a change to that one is never taken for this one's)
                 line = anchor or getattr(ctx_scope, "lineno", None) or 1
-                ch = Change("mod", (line, line), cls=cls, what="def-added")
+                ch = Change("mod", (line, line + 1), cls=cls, what="def-added")
                 ch.header = ("imported", name) if isinstance(name, tuple) else ("added", name)
                 self.changes.append(ch)
         same = self.same
@@ -201,8 +203,12 @@ class Differ:
                     if ch.level == "mod" and not ch.coarse:
                         ch.calls = _span(o)
             elif len(self.changes) > start and not isinstance(scope, FUNC_SCOPES):
-                others = [st for st in getattr(scope, "body", ()) if st is not o and isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == o.name]
-                kind = _header_only(o, n, (len(others), any(st.lineno > o.lineno for st in others)))
+                siblings = getattr(scope, "body", ())
+                others = [st for st in siblings if st is not o and isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)) and st.name == o.name]
+                accessor = any(_deco_name(d) in ACCESSORS for st in others for d in st.decorator_list)
+                kind = _header_only(o, n, (len(others), any(st.lineno > o.lineno for st in others), accessor))
+                if not any(st is o for st in siblings):
+                    kind = None  # (inside an if / try block of the body: its twins are elsewhere)
                 if kind not in ("annotations", "signature") and (o.name.startswith("__") or n.name.startswith("__")):
                     kind = None  # (Python itself calls these, and not only by entering them)
                 if kind:
@@ -536,11 +542,12 @@ def _lazy_body(node):
     return False
 
 
-def _header_only(o, n, twins=(0, False)):
+def _header_only(o, n, twins=(0, False, False)):
     """How two versions of a def differ outside the body.  `twins`: (how many other defs in the
-    same body have its name, whether one of them comes later).
+    same body have its name, whether one of them comes later, whether one is an accessor).
 
       "decorators"         only transparent decorators came, went or changed
+      "wrapped"            ... `unsupported_args` among them
       "stub"               ... on a typing overload that a later def of the same name replaces
       ("name", old, new)   only the name
       "annotations"        only annotations of arguments or of the result
@@ -581,13 +588,21 @@ def _header_only(o, n, twins=(0, False)):
         changed = [_deco_name(d) for d in gone + come]
         if not changed or any(x not in TRANSPARENT for x in changed):
             return None
-        if any(_deco_name(d) == "property" for d in come):
-            return None  # merely reading the attribute would now run the function
+        if any(_deco_name(d) in ("property", "abstractmethod") for d in come):
+            # merely reading the attribute would now run the function / the class could no
+            # longer be instantiated: seen without entering the function
+            return None
         if any(_deco_name(d) in ACCESSORS for d in o.decorator_list + n.decorator_list):
             return None
         if twins[0]:
-            return "stub" if twins[1] and all(x == "overload" for x in changed) else None
-        return "decorators"
+            # a typing stub (nothing but `overload` on it before) that loses the decorator and
+            # is replaced by a later def of its name - not by an accessor built from it
+            stub = twins[1] and not twins[2] and not come and o.decorator_list and all(x == "overload" for x in names)
+            return "stub" if stub else None
+        if _lazy_body(o) or _lazy_body(n):
+            return None  # (a call of a generator fails or not without entering its body)
+        # `unsupported_args` wraps the method and can raise before entering it
+        return "wrapped" if "unsupported_args" in changed else "decorators"
     if not same["decorator_list"] or twins[0] or any(x not in TRANSPARENT for x in names):
         return None
     if by_pattern(o.name) or by_pattern(n.name):
