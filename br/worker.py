@@ -830,7 +830,9 @@ def _name_connections(cls):
 
 
 # test modules the full zygote leaves for the child to import (heavy imports, rarely needed)
-LAZY_MODULES = ("tests.test_sqlglotc",)
+# (tests/test_docs.py holds no test, only unittest's load_tests hook for the doctests, and it
+# is the one module that brings in doctest, pdb and readline)
+LAZY_MODULES = ("tests.test_sqlglotc", "tests.test_docs")
 PRERUN = {"on": False}
 # set while a class set-up runs in a child that may defer its DuckDB work (see _class_setup)
 LAZY = {"on": False}

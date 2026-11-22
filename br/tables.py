@@ -15,8 +15,10 @@ run when the image was built, and the caller asks DuckDB itself for any other te
 Not used when the patch touches anything the rows depend on (DEPENDS).
 """
 import csv
+import marshal
 import os
 import pickle
+import struct
 
 OWNER = ("tests.test_executor", "TestExecutor")
 ATTRS = ("tpch_tables", "tpcds_tables")
@@ -33,16 +35,74 @@ class Mismatch(Exception):
     """The stored rows do not fit what the set-up produced: use the ordinary set-up."""
 
 
+ROWS = "rows, shared"  # key of the packed form of the rows in the store (see pack)
+
+
 def load():
     """The stored rows ({attribute: {table: (columns, rows)}}), or None when there are none."""
     if not _cache[1]:
         _cache[1] = True
         try:
             with open(PATH, "rb") as fh:
-                _cache[0] = pickle.load(fh)
+                stored = pickle.load(fh)
+            if ROWS in stored:
+                stored.update(marshal.loads(stored.pop(ROWS)))
+            _cache[0] = stored
         except Exception:
             _cache[0] = None
     return _cache[0]
+
+
+def _cell_key(value):
+    # equal cells of the same type; floats by their bytes (0.0 and -0.0 stay apart)
+    return (float, struct.pack("d", value)) if type(value) is float else (type(value), value)
+
+
+def pack(stored):
+    """The store with its rows in a form that loads faster and takes less room: every cell value
+    that occurs more than once (the same string, number ...) is ONE object, and the rows are
+    written with marshal, which writes such an object once.  What load() hands out has the same
+    tables, rows, values and types; equal immutable cells are merely the same object.  Returns
+    `stored` unchanged when the rows hold anything but tuples of str / int / float / None, or
+    when reading the packed form back does not give exactly what went in."""
+    rows_of = {attr: stored[attr] for attr in ATTRS if attr in stored}
+    try:
+        seen = {}
+        shared = {}
+        for attr, tables in rows_of.items():
+            shared[attr] = {}
+            for name, (columns, rows) in tables.items():
+                new_rows = []
+                for row in rows:
+                    if type(row) is not tuple:
+                        return stored
+                    cells = []
+                    for value in row:
+                        if type(value) not in (str, int, float, type(None)):
+                            return stored
+                        cells.append(seen.setdefault(_cell_key(value), value))
+                    new_rows.append(tuple(cells))
+                shared[attr][name] = (tuple(columns), new_rows)
+        blob = marshal.dumps(shared)
+        back = marshal.loads(blob)
+        for attr, tables in rows_of.items():
+            if list(back[attr]) != list(tables):
+                return stored
+            for name, (columns, rows) in tables.items():
+                columns2, rows2 = back[attr][name]
+                if tuple(columns) != columns2 or len(rows) != len(rows2):
+                    return stored
+                for a, b in zip(rows, rows2):
+                    if type(b) is not tuple or len(a) != len(b):
+                        return stored
+                    for x, y in zip(a, b):
+                        if type(x) is not type(y) or _cell_key(x) != _cell_key(y):
+                            return stored
+    except Exception:
+        return stored
+    packed = {k: v for k, v in stored.items() if k not in rows_of}
+    packed[ROWS] = blob
+    return packed
 
 
 def usable(cls, patched=()):
