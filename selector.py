@@ -53,6 +53,9 @@ P_PASS_REST = float(os.environ.get("BR_P_PASS_REST", "0"))
 # ... when the very first test that was run failed: on 544 labelled commits 3 in 10 of the other
 # candidates pass then, against 8 to 9 in 10 when some test passed first ("1": no difference)
 P_PASS_COLD = float(os.environ.get("BR_P_PASS_COLD", "1"))
+# ... and then for a test in the same test file as one that failed: about 2 in 10 of those pass
+# on the labelled commits, against 8 in 10 of the tests in other files ("1": no difference)
+P_PASS_COLD_SAME = float(os.environ.get("BR_P_PASS_COLD_SAME", "1"))
 # ... a test lighter than this many recorded seconds is not run on its own after a failure
 AGAIN_MIN = float(os.environ.get("BR_AGAIN_MIN", "1.0"))
 # ... but any test left is run when its estimated cost is under this share of its recorded time
@@ -84,6 +87,10 @@ RELATED_CAP = float(os.environ.get("BR_RELATED_CAP", "1000"))
 # the first part of a slow test's sample is run before its related tests are
 FIRST_LOOK = os.environ.get("BR_FIRST_LOOK", "1") == "1"
 # measuring only: let the slow test go as soon as that first part has passed
+# After a test ran out of time the child stops (see br/worker.py) and whatever is left stays
+# selected unchecked.  A slow test among them is worth one more look all the same: "1" takes
+# its first part in a new child, "2" all of its parts there; "0" none.
+LOOK_CUT = os.environ.get("BR_LOOK_CUT", "1")
 FIRST_ONLY = os.environ.get("BR_FIRST_ONLY", "0") == "1"
 # ... and then that first part is no more than this many of its least expensive entries (0: all)
 FIRST_N = int(os.environ.get("BR_FIRST_N", "0"))
@@ -168,6 +175,12 @@ CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
 # it): "0" runs every light candidate of those.  On 544 labelled commits the early stop is wrong
 # in 4 of 17 such commits and in 1 of the 59 others.
 CLEAN_WARM_MOD = os.environ.get("BR_CLEAN_WARM_MOD", "1") == "1"
+# ... those get this many estimated seconds instead when it is more (their failures sit later
+# in the order: the four wrong ones above first fail after 0.01, 0.09, 0.2 and 0.47 s)
+CLEAN_STOP_MOD = float(os.environ.get("BR_CLEAN_STOP_MOD", "0"))
+# ... and a stop that would let go no more than this many candidates is not worth its risk:
+# they are run as well
+CLEAN_FEW = int(os.environ.get("BR_CLEAN_FEW", "0"))
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
@@ -1005,10 +1018,18 @@ class Selector:
                 lane.overlay.set_file(rel, content)
 
         def run(items, stop_on_fail, patience=5.0):
-            if st["cut"]:
+            if st["cut"] and not st.get("again"):
                 # the child gave up earlier: do not run more
                 return [], [n for n, _, _ in items if n not in st["slow_out"]]
-            jobs = [(self.id_of[n], max(1.5, patience * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in items]
+            if st.get("again") == 1:
+                # ... except a look at a slow test, which starts from a child no test was
+                # stopped in
+                lane.finish()
+                st["open"] = False
+                st["again"] = 2
+            # (after a timeout the look is expected to hang too: it gets less time to show it)
+            floor = 0.8 if st.get("again") else 1.5
+            jobs = [(self.id_of[n], max(floor, patience * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in items]
             # total CPU this commit may burn: generous against the estimate, but bounded
             st["planned"] += sum(e * self.slack.get(n, 1.0) for n, _, e in items) / 1000.0
             cpu_budget = min(COMMIT_CPU, 3.0 + 2.5 * st["planned"])
@@ -1034,6 +1055,7 @@ class Selector:
             if lane.cut:
                 st["cut"] = lane.cut
                 dbg["cut"] = lane.cut
+                st["again"] = 0
             failed, unseen = [], []
             for i, (n, v, e) in enumerate(items):
                 r = results.get(i)
@@ -1109,6 +1131,14 @@ class Selector:
                     return "F" if f3 else "U" if u3 else "P"
             return "P"
 
+        def chance(n, failed):
+            """A cap on the chance that test n passes: lower when the very first test run failed
+            and n sits in the same test file as a test that failed (P_PASS_COLD_SAME)."""
+            if P_PASS_COLD_SAME >= 1 or not st.get("cold"):
+                return 1.0
+            name = self.id_of[n].split("::", 1)[0]
+            return P_PASS_COLD_SAME if any(self.id_of[m].split("::", 1)[0] == name for m in failed) else 1.0
+
         selected, how, unverified = [], None, []
         try:
             install()
@@ -1119,11 +1149,16 @@ class Selector:
                 near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
                 first, spent = [], 0.0
                 budget = min(CLEAN_STOP * 1000, max(CLEAN_MIN * 1000, CLEAN_FRAC * total_est))
-                for item in sorted(cheap + costly, key=lambda it: (near(it[0]), it[2], it[0])):
+                if "mod" in plan.kinds and not plan.fresh:
+                    budget = max(budget, CLEAN_STOP_MOD * 1000)
+                order = sorted(cheap + costly, key=lambda it: (near(it[0]), it[2], it[0]))
+                for item in order:
                     if spent >= budget:
                         break
                     first.append(item)
                     spent += item[2]
+                if len(order) - len(first) <= CLEAN_FEW:
+                    first = order
             if first:
                 failed, rest = run(first, STOP_FIRST)
                 # (nothing passed before the first failure: see P_PASS_COLD)
@@ -1164,7 +1199,7 @@ class Selector:
                         if ms[n] < AGAIN_MIN * 1000:
                             break  # too light to be worth a run of its own
                         without = cost_of(failed + [m for m in kept if m != n])
-                        if by[n][2] < p_again * (current - without):
+                        if by[n][2] < min(p_again, chance(n, failed)) * (current - without):
                             again.append(by[n])
                             kept.remove(n)
                             current = without
@@ -1198,7 +1233,7 @@ class Selector:
                     keep_cost = cost_of(base + keep + [n]) - cost_of(base + keep)
                     if FIRST_ONLY and LOOK_FIRST and failed and ms[n] > HEAVY * 1000 and keep_cost >= DROP_MIN * 1000 and est >= LOOK_EST * 1000 and self.sample_variant(plan, n) is not None:
                         keep.append(n)  # settled below by a look at its first entries
-                    elif est < p_pass * keep_cost and (failed or est <= CLEAN_RUN * 1000 or self.slice_probe(plan, n)[1] is None):
+                    elif est < min(p_pass, chance(n, failed)) * keep_cost and (failed or est <= CLEAN_RUN * 1000 or self.slice_probe(plan, n)[1] is None):
                         run_list.append(item)
                     else:
                         keep.append(n)
@@ -1209,7 +1244,10 @@ class Selector:
                     keep = keep + [n for n in unseen2 if n in st["undecided"]]
                 keep = kept + keep
                 looked = {}  # slow test -> (its sample, what the first part said) once that part passed
-                if keep and failed and FIRST_LOOK and not st["cut"] and SAMPLE_SHARE > 0:
+                after_cut = st["cut"] == "timeout" and LOOK_CUT != "0"
+                if after_cut:
+                    st["again"] = 1
+                if keep and failed and FIRST_LOOK and (not st["cut"] or after_cut) and SAMPLE_SHARE > 0:
                     # A slow fixture-driven test that is still selected unchecked next to real
                     # failures: the first part of its sample comes before anything else that
                     # is done about it.  When such a test fails it mostly fails there, and
@@ -1222,6 +1260,22 @@ class Selector:
                             continue
                         sv = self.sample_variant(plan, n)
                         if sv is None or sv[1] >= P_PASS_SAMPLE * weight:
+                            continue
+                        if after_cut:
+                            dbg.setdefault("look_after_cut", []).append(n)
+                            if not st.get("again"):
+                                continue  # (the new child was stopped as well)
+                        if after_cut and LOOK_CUT == "2":
+                            verdict = settle(n, sv)
+                            dbg.setdefault("sampled", []).append((n, verdict))
+                            if verdict == "F":
+                                failed.append(n)
+                                keep = [m for m in keep if m != n]
+                            elif verdict == "P":
+                                keep = [m for m in keep if m != n]
+                                dbg.setdefault("sample_dropped", []).append(n)
+                            else:
+                                looked[n] = None
                             continue
                         st["planned"] += sv[1] / 1000.0
                         look, look_est = sv[0][0]
@@ -1244,6 +1298,7 @@ class Selector:
                             dbg.setdefault("sample_dropped", []).append(n)
                         else:
                             looked[n] = (sv, st["note"].get(n, ""))
+                st["again"] = 0
                 if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
                     sliced = {n: self.slice_probe(plan, n) for n in keep}
