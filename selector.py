@@ -83,6 +83,8 @@ FIRST_ONLY = os.environ.get("BR_FIRST_ONLY", "0") == "1"
 FIRST_N = int(os.environ.get("BR_FIRST_N", "0"))
 # ... and a slow fixture-driven test next to failures is never run in full: that look decides
 LOOK_FIRST = os.environ.get("BR_LOOK_FIRST", "0") == "1"
+# ... unless running it is estimated to take less than this many seconds (few entries reached)
+LOOK_EST = float(os.environ.get("BR_LOOK_EST", "0"))
 # with nothing failing, a slow test that is going to be sampled is not probed first
 PROBE_ONCE = os.environ.get("BR_PROBE_ONCE", "0") == "1"
 # seconds to wait for the stand-alone import check of a patched module
@@ -1037,7 +1039,7 @@ class Selector:
                 for item in sorted(later, key=lambda it: it[2]):
                     n, v, est = item
                     keep_cost = cost_of(base + keep + [n]) - cost_of(base + keep)
-                    if FIRST_ONLY and LOOK_FIRST and failed and ms[n] > HEAVY * 1000 and keep_cost >= DROP_MIN * 1000 and self.sample_variant(plan, n) is not None:
+                    if FIRST_ONLY and LOOK_FIRST and failed and ms[n] > HEAVY * 1000 and keep_cost >= DROP_MIN * 1000 and est >= LOOK_EST * 1000 and self.sample_variant(plan, n) is not None:
                         keep.append(n)  # settled below by a look at its first entries
                     elif est < p_pass * keep_cost and (failed or est <= CLEAN_RUN * 1000 or self.slice_probe(plan, n)[1] is None):
                         run_list.append(item)
