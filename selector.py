@@ -158,6 +158,11 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
 # ... and never when there are no more than this many of them: they are all run
 CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
+# The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
+# entries) only for patches that replace single lines; anything that adds or removes lines, or
+# touches a def, class, import, decorator or except line, is handled without them.
+FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0") == "1"
+STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 T0 = time.monotonic()
 
 
@@ -301,7 +306,63 @@ class Selector:
         except (OSError, ValueError):
             return False
 
+    @staticmethod
+    def simple_edit(data):
+        """Does the patch only replace lines of Python one for one (comments and blank lines
+        apart), none of them the opening of a definition, an import, a decorator or a handler?
+        Files that are not Python do not count."""
+        try:
+            text = data.decode("utf-8", "replace")
+        except Exception:
+            return False
+        state = {"file": None, "minus": [], "plus": [], "ok": True}
+
+        def close():
+            if state["file"] and state["file"].endswith(".py"):
+                minus = [x for x in state["minus"] if x.strip() and not x.lstrip().startswith("#")]
+                plus = [x for x in state["plus"] if x.strip() and not x.lstrip().startswith("#")]
+                if len(minus) != len(plus):
+                    state["ok"] = False
+                for x in minus + plus:
+                    if x.strip().startswith(STRUCTURAL):
+                        state["ok"] = False
+            state["minus"], state["plus"] = [], []
+
+        for line in text.splitlines():
+            if line.startswith("+++ "):
+                close()
+                name = line[4:].strip()
+                if name == "/dev/null":
+                    state["ok"] = False
+                state["file"] = name[2:] if name.startswith("b/") else name
+            elif line.startswith("--- "):
+                if line[4:].strip() == "/dev/null":
+                    state["ok"] = False
+            elif line.startswith("@@"):
+                close()
+            elif line.startswith("-"):
+                state["minus"].append(line[1:])
+            elif line.startswith("+"):
+                state["plus"].append(line[1:])
+            elif line.startswith(("rename ", "new file", "deleted file", "similarity ", "Binary ")):
+                state["ok"] = False
+        close()
+        return state["ok"]
+
     def decide(self, commit, data):
+        global CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
+        if not FAST_SIMPLE or self.simple_edit(data):
+            return self.decide_as_set(commit, data)
+        # not the kind of change the shortcuts were measured on: none of them here
+        saved = CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
+        CLEAN_STOP, FIRST_ONLY, LOOK_FIRST = 0.0, False, False
+        try:
+            return self.decide_as_set(commit, data)
+        finally:
+            CLEAN_STOP, FIRST_ONLY, LOOK_FIRST = saved
+            self.debug.setdefault(commit, {})["careful"] = True
+
+    def decide_as_set(self, commit, data):
         plan = planner.make_plan(commit, data, BASE, self.maps)
         dbg = {"kinds": sorted(plan.kinds), "notes": plan.notes, "fresh": plan.fresh}
         self.debug[commit] = dbg
