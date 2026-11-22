@@ -154,6 +154,10 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 # ... and only for a change inside function bodies, or of a class-level value whose readers are
 # known (on labelled patches the other kinds have little to save and fail late more often)
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
+# measuring build: where the CPU of a batch goes, told through the selection of one commit
+# that would otherwise select nothing (see Selector.account)
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
+TRACE = bool(DEBUG) or DIAG
 T0 = time.monotonic()
 
 
@@ -401,7 +405,7 @@ class Selector:
                 if r is not None:
                     ran += 1
                     cpu_ms += r[1]
-                    if DEBUG:
+                    if TRACE:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], -1))
         dbg["mode"] = mode
         dbg["ran"] = ran
@@ -904,7 +908,7 @@ class Selector:
                     st["cpu"] += r[1]
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
-                    if DEBUG:
+                    if TRACE:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1), r[2], r[3]))
                     st["evals"] += r[2]
                     st["differ"] += r[3]
@@ -1380,6 +1384,56 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  Of the CPU this process and the test children used (the worker
+        chain's own start-up is not in it), in sixteenths:
+          a  this process (planning the commits)
+          b  the children of commits where nothing failed
+          c  runs of the slow tests (recorded time over HEAVY), wherever they happened
+          d  children of commits run from a fresh import (commits where nothing failed apart)
+        (what is left: the hot-swapped commits with failures).
+        They are written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on
+        one worker of the first commit that selects nothing.  The number of children started,
+        in all, is spent as that many times 0.25 s of CPU here (at most 60)."""
+        ms = self.ms
+        mine = time.process_time() * 1000.0
+        clean = slow = fresh = kids = 0
+        children = 0
+        for dbg in self.debug.values():
+            used = dbg.get("child_ms") or 0
+            if used:
+                children += 1 + (1 if dbg.get("import_ms") else 0)
+            kids += used
+            runs = dbg.get("tests") or []
+            s = sum(r[1] for r in runs if ms[r[0]] > HEAVY * 1000)
+            slow += s
+            if dbg.get("how") in ("clean", "heavy-kept", "heavy-dropped"):
+                clean += max(0, used - s)
+            elif dbg.get("mode") in ("bare", "core"):
+                fresh += max(0, used - s)
+        total = mine + kids
+        if total <= 0:
+            return
+
+        def q(x):
+            return min(16, int(16.0 * x / total + 0.5))
+
+        want = 1 + q(mine) + 17 * q(clean) + 289 * q(slow) + 4913 * q(fresh)
+        log("account: main %d children %d (clean %d slow %d fresh %d) started %d -> %d" % (mine, kids, clean, slow, fresh, children, want))
+        chosen, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                chosen.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(chosen)]
+                    break
+        stop = time.process_time() + 0.25 * min(60, children)
+        while time.process_time() < stop:
+            sum(range(20000))
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1389,6 +1443,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1396,7 +1451,7 @@ class Selector:
                     data = fh.read()
                 before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
                 selected = self.decide(commit, data)
-                if DEBUG:
+                if TRACE:
                     self.debug[commit]["child_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             except Exception as e:  # never lose a commit: fall back to running everything
                 log("commit %s: %r -> selecting all" % (commit, e))
@@ -1405,6 +1460,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         for lane in (self.lane, self.lane2):
