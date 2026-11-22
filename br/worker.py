@@ -114,6 +114,12 @@ FUNCS = {}  # source path -> live function objects defined there (built once, be
 LOADED = set()  # source paths of modules already imported in the zygote
 
 
+# Each stage of the worker chain collects garbage before it freezes its objects ("1"), or
+# freezes them as they are ("0": nothing is freed, so no page is handed out again and copied
+# in the children; the collector is off while the stages import).
+COLLECT_FIRST = os.environ.get("BR_COLLECT_FIRST", "1") == "1"
+
+
 def index_functions(root):
     prefix = root + os.sep
     for m in list(sys.modules.values()):
@@ -804,8 +810,12 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         ready += b" " + json.dumps(loaded_files(overlay)).encode()
     elif mode == "full":
         preload(overlay, skip=LAZY_MODULES)
-    gc.collect()
-    if mode == "full":
+    if COLLECT_FIRST:
+        gc.collect()
+        if mode == "full":
+            index_functions(overlay)
+    elif mode != "bare":
+        # (what earlier stages made is frozen and is not listed again: index stage by stage)
         index_functions(overlay)
     gc.freeze()
     os.write(out_fd, ready + b"\n")
@@ -824,7 +834,8 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
                 try:
                     os.close(in_fd)
                     os.close(out_fd)
-                    gc.unfreeze()
+                    if COLLECT_FIRST:
+                        gc.unfreeze()
                     serve(nxt, overlay, base, fds[0], fds[1], {k: v for k, v in spares.items() if k != nxt})
                 finally:
                     os._exit(0)

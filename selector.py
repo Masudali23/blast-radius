@@ -312,7 +312,9 @@ class Selector:
             # candidates were narrowed on the understanding that the patched module still
             # imports; if it does not, every test that imports it fails
             late = time.monotonic() > self.stop_at
+            before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
             bad = None if late else self.unimportable(plan)
+            dbg["import_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             if late or bad:
                 dbg["how"] = "out-of-time" if late else "import-error"
                 dbg["unimportable"] = bad
