@@ -154,6 +154,9 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 # ... and only for a change inside function bodies, or of a class-level value whose readers are
 # known (on labelled patches the other kinds have little to save and fail late more often)
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
+# measuring build: in which part of sqlglot the patches sit for which the slowest test is let
+# go after a look, told through the selection of one commit that would otherwise select nothing
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 T0 = time.monotonic()
 
 
@@ -832,6 +835,14 @@ class Selector:
             cheap.sort(key=lambda it: (near(it[0]), it[2], it[0]))
         total_est = sum(e for _, _, e in cheap) + sum(e for _, _, e in costly)
         dbg["est_ms"] = int(total_est)
+        if DIAG:
+            code = [rel for rel in plan.files if rel.endswith(".py") and rel.startswith("sqlglot/")]
+            if any(rel.startswith("sqlglot/executor/") or rel.startswith("sqlglot/planner") for rel in code):
+                dbg["area"] = 2
+            elif any(rel.startswith("sqlglot/optimizer/") for rel in code):
+                dbg["area"] = 1
+            else:
+                dbg["area"] = 0
         if DUMP:
             # for studying run orders off line: every candidate with its estimate, its class
             # and whether it is run through a part of its fixture entries
@@ -1380,6 +1391,42 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  The commits in which the slowest test is let go after a look at
+        entries that were handed something new, by where the patch is:
+          a  in the optimizer            b  in the executor or the planner       c  elsewhere
+        and  d  the commits in which the slowest test is selected, as  o + 4 e + 16 r  with o,
+        e, r (at most 3 each... r at most 1) the numbers for optimizer, executor/planner, rest.
+        Written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
+        worker of the first commit that selects nothing."""
+        ms = self.ms
+        slowest = max(ms, key=lambda n: (ms[n] if "tpcds" in self.id_of[n] else 0, n))
+        let_go = [0, 0, 0]
+        kept = [0, 0, 0]
+        chosen_in = {commit: set(n for w in workers for n in w) for commit, workers in lines}
+        for commit, dbg in self.debug.items():
+            area = dbg.get("area", 0)
+            if slowest in chosen_in.get(commit, ()):
+                kept[area] += 1
+            if any(n_v[1] == "P" and n_v[0] == slowest for n_v in (dbg.get("sampled") or ())):
+                note = ((dbg.get("first_part") or [[0, ""]])[0][1] or "")
+                recognised, _, new = note.partition("/")
+                if not (recognised.isdigit() and int(recognised) > 0 and new == "0"):
+                    let_go[area] += 1
+        d = min(3, kept[1]) + 4 * min(3, kept[2]) + 16 * min(1, kept[0])
+        want = 1 + min(16, let_go[1]) + 17 * min(16, let_go[2]) + 289 * min(16, let_go[0]) + 4913 * min(16, d)
+        log("account: let go %s kept %s -> %d" % (let_go, kept, want))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1389,6 +1436,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1405,6 +1453,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         for lane in (self.lane, self.lane2):
