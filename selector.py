@@ -892,7 +892,7 @@ class Selector:
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
                     if DEBUG:
-                        dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1)))
+                        dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1), r[2], r[3]))
                     st["evals"] += r[2]
                     st["differ"] += r[3]
                     if r[0] == "F":
@@ -1171,6 +1171,7 @@ class Selector:
             finally:
                 lane.overlay.restore()
         dbg["mode"] = st["mode"]
+        dbg["probed"] = st["probed"]
         dbg["ran"] = st["ran"]
         dbg["cpu_ms"] = st["cpu"]
         dbg["unverified"] = unverified
