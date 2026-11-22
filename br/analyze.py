@@ -551,7 +551,8 @@ def _header_only(o, n, twins=(0, False, False)):
       "stub"               ... on a typing overload that a later def of the same name replaces
       ("name", old, new)   only the name
       "annotations"        only annotations of arguments or of the result
-      "signature"          undecorated, and the arguments differ in another way
+      "signature"          the arguments differ in another way (no decorator but staticmethod /
+                           classmethod)
       None                 anything else, and whatever is not safe to narrow
     """
 
@@ -576,7 +577,9 @@ def _header_only(o, n, twins=(0, False, False)):
             return "annotations" if all(x in TRANSPARENT or x in ACCESSORS for x in names) else None
         # other arguments or defaults: noticed where the function is called (nothing wraps it
         # or reads its signature when it has no decorator)
-        return "signature" if not names and not twins[0] and not _lazy_body(o) and not _lazy_body(n) else None
+        # (`staticmethod` and `classmethod` hand the call on as it is)
+        plain = all(x in ("staticmethod", "classmethod") for x in names)
+        return "signature" if plain and not twins[0] and not _lazy_body(o) and not _lazy_body(n) else None
     if not same["type_params"]:
         return None
     if o.name == n.name:

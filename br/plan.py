@@ -428,7 +428,7 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 # name is in use somewhere already; the module must still load (checked)
                 everyone = maps.imports.get(rel, 0) | maps.any_line(rel)
                 try:
-                    unused = REFINE_HEADERS and not _ident_lines(base, c.header[1], maps)
+                    unused = REFINE_HEADERS and not _written(base, c.header[1], maps)
                 except Exception:
                     unused = False
                 if unused:
@@ -901,6 +901,33 @@ def _all_of(factors):
     return entries
 
 
+_OTHER_PY = []
+
+
+def _written(base, name, maps):
+    """Is `name` written (as a whole word) in any python file of the checkout - the ones the
+    maps know, and the few no test was seen to load (scripts, benchmarks)?"""
+    if _ident_lines(base, name, maps):
+        return True
+    if not _OTHER_PY:
+        known = set(maps.files)
+        found = []
+        for top, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", "target", "build", "dist")]
+            for f in files:
+                if f.endswith(".py"):
+                    rel = os.path.relpath(os.path.join(top, f), base)
+                    if rel not in known:
+                        found.append(rel)
+        _OTHER_PY.append(found)
+    pat = re.compile(r"\b%s\b" % re.escape(name))
+    for rel in _OTHER_PY[0]:
+        data = _read(base, rel)
+        if data is not None and name.encode() in data and pat.search(data.decode("utf-8", "replace")):
+            return True
+    return False
+
+
 _RAISERS = []
 
 
@@ -932,7 +959,7 @@ def _names_free(base, maps, rel, names):
             return False  # the file holds names it does not write out
         if any(re.search(r"\b%s\b" % re.escape(name), text) for name in names):
             return False
-        if any(_ident_lines(base, name, maps) for name in names):
+        if any(_written(base, name, maps) for name in names):
             return False  # written somewhere else: someone may reach it through this module
         dotted = rel[:-3].replace("/", ".")
         if dotted.endswith(".__init__"):
@@ -959,7 +986,7 @@ def _renamed_users(maps, base, rel, c, callers):
     sits in a function that ran while modules were loading, or the mentions cannot be listed."""
     _, name, new_name = c.header
     try:
-        if _ident_lines(base, new_name, maps):
+        if _written(base, new_name, maps):
             return None  # the new name is in use already: the function now stands in for another
         where = _ident_lines(base, name, maps)
     except Exception:
