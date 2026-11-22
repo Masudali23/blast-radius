@@ -171,17 +171,74 @@ def _const_text(k):
     return (type(k).__name__, repr(k))
 
 
-def _own_differs(old, new):
-    """True when module/class-level bytecode itself differs (not just nested functions)."""
+# What a class body notes about itself besides running its statements (Python 3.13): the line
+# the class starts on, and the names its methods assign to on `self`.  A patch that adds a line
+# to a function moves every class below it; that is no change to any of those classes.
+CLASS_NOTES = ("__firstlineno__", "__static_attributes__")
+
+
+def _const_uses(code):
+    """{index of a constant: the names it is stored under right after being loaded}; None in
+    place of the names when the constant is used in any other way."""
+    import dis
+
+    uses = {}
+    previous = None
+    for ins in dis.get_instructions(code):
+        if previous is not None:
+            index = previous.arg
+            if ins.opname == "STORE_NAME" and uses.get(index, ()) is not None:
+                uses.setdefault(index, set()).add(ins.argval)
+            else:
+                uses[index] = None
+            previous = None
+        if ins.opcode in dis.hasconst:
+            if ins.opname == "LOAD_CONST":
+                previous = ins
+            else:
+                uses[ins.arg] = None
+    if previous is not None:
+        uses[previous.arg] = None
+    return uses
+
+
+def _own_differs(old, new, notes=None):
+    """True when module/class-level bytecode itself differs (not just nested functions).
+
+    With `notes` (a list), a class body that differs only in what it notes about itself
+    (CLASS_NOTES) is not counted; the list receives (qualified name of the class, attribute,
+    old value, new value) for whoever makes the live classes say the same."""
     if bool(old.co_flags & 1):
         return False
-    strip = lambda c: tuple(_const_text(k) for k in c.co_consts)
-    if old.co_code != new.co_code or old.co_names != new.co_names or strip(old) != strip(new):
+    if old.co_code != new.co_code or old.co_names != new.co_names or len(old.co_consts) != len(new.co_consts):
         return True
+    odd = [i for i, (a, b) in enumerate(zip(old.co_consts, new.co_consts)) if _const_text(a) != _const_text(b)]
+    if odd:
+        if notes is None:
+            return True
+        uses = _const_uses(old)
+        for i in odd:
+            names = uses.get(i)
+            if not names or not names.issubset(CLASS_NOTES):
+                return True
+            for name in sorted(names):
+                notes.append((old.co_qualname, name, old.co_consts[i], new.co_consts[i]))
     oc, nc = _children(old), _children(new)
     if len(oc) != len(nc):
         return True
-    return any(_own_differs(a, b) for a, b in zip(oc, nc))
+    return any(_own_differs(a, b, notes) for a, b in zip(oc, nc))
+
+
+def _class_at(path, qualname):
+    """The live class with that qualified name in the module loaded from `path`, or None."""
+    obj = next((m for m in list(sys.modules.values()) if getattr(m, "__file__", None) == path), None)
+    if obj is None:
+        return None
+    for part in qualname.split("."):
+        obj = vars(obj).get(part) if part != "<locals>" else None
+        if not isinstance(obj, type):
+            return None
+    return obj if obj.__qualname__ == qualname else None
 
 
 def _cached_code(base_path):
@@ -217,17 +274,17 @@ def hot_swap(path, old_src, new_src, probe=False, base_path=None, small=None):
     """
     if small is not None:
         probed = PROBED[0]
-        why = _hot_swap(path, small[0], small[1], probe, None)
+        why = _hot_swap(path, small[0], small[1], probe, None, False)
         if why != OWN_CHANGED:
             return why
         # A class body also records what its methods assign to `self`; with the other methods
         # blanked that record can differ where the whole class's does not.  (Nothing has been
         # swapped yet at this point: ask the whole files.)
         PROBED[0] = probed
-    return _hot_swap(path, old_src, new_src, probe, base_path)
+    return _hot_swap(path, old_src, new_src, probe, base_path, True)
 
 
-def _hot_swap(path, old_src, new_src, probe, base_path):
+def _hot_swap(path, old_src, new_src, probe, base_path, whole):
     old_top = _cached_code(base_path) if base_path else None
     if old_top is None:
         try:
@@ -244,7 +301,10 @@ def _hot_swap(path, old_src, new_src, probe, base_path):
             new_top = compile(new_src, path, "exec", dont_inherit=True)
         except Exception as e:
             return "new does not compile: %r" % (e,)
-    if _own_differs(old_top, new_top):
+    # (what the classes note about themselves is only the classes' own when the texts are the
+    # whole files)
+    notes = [] if whole else None
+    if _own_differs(old_top, new_top, notes):
         # (constants read back from stored bytecode can print differently from freshly
         # compiled ones, a set of strings for one: compare with the old source compiled here
         # before deciding that the module or class level changed)
@@ -252,15 +312,22 @@ def _hot_swap(path, old_src, new_src, probe, base_path):
             old_top = compile(old_src, path, "exec", dont_inherit=True)
         except Exception as e:
             return "old does not compile: %r" % (e,)
-        if _own_differs(old_top, new_top):
+        notes = [] if whole else None
+        if _own_differs(old_top, new_top, notes):
             return OWN_CHANGED
     pairs = []
     if not _pair(old_top, new_top, pairs, False):
         return "structure changed"
-    if not pairs:
+    if not pairs and not notes:
         return None
     if path not in LOADED:
         return None  # not imported yet: the child will import the patched source itself
+    renote = []
+    for qualname, name, was, now in notes or ():
+        cls = _class_at(path, qualname)
+        if cls is None or cls.__dict__.get(name, _ABSENT) != was:
+            return "class %s does not hold what its body noted" % qualname
+        renote.append((cls, name, now))
     wanted = {}
     for old, new in pairs:
         wanted.setdefault((old.co_name, old.co_firstlineno), []).append((old, new))
@@ -281,6 +348,11 @@ def _hot_swap(path, old_src, new_src, probe, base_path):
     for old, new in pairs:
         if not found[id(old)]:
             return "no live function for %s:%d" % (old.co_qualname, old.co_firstlineno)
+    for cls, name, now in renote:
+        try:
+            type.__setattr__(cls, name, now)
+        except Exception as e:
+            return "cannot set %s: %r" % (name, e)
     return None
 
 
