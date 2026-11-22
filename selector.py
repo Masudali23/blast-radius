@@ -1433,6 +1433,16 @@ class Selector:
                 if not line[1]:
                     line[1] = [sorted(picked)]
                     break
+        # ... and the share of the children's CPU used by commits run from a fresh import
+        # (the measuring runs above included), in sixteenths, as that many seconds of CPU here
+        total = sum(d.get("child_ms") or 0 for d in self.debug.values())
+        fresh = sum(d.get("child_ms") or 0 for d in self.debug.values() if d.get("mode") in ("bare", "core"))
+        share = min(16, int(16.0 * fresh / total + 0.5)) if total > 0 else 0
+        count = sum(1 for d in self.debug.values() if d.get("mode") in ("bare", "core"))
+        log("account: fresh-import commits %d, %d of %d ms -> %d" % (count, fresh, total, share))
+        stop = time.process_time() + 1.0 * share
+        while time.process_time() < stop:
+            sum(range(20000))
 
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
@@ -1451,7 +1461,7 @@ class Selector:
                     data = fh.read()
                 before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
                 selected = self.decide(commit, data)
-                if DEBUG:
+                if DEBUG or DIAG:
                     self.debug[commit]["child_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             except Exception as e:  # never lose a commit: fall back to running everything
                 log("commit %s: %r -> selecting all" % (commit, e))
