@@ -180,6 +180,18 @@ CPU time is part of the score, so the selector avoids running what it can decide
   to changes inside function bodies and to class-level values whose readers are known. On
   1,152 labelled commits a budget of 3.2 s misses nothing and saves a fifth of all test
   CPU; a budget of 0.8 s lets 4 of 722 failing commits slip through.
+  The image can keep the shortcuts that are not exact to the kinds of patch they were measured
+  on (`BR_FAST_SIMPLE`): single lines replaced one for one, or lines added around a statement
+  that leaves its block; a patch that touches a def, class, import, decorator or except line,
+  or adds and removes lines otherwise, is decided without them. `BR_CLEAN_WARM_MOD=0` also
+  runs every light candidate of a module or class level change that is checked in the warm
+  worker: on 544 labelled commits the early stop is wrong in 4 of 17 of those and in 1 of the
+  59 others.
+- **A pool that breaks**: the optimizer tests share one process pool for the whole class. When
+  a change makes a task's answer unreadable for the parent process, the real pool is broken
+  for good and every test of the class that uses it later in the run fails, whatever the
+  change does to that test itself. The stand-in pool (`br/inlinepool.py`) reports the break
+  and those tests are selected with the one that caused it.
 - **Slow tests**: a test too slow to run in full is selected, unless everything else passes
   (or, when something fails, the tests closest to it — same test file or same fixture — all
   pass) and a sample of its own fixture entries passes too.
