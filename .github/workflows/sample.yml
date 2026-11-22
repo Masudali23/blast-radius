@@ -19,8 +19,8 @@ jobs:
               --security-opt no-new-privileges --user 65534:65534 --env HOME=/tmp \
               --volume $PWD/sample/commits:/data/commits:ro \
               --volume $PWD/sample/tests.json:/data/tests.json:ro \
-              blast-radius-entry sh -c 'python -m selector; rc=$?; grep -E "usage_usec|user_usec|system_usec" /sys/fs/cgroup/cpu.stat >&2; grep -E "^pgfault|^pgmajfault" /sys/fs/cgroup/memory.stat >&2; exit $rc' > output$i.jsonl 2> stderr$i.txt || true
-            echo "--- run $i stderr"; tail -9 stderr$i.txt
+              blast-radius-entry sh -c 'python -S -m selector; rc=$?; grep -E "usage_usec|user_usec|system_usec" /sys/fs/cgroup/cpu.stat >&2; grep -E "^pgfault|^pgmajfault" /sys/fs/cgroup/memory.stat >&2; exit $rc' > output$i.jsonl 2> stderr$i.txt || true
+            echo "--- run $i stderr"; tail -30 stderr$i.txt
             cpu=$(grep usage_usec stderr$i.txt | awk '{print $2/1000000}')
             python3 score.py sample sample/answers.json output$i.jsonl --cpu-seconds ${cpu:-0}
           done
