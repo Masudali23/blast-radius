@@ -1088,6 +1088,31 @@ def _user_lines(names, base, maps, rel, own_lines):
     return out
 
 
+# "1": a new python file in a package of the library puts everyone in play who imports a module
+# of that package (as if the package were walked by the library itself)
+NEW_PY_WALK = os.environ.get("BR_NEW_PY_WALK", "0") == "1"
+_WALK = re.compile(r"\b(pkgutil|iter_modules|walk_packages|listdir|scandir|iterdir|rglob|find_spec|__path__)\b|\bos\.walk\(|^\s*(import glob|from glob import)|\bPath\([^)]*\)\.glob\(", re.M)
+_WALKERS = []
+
+
+def _walkers(maps, base):
+    """Tests of the python files that list the files of a directory or the modules of a
+    package (by any of the usual means): the files' own tests and whoever imports them."""
+    if not _WALKERS:
+        mask = 0
+        for f in maps.files:
+            if not f.endswith(".py"):
+                continue
+            data = _read(base, f)
+            if data is None:
+                mask = maps.all
+                break
+            if _WALK.search(data.decode("utf-8", "replace")):
+                mask |= maps.imports.get(f, 0) | maps.any_line(f)
+        _WALKERS.append(mask)
+    return _WALKERS[0]
+
+
 def _new_module(plan, rel, new, maps, base):
     """A python file that did not exist.  Nothing imports it by name yet, but it can still
     matter: it can shadow a module, and packages are sometimes walked (pkgutil) by tests."""
@@ -1124,12 +1149,16 @@ def _new_module(plan, rel, new, maps, base):
     for f, mask in maps.opened.items():
         if os.path.dirname(f) == d:
             plan.add("mod", rel, 0, 0, mask)
-    if rel.startswith("sqlglot/"):
+    if rel.startswith("sqlglot/") and NEW_PY_WALK:
         # a package of sqlglot can be walked to find its modules: whoever imports a module
         # that lives directly in this directory is in play
         for f in maps.files:
             if os.path.dirname(f) == d:
                 plan.add("mod", rel, 0, 0, maps.imports.get(f, 0) | maps.any_line(f))
+    elif rel.startswith("sqlglot/"):
+        # ... but nothing in the library lists its own files, and only a few tests list a
+        # package's: those are the ones a file nobody imports by name can reach
+        plan.add("mod", rel, 0, 0, _walkers(maps, base))
     if name == "__init__.py":
         plan.fresh = True
         for f in maps.files:
