@@ -22,7 +22,9 @@ REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
 # Functions whose slow path runs only when a test before it in the same process cleared what
 # they fill (tests/test_dialect_entry_points.py empties the dialect registry and leaves it so):
 # traced one test at a time, nobody is seen on those lines.
-ORDER_SENSITIVE = {"sqlglot/dialects/dialect.py": ("_try_load",)}
+# (`__getitem__`: alone, a test gets as far as its load only when its first lookup is by
+# index; after the registry was emptied, every indexed lookup of a key not yet refilled does)
+ORDER_SENSITIVE = {"sqlglot/dialects/dialect.py": ("_try_load", "__getitem__")}
 _ORDER_SPANS = {}
 
 
