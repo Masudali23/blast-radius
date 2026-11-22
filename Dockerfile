@@ -17,7 +17,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BR_COLLECT_FIRST=0 \
     BR_CLEAN_STOP=0.2 \
     BR_CLEAN_MIN=0.2 \
-    BR_PROBE_ONCE=1
+    BR_PROBE_ONCE=1 \
+    BR_DIAG=1
 
 # The labelling environment's packages, from PyPI.
 COPY requirements.lock /app/requirements.lock

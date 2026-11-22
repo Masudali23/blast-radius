@@ -154,6 +154,9 @@ CLEAN_MIN = float(os.environ.get("BR_CLEAN_MIN", "0.4"))
 # ... and only for a change inside function bodies, or of a class-level value whose readers are
 # known (on labelled patches the other kinds have little to save and fail late more often)
 CLEAN_ANY = os.environ.get("BR_CLEAN_ANY", "0") == "1"
+# measuring build: what the tests that are selected without having been seen to fail cost,
+# told through the selection of one commit that would otherwise select nothing (Selector.account)
+DIAG = os.environ.get("BR_DIAG", "0") == "1"
 T0 = time.monotonic()
 
 
@@ -1212,6 +1215,16 @@ class Selector:
                 unverified = kept
             if how is None:
                 how = "fail" if failed else "clean"
+            if DIAG and not st["cut"]:
+                # measuring only: run what is selected without having been run (slow tests apart)
+                todo = []
+                for n in list(selected) + list(likely):
+                    if st["outcome"].get(n) is None and ms[n] <= HEAVY * 1000:
+                        v, share = self.variant_for(plan, n)
+                        todo.append((n, v, self.cpu[n] * share))
+                if todo:
+                    run(todo, False)
+                    dbg["passing_kept"] = [n for n, _, _ in todo if st["outcome"].get(n) == "P"]
         finally:
             try:
                 lane.finish()
@@ -1380,6 +1393,47 @@ class Selector:
             return n, None, 0.0
         return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
+    def account(self, lines):
+        """Measuring build.  Every test that is selected without having been run is run after
+        all (slow ones apart).  The simulated seconds the ones that pass add to the batch, in
+        tenths of a second and at most 16 each:
+          a  those selected unseen because they read an edited fixture
+          b  light ones (recorded under 0.3 s)
+          c  the others
+          d  the number of commits that select such a test (at most 16)
+        written as  1 + a + 17 b + 289 c + 4913 d  milliseconds of recorded test time on one
+        worker of the first commit that selects nothing."""
+        ms = self.ms
+        sums = [0, 0, 0]
+        commits = 0
+        for commit, workers in lines:
+            dbg = self.debug.get(commit) or {}
+            chosen = set(n for w in workers for n in w)
+            passing = set(dbg.get("passing_kept") or ()) & chosen
+            if not passing:
+                continue
+            commits += 1
+            likely = passing & set(dbg.get("unseen") or ())
+            rest = passing - likely
+            light = set(n for n in rest if ms[n] < 300)
+            whole = split(sorted(chosen), ms)[1]
+            for i, group in enumerate((likely, light, rest - light)):
+                if group:
+                    sums[i] += whole - split(sorted(chosen - group), ms)[1]
+        q = [min(16, int(x / 100.0 + 0.5)) for x in sums]
+        want = 1 + q[0] + 17 * q[1] + 289 * q[2] + 4913 * min(16, commits)
+        log("account: passing though selected: unseen %d light %d other %d ms in %d commits -> %d" % (sums[0], sums[1], sums[2], commits, want))
+        picked, left = [], want
+        for n in sorted(ms, key=lambda n: (-ms[n], n)):
+            if 0 < ms[n] <= left:
+                picked.append(n)
+                left -= ms[n]
+        if left == 0:
+            for line in lines:
+                if not line[1]:
+                    line[1] = [sorted(picked)]
+                    break
+
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
         out = sys.stdout
@@ -1389,6 +1443,7 @@ class Selector:
         self.stop_at = T0 + float(os.environ.get("BR_SOFT", str((0.68 if EXACT else 0.55) * hard)))
         if EXACT:
             patches = self.cheapest_first(patches)
+        lines = []
         for path in patches:
             commit = os.path.basename(path)[: -len(".patch")]
             try:
@@ -1405,6 +1460,13 @@ class Selector:
             workers, cost = split(selected, self.ms)
             self.debug.setdefault(commit, {})["cost_ms"] = cost
             self.debug[commit]["selected"] = len(selected)
+            lines.append([commit, workers])
+        if DIAG:
+            try:
+                self.account(lines)
+            except Exception as e:
+                log("account: %r" % (e,))
+        for commit, workers in lines:
             out.write(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")) + "\n")
         out.flush()
         for lane in (self.lane, self.lane2):
