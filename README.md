@@ -157,6 +157,15 @@ CPU time is part of the score, so the selector avoids running what it can decide
 - **Default values**: a different literal default in a function signature can only be seen by a
   call of that function, so the candidates are the tests that enter it (unless something called
   it while modules were still loading).
+- **Reading only what changed** (`br/lean.py`): most of a large module is functions a patch
+  does not touch. When every changed line sits inside one function body, the bodies of all
+  the other functions are replaced by `pass` in both versions (line numbers stay put) and the
+  two small texts are parsed in place of the files; the result is used only when it says that
+  function bodies differ and nothing else, otherwise the files themselves are read. When the
+  patch keeps the number of lines the worker compiles the same two texts for the hot swap.
+  The index of function bodies is made from the pinned checkout when the image is built
+  (`tools/build_spans.py`), which also checks, file by file, that blanking gives the same
+  tree. Plans are identical with and without it on 4,220 patches.
 - **Import check**: narrowing a module or class level edit assumes the module still imports.
   Unless the edit plainly cannot raise (a constant swapped inside a literal), the patched module
   is first imported on its own; if that fails, every test that imports it is selected.

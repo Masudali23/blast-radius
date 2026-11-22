@@ -23,7 +23,7 @@ import time
 import types
 import unittest
 
-from br import answers, infect, memo, tables, variants
+from br import answers, infect, lean, memo, tables, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
@@ -159,11 +159,23 @@ def _pair(old, new, out, inside_func):
     return True
 
 
+def _const_text(k):
+    """A constant as text; a set of constants reads the same whatever order it happens to list
+    its members in (that order is not the same from one compilation to the next)."""
+    if isinstance(k, types.CodeType):
+        return "<code>"
+    if type(k) is frozenset:
+        return ("frozenset", tuple(sorted(repr(_const_text(x)) for x in k)))
+    if type(k) is tuple:
+        return ("tuple", tuple(_const_text(x) for x in k))
+    return (type(k).__name__, repr(k))
+
+
 def _own_differs(old, new):
     """True when module/class-level bytecode itself differs (not just nested functions)."""
     if bool(old.co_flags & 1):
         return False
-    strip = lambda c: tuple("<code>" if isinstance(k, types.CodeType) else (type(k).__name__, repr(k)) for k in c.co_consts)
+    strip = lambda c: tuple(_const_text(k) for k in c.co_consts)
     if old.co_code != new.co_code or old.co_names != new.co_names or strip(old) != strip(new):
         return True
     oc, nc = _children(old), _children(new)
@@ -191,13 +203,18 @@ def _cached_code(base_path):
         return None
 
 
-def hot_swap(path, old_src, new_src, probe=False, base_path=None):
+def hot_swap(path, old_src, new_src, probe=False, base_path=None, small=None):
     """Replace the code of every live function defined in `path` whose source changed.
 
     Returns None on success, or a string explaining why a fresh import is required.
     With probe=True the changed expression is instrumented (see br.infect); PROBED records
     whether that worked.
+    `small`: the two sources with the bodies of the untouched functions blanked (br/lean.py);
+    the functions that differ compile to the same code from those.
     """
+    if small is not None:
+        old_src, new_src = small
+        base_path = None
     old_top = _cached_code(base_path) if base_path else None
     if old_top is None:
         try:
@@ -586,7 +603,10 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
             except OSError as e:
                 runner.emit("X read %s: %r" % (rel, e))
                 return
-            why = hot_swap(path, old_src, new_src, probe=rel in job.get("probe", ()), base_path=os.path.join(base, rel))
+            small = lean.reduce(rel, old_src, new_src) if rel in job.get("lean", ()) else None
+            if small is not None:
+                small = small[:2] if small[2] == 0 else None
+            why = hot_swap(path, old_src, new_src, probe=rel in job.get("probe", ()), base_path=os.path.join(base, rel), small=small)
             if why:
                 runner.emit("X %s: %s" % (rel, why))
                 return
@@ -906,6 +926,7 @@ def main():
     # the stores are read once, before anything is forked
     answers.load()
     tables.load()
+    lean.load()
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     serve("bare", overlay, base, in_fd, out_fd, spares)
 

@@ -7,7 +7,7 @@ import re
 import sys
 import tokenize
 
-from . import analyze, boolrel, infect, patch, relations
+from . import analyze, boolrel, infect, lean, patch, relations
 
 # Files that configure the test run itself.  We cannot model those, so such a commit runs everything.
 # how far to narrow a class-attribute change: "off", "class" (instances of the class) or
@@ -36,7 +36,7 @@ RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "us
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts", "uses")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts", "uses", "lean")
 
     def __init__(self, commit):
         self.commit = commit
@@ -70,6 +70,9 @@ class Plan:
         # kind in classes / attr_reads / dict_keys / dict_calls / pairs [(file, line)] /
         # range [file, lo, hi].  (For asking whether one half of a test can notice it.)
         self.uses = {}
+        # hot-swapped files whose change was read off reduced texts (br/lean.py): the worker
+        # compiles the same two texts
+        self.lean = []
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -252,7 +255,19 @@ def _changed(plan, rel, old, new, base, maps, opts):
         plan.syntax = True
         plan.add("mod", rel, 0, 0, maps.imports.get(rel, 0) | readers | maps.any_line(rel))
         return
-    status, changes = analyze.diff_python(old_t, new_t)
+    small = lean.reduce(rel, old, new)
+    reduced = False
+    if small is not None:
+        # every changed line sits in one function body: compare the two files with the bodies
+        # of the other functions blanked.  That is the whole answer when it says "function
+        # bodies differ and nothing else"; anything else is asked of the files themselves.
+        small_old, small_new = _decode(small[0]), _decode(small[1])
+        status, changes = analyze.diff_python(small_old, small_new)
+        if status == "diff" and changes and all(c.level == "func" for c in changes):
+            old_t, new_t = small_old, small_new
+            reduced = True
+    if not reduced:
+        status, changes = analyze.diff_python(old_t, new_t)
     if status != "syntax" and new.split(b"\n", 2)[:2] != old.split(b"\n", 2)[:2]:
         # the first two lines may carry an encoding declaration: a "comment" that decides
         # whether the file can be read at all
@@ -454,6 +469,8 @@ def _changed(plan, rel, old, new, base, maps, opts):
         pass  # no function changes and nothing to import afresh
     elif hot:
         plan.swaps.append(rel)
+        if reduced and small[2] == 0:
+            plan.lean.append(rel)
         if PROBE_EXPR and len(changes) == 1 and not changes[0].coarse and shapes_ok() and analyze.TREES:
             if infect.applicable(analyze.TREES[0], analyze.TREES[1]):
                 plan.probe.append(rel)
@@ -485,6 +502,16 @@ def _outermost(tree, lo, hi):
     return lo, hi
 
 
+_FORMULAS = [None, None]
+
+
+def _formulas(tree):
+    """boolrel.formulas(tree), walked once per tree."""
+    if _FORMULAS[0] is not tree:
+        _FORMULAS[0], _FORMULAS[1] = tree, boolrel.formulas(tree)
+    return _FORMULAS[1]
+
+
 def _regrouped(maps, rel, regroup, old_tree):
     """Tests in which the regrouped condition can behave differently, from its recorded
     evaluations; None when nothing can be said."""
@@ -493,7 +520,7 @@ def _regrouped(maps, rel, regroup, old_tree):
     if seen is None:
         return None
     truth_only = None
-    for n, flag in boolrel.formulas(old_tree):
+    for n, flag in _formulas(old_tree):
         if n is node:
             truth_only = flag
     if truth_only is None:
@@ -582,7 +609,7 @@ def _entries_regrouped(maps, rel, regroup, old_tree):
     node, old, new, impure = regroup
     key = boolrel.site_key(node)
     truth_only = None
-    for n, flag in boolrel.formulas(old_tree):
+    for n, flag in _formulas(old_tree):
         if n is node:
             truth_only = flag
 

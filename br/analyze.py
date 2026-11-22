@@ -477,16 +477,16 @@ def diff_python(old_src, new_src):
     except (SyntaxError, ValueError, RecursionError):
         return "diff", [Change("mod", (1, 10**9), coarse=True, what="old-unparseable")]
     same = SAME[0] = same_text(old_src, new_src)
-    if same is None:
-        if ast.dump(old_tree) == ast.dump(new_tree):
-            return "same", []
-    elif _equal(old_tree.body, new_tree.body, same) and _equal(old_tree.type_ignores, new_tree.type_ignores, same):
-        return "same", []
     d = Differ(same)
     d.stmts(old_tree.body, new_tree.body, old_tree, None)
     if not d.changes:
-        # only docstrings differ (we strip them): harmless for the test-suite, but stay honest
-        return "doc", []
+        # (two equal trees give no changes, so whether they are equal is asked only here)
+        if same is None:
+            equal = ast.dump(old_tree) == ast.dump(new_tree)
+        else:
+            equal = _equal(old_tree.body, new_tree.body, same) and _equal(old_tree.type_ignores, new_tree.type_ignores, same)
+        # "doc": only docstrings differ (we strip them): harmless for the test-suite, but stay honest
+        return ("same" if equal else "doc"), []
     TREES.extend((old_tree, new_tree))
     return "diff", d.changes
 
@@ -546,11 +546,12 @@ def _member_shapes(stmt, chain, out):
 
     node = stmt
     for name in reversed(chain):
-        node = ast.ClassDef(name=name, bases=[], keywords=[], body=[node], decorator_list=[])
+        # (the statement comes from the parser, with every position it needs; the classes put
+        # around it get the positions ast.fix_missing_locations would give them)
+        node = ast.ClassDef(name=name, bases=[], keywords=[], body=[node], decorator_list=[], lineno=1, col_offset=0, end_lineno=1, end_col_offset=0)
         if "type_params" in ast.ClassDef._fields:
             node.type_params = []
     module = ast.Module(body=[node], type_ignores=[])
-    ast.fix_missing_locations(module)
     stack = [compile(module, "<x>", "exec", dont_inherit=True)]
     while stack:
         c = stack.pop()

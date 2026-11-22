@@ -5,6 +5,7 @@ tools/*
 !tools/fetch_sqlglot.py
 !tools/build_tables.py
 !tools/build_answers.py
+!tools/build_spans.py
 output.jsonl
 *.md
 __pycache__

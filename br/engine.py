@@ -193,7 +193,7 @@ class Lane:
                     error = "child exit status %d" % status
                 return results, error, False
 
-    def run(self, mode, tests, swap=(), stop_on_fail=False, deadline=60.0, probe=(), stages=False, cpu_budget=None, imports=(), consts=()):
+    def run(self, mode, tests, swap=(), stop_on_fail=False, deadline=60.0, probe=(), stages=False, cpu_budget=None, imports=(), consts=(), lean=()):
         """Run tests [(test_id, limit_seconds[, variant])] in a fresh child of the `mode` worker.
 
         Returns (results, error): results maps index -> (outcome, cpu_ms, evals, differ) for the
@@ -208,7 +208,7 @@ class Lane:
         self._deadline = deadline
         self.cut = None
         self.unimportable = []
-        self._send(p, {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget, "imports": list(imports), "consts": list(consts)})
+        self._send(p, {"tests": tests, "swap": list(swap), "stop_on_fail": stop_on_fail, "deadline": deadline, "probe": list(probe), "stages": stages, "cpu_budget": cpu_budget, "imports": list(imports), "consts": list(consts), "lean": list(lean)})
         results, error, alive = self._collect(p, mode)
         self._open = alive
         return results, error

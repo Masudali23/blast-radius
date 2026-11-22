@@ -161,9 +161,11 @@ CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
-# ("2": lines may be added or removed as well, as long as none of them is such a line)
+# ("2": lines may be added or removed as well, as long as none of them is such a line;
+# "3": lines may only be added, and only around a statement that leaves its block)
 FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
+FLOW = ("return", "raise", "continue", "break", "pass")
 T0 = time.monotonic()
 
 
@@ -322,8 +324,16 @@ class Selector:
             if state["file"] and state["file"].endswith(".py"):
                 minus = [x for x in state["minus"] if x.strip() and not x.lstrip().startswith("#")]
                 plus = [x for x in state["plus"] if x.strip() and not x.lstrip().startswith("#")]
-                if len(minus) != len(plus) and FAST_SIMPLE == "1":
-                    state["ok"] = False
+                if len(minus) != len(plus):
+                    if FAST_SIMPLE == "1":
+                        state["ok"] = False
+                    elif FAST_SIMPLE == "3":
+                        # lines may only be added, one of them a statement that leaves the
+                        # block (return, raise, continue, break) or `pass`, none of them
+                        # opening a block or continuing a list
+                        leaves = [x.strip().split("(")[0].split(" ")[0] in FLOW for x in plus]
+                        if minus or not any(leaves) or any(x.strip().endswith((",", ":")) for x in plus):
+                            state["ok"] = False
                 for x in minus + plus:
                     if x.strip().startswith(STRUCTURAL):
                         state["ok"] = False
@@ -352,7 +362,7 @@ class Selector:
 
     def decide(self, commit, data):
         global CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
-        if FAST_SIMPLE not in ("1", "2") or self.simple_edit(data):
+        if FAST_SIMPLE not in ("1", "2", "3") or self.simple_edit(data):
             return self.decide_as_set(commit, data)
         # not the kind of change the shortcuts were measured on: none of them here
         saved = CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
@@ -438,7 +448,7 @@ class Selector:
                 for rel, content in plan.files.items():
                     lane.overlay.set_file(rel, content)
                 full = m == "full"
-                results, err = lane.run(m, jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), deadline=wait, cpu_budget=cpu)
+                results, err = lane.run(m, jobs, swap=plan.swaps if full else (), lean=plan.lean if full else (), consts=plan.consts if full else (), deadline=wait, cpu_budget=cpu)
                 if err and full and not results:
                     lane.overlay.restore()
                     m = lane.fresh_mode(plan.files)
@@ -940,7 +950,7 @@ class Selector:
                 budget = 30.0 + 4.0 * (total_est + sum(e for _, _, e in deferred)) / 1000.0
                 budget = max(10.0, min(budget, self.stop_at + 30.0 - time.monotonic()))
                 full = st["mode"] == "full"
-                results, err = lane.run(st["mode"], jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), probe=plan.probe if full else (), stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
+                results, err = lane.run(st["mode"], jobs, swap=plan.swaps if full else (), lean=plan.lean if full else (), consts=plan.consts if full else (), probe=plan.probe if full else (), stop_on_fail=stop_on_fail, deadline=budget, stages=True, cpu_budget=cpu_budget)
                 if err and full and not results:
                     # the warm worker cannot take this change: start from a fresh import instead
                     dbg["fallback"] = err
@@ -1340,7 +1350,7 @@ class Selector:
             to_run.sort(key=lambda it: it[0])
             jobs = [(self.id_of[n], max(1.5, 5.0 * e * self.slack.get(n, 1.0) / 1000.0 + 0.5), v) for n, v, e in to_run]
             full = mode == "full"
-            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), consts=plan.consts if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
+            results, err = lane.run(mode, jobs, swap=plan.swaps if full else (), lean=plan.lean if full else (), consts=plan.consts if full else (), deadline=60.0, cpu_budget=COMMIT_CPU)
             if err and full and not results:
                 dbg["fallback"] = err
                 lane.overlay.restore()

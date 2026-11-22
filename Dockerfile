@@ -19,6 +19,11 @@ COPY br /app/br
 COPY selector.py /app/selector.py
 COPY maps /app/maps
 
+# Where the function bodies of the larger modules are (br/lean.py).  Optional: without the
+# file every patched module is read whole.
+COPY tools/build_spans.py /app/tools/build_spans.py
+RUN python /app/tools/build_spans.py /app/repo /app/spans.pkl || true
+
 # The executor tests' fixture tables, parsed once from the pinned checkout (br/tables.py).
 # Optional: without the file the tests' own set-up parses them at run time.
 # maps/frames.pkl holds what DuckDB answers to those tests' queries; it was written by this
