@@ -4,6 +4,7 @@ The result is a list of Change records in OLD-file line numbers, which is what t
 coverage maps (built from the pinned commit) are keyed by.
 """
 import ast
+import os
 
 FUNC_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.GeneratorExp)
 BODY_FIELDS = ("body", "orelse", "finalbody")
@@ -21,13 +22,17 @@ class Change:
     cls:    name of the enclosing class for class-body changes (or None)
     """
 
-    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what", "stmts", "calls")
+    __slots__ = ("level", "lines", "coarse", "names", "scope_span", "cls", "cls_lines", "what", "stmts", "calls", "header")
 
     def __init__(self, level, lines, coarse=False, names=None, scope_span=None, cls=None, what="", stmts=None):
         self.stmts = stmts  # (old statement, new statement) for a module / class level change
         # span of the function whose literal default value is all that changed (else None):
         # such a change is only ever seen by a call of that function
         self.calls = None
+        # ... or of the function whose decorators ("decorators") or name (("name", old, new)) are
+        # all that changed outside its body: seen by a call of that function, or - unlike a default
+        # value - by whatever looks at the function while modules are loading
+        self.header = None
         self.level = level
         self.lines = lines
         self.coarse = coarse
@@ -93,6 +98,11 @@ def _target_names(stmt):
     return names or None
 
 
+# a body that only gained new, undecorated functions is compared statement by statement around
+# them (else: one change the size of the whole body)
+ADDED_DEFS = os.environ.get("BR_ADDED_DEFS", "1") == "1"
+
+
 class _Ctx:
     __slots__ = ("scope", "stmt", "header", "cls", "new")
 
@@ -150,12 +160,21 @@ class Differ:
     # -- comparison --------------------------------------------------------
     def stmts(self, olist, nlist, ctx_scope, cls):
         """Compare two statement lists that live directly in `ctx_scope`."""
+        pairs = None
         if len(olist) != len(nlist) or any(type(a) is not type(b) for a, b in zip(olist, nlist)):
-            # try to salvage: common prefix / suffix are unchanged, the middle is a structural edit
-            self._report(_Ctx(ctx_scope, None, cls=cls), coarse=True, what="stmt-list")
-            return
+            found = _added_defs(olist, nlist, isinstance(ctx_scope, ast.Module)) if ADDED_DEFS and len(nlist) > len(olist) and not isinstance(ctx_scope, FUNC_SCOPES) else None
+            if found is None:
+                # try to salvage: common prefix / suffix are unchanged, the middle is a structural edit
+                self._report(_Ctx(ctx_scope, None, cls=cls), coarse=True, what="stmt-list")
+                return
+            pairs, added = found
+            for anchor, name in added:
+                line = anchor or getattr(ctx_scope, "lineno", None) or 1
+                ch = Change("mod", (line, line), cls=cls, what="def-added")
+                ch.header = ("added", name)
+                self.changes.append(ch)
         same = self.same
-        for o, n in zip(olist, nlist):
+        for o, n in pairs if pairs is not None else zip(olist, nlist):
             if same is not None and same(o, n):
                 continue  # written identically: nothing to find
             self.stmt(o, n, ctx_scope, cls)
@@ -169,6 +188,7 @@ class Differ:
         ctx = _Ctx(scope, o, cls=cls, new=n)
         if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef)):
             # name / decorators / defaults / annotations are evaluated in the enclosing scope
+            start = len(self.changes)
             if o.name != n.name:
                 self._report(ctx, what="def-name")
             hctx = _Ctx(scope, o, header=True, cls=cls)
@@ -179,6 +199,15 @@ class Differ:
                 for ch in self.changes[before:]:
                     if ch.level == "mod" and not ch.coarse:
                         ch.calls = _span(o)
+            elif len(self.changes) > start and not isinstance(scope, FUNC_SCOPES):
+                kind = _header_only(o, n)
+                if kind not in ("annotations", "signature") and (o.name.startswith("__") or n.name.startswith("__")):
+                    kind = None  # (Python itself calls these, and not only by entering them)
+                if kind:
+                    for ch in self.changes[start:]:
+                        if ch.level == "mod" and not ch.coarse:
+                            ch.calls = _span(o)
+                            ch.header = kind
             self.stmts(_strip_doc(o.body), _strip_doc(n.body), o, None)
             return
         if isinstance(o, ast.ClassDef):
@@ -354,7 +383,7 @@ def harmless_at_import(change):
     if not change.stmts:
         return False
     o, n = change.stmts
-    if change.calls:
+    if change.calls and not change.header:
         return True  # literal default values (see _defaults_only)
     if type(o) is not type(n) or not isinstance(o, (ast.Assign, ast.AnnAssign)):
         return False
@@ -369,6 +398,86 @@ def harmless_at_import(change):
     if isinstance(o, ast.AnnAssign) and ast.dump(o.annotation) != ast.dump(n.annotation):
         return False
     return _same_but_constants(o.value, n.value, True)
+
+
+def _bare_args(args):
+    """The arguments of a def without their annotations, as text."""
+    import copy
+
+    args = copy.deepcopy(args)
+    for arg in args.posonlyargs + args.args + args.kwonlyargs + [x for x in (args.vararg, args.kwarg) if x is not None]:
+        arg.annotation = None
+    return ast.dump(args)
+
+
+def _added_defs(olist, nlist, module=False):
+    """When `nlist` is `olist` with plain new functions put in between: (the statements that
+    pair up, [(old line the function follows, its name)]).  None otherwise.  A new function
+    counts only if nothing about it is evaluated beyond its own definition (no decorators) and
+    its name is not one Python or sqlglot look up by pattern.  In a module (not in a class,
+    where an enumeration would take it for a member) a new name given a literal value counts
+    as well."""
+    taken = set()
+    for st in olist:
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            taken.add(st.name)
+        else:
+            taken.update(_target_names(st) or ())
+    pairs, added = [], []
+    i = 0
+    anchor = None
+    for n in nlist:
+        o = olist[i] if i < len(olist) else None
+        if o is not None and type(o) is type(n) and (not isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or o.name == n.name):
+            pairs.append((o, n))
+            anchor = o.end_lineno
+            i += 1
+            continue
+        if module and isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name) and _literal(n.value):
+            name = n.targets[0].id
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and not n.decorator_list:
+            name = n.name
+        else:
+            return None
+        if name in taken or name.startswith("__") or name.endswith("_sql") or name.startswith("test"):
+            return None
+        taken.add(name)
+        added.append((anchor, name))
+    if i != len(olist) or not added:
+        return None
+    return pairs, added
+
+
+def _header_only(o, n):
+    """How two versions of a def differ outside the body: in their decorators only
+    ("decorators"), in their name only (("name", old, new)), or - when neither has decorators -
+    in annotations only ("annotations") or otherwise in arguments ("signature").  Else None."""
+
+    def part(node, f):
+        v = getattr(node, f, None)
+        if isinstance(v, list):
+            return ast.dump(ast.Tuple(elts=list(v), ctx=ast.Load()))
+        return ast.dump(v) if v is not None else ""
+
+    same = {f: part(o, f) == part(n, f) for f in ("decorator_list", "args", "returns", "type_params")}
+    if type(o) is not type(n):
+        return None
+    if not (same["args"] and same["returns"]):
+        # annotations are never looked at by the code under test (nothing asks for a function's
+        # type hints); an undecorated function whose annotations alone changed is the same
+        # function, provided the module still loads
+        if o.name == n.name and same["decorator_list"] and same["type_params"] and not o.decorator_list:
+            # ... and one that takes other arguments, or has other defaults, is noticed where
+            # it is called (nothing wraps it or reads its signature when it has no decorator)
+            return "annotations" if _bare_args(o.args) == _bare_args(n.args) else "signature"
+        return None
+    if not same["type_params"]:
+        return None
+    if "cache" in part(o, "decorator_list").lower() or "cache" in part(n, "decorator_list").lower():
+        return None  # a cached function is not entered by every test that uses it
+    if o.name == n.name:
+        return None if same["decorator_list"] else "decorators"
+    return ("name", o.name, n.name) if same["decorator_list"] else None
 
 
 def _defaults_only(o, n):

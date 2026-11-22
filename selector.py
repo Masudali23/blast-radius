@@ -1161,7 +1161,8 @@ class Selector:
                         break
                     first.append(item)
                     spent += item[2]
-                if len(order) - len(first) <= CLEAN_FEW or sum(it[2] for it in order[len(first):]) <= CLEAN_REST * 1000:
+                left = order[len(first):]
+                if left and ((CLEAN_FEW > 0 and len(left) <= CLEAN_FEW) or (CLEAN_REST > 0 and sum(it[2] for it in left) <= CLEAN_REST * 1000)):
                     first = order
             if first:
                 failed, rest = run(first, STOP_FIRST)
@@ -1248,7 +1249,8 @@ class Selector:
                     keep = keep + [n for n in unseen2 if n in st["undecided"]]
                 keep = kept + keep
                 looked = {}  # slow test -> (its sample, what the first part said) once that part passed
-                after_cut = st["cut"] == "timeout" and LOOK_CUT != "0"
+                # (only while the worker that was stopped still answers: it is let go first)
+                after_cut = st["cut"] == "timeout" and LOOK_CUT != "0" and st["open"] and getattr(lane, "_open", False)
                 if after_cut:
                     st["again"] = 1
                 if keep and failed and FIRST_LOOK and (not st["cut"] or after_cut) and SAMPLE_SHARE > 0:

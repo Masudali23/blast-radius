@@ -19,6 +19,8 @@ REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 REFINE_RELATIONS = os.environ.get("BR_REFINE_RELATIONS", "1") == "1"
 # an edited literal default value of a function is in play only for tests that call the function
 REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
+# a def whose decorators or name alone changed: the tests that enter the function (see _plan)
+REFINE_HEADERS = os.environ.get("BR_REFINE_HEADERS", "1") == "1"
 # narrow an edited class-level constant to the tests that read it from that class
 REFINE_ATTRS = os.environ.get("BR_REFINE_ATTRS", "1") == "1"
 # hand a changed literal class constant to the warm worker instead of importing afresh
@@ -426,7 +428,44 @@ def _changed(plan, rel, old, new, base, maps, opts):
                 # class or module, with effects no reader index knows about
                 plan.add("mod", rel, lo, hi, maps.imports.get(rel, 0) | maps.any_line(rel) | mask)
                 continue
-            if mask and c.calls and REFINE_DEFAULTS:
+            if c.header and c.header[0] == "added":
+                # a new function next to the old ones: nobody can call it by name unless the
+                # name is in use somewhere already; the module must still load (checked)
+                everyone = maps.imports.get(rel, 0) | maps.any_line(rel)
+                try:
+                    unused = REFINE_HEADERS and not _ident_lines(base, c.header[1], maps)
+                except Exception:
+                    unused = False
+                if unused:
+                    plan.notes.append("header-narrowed %s:%d added: %d -> 0" % (rel, lo, bin(everyone).count("1")))
+                    plan.add("mod", rel, lo, hi, 0)
+                    _import_guard(plan, rel, c, everyone, 0)
+                else:
+                    plan.add("mod", rel, lo, hi, everyone)
+                continue
+            if mask and c.calls and c.header and REFINE_HEADERS:
+                flo, fhi = c.calls
+                if c.header == "annotations":
+                    callers = 0
+                else:
+                    callers = None if maps.ran_at_import(rel, flo, fhi) else maps.func(rel, flo, fhi)
+                if callers is not None and isinstance(c.header, tuple):
+                    callers = _renamed_users(maps, base, rel, c, callers)
+                if callers is not None:
+                    # A function that only lost, gained or changed a decorator, or got another
+                    # name: nothing called it while modules were loading, so a test that never
+                    # entered it does not notice - unless the module no longer loads (checked),
+                    # or something reads the old name while loading (those are counted in).
+                    plan.notes.append("header-narrowed %s:%d %s: %d -> %d" % (rel, flo, c.header if isinstance(c.header, str) else "name", bin(mask).count("1"), bin(callers).count("1")))
+                    plan.add("mod", rel, lo, hi, callers)
+                    if c.header in ("decorators", "signature"):
+                        # of a sliced test, the entries that enter the function (a renamed
+                        # one can also be missed by a whole module: no such narrowing there)
+                        plan.entry[(rel, lo, hi)] = (lambda r, a, b: lambda test_id: maps.entry_lines(test_id, r, a, b, loading=False))(rel, flo, fhi)
+                        plan.uses[(rel, lo, hi)] = [[("range", [rel, flo, fhi])]]
+                    _import_guard(plan, rel, c, everyone, callers)
+                    continue
+            if mask and c.calls and not c.header and REFINE_DEFAULTS:
                 flo, fhi = c.calls
                 if not maps.ran_at_import(rel, flo, fhi):
                     # nothing called the function while modules were loading, so the default is
@@ -840,6 +879,32 @@ def _all_of(factors):
 
     entries.explained = explained
     return entries
+
+
+def _renamed_users(maps, base, rel, c, callers):
+    """`callers` plus the tests that run, while modules load, a line that mentions the old name
+    of a renamed function (an import of it, a table that refers to it); None when such a line
+    sits in a function that ran while modules were loading, or the mentions cannot be listed."""
+    _, name, new_name = c.header
+    try:
+        if _ident_lines(base, new_name, maps):
+            return None  # the new name is in use already: the function now stands in for another
+        where = _ident_lines(base, name, maps)
+    except Exception:
+        return None
+    flo, fhi = c.calls
+    for f, lines in where.items():
+        if f.startswith("tests/"):
+            # a test file that mentions the name: all of its tests, and whoever imports it
+            callers |= maps.imports.get(f, 0) | maps.any_line(f)
+            continue
+        for line in lines:
+            if f == rel and flo <= line <= fhi:
+                continue
+            if maps.ran_at_import(f, line, line):
+                return None
+            callers |= maps.mod(f, line, line)
+    return callers
 
 
 def _users(names, base, maps, rel, own_lines):
