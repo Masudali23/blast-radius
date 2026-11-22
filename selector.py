@@ -52,6 +52,8 @@ P_PASS_AGAIN = float(os.environ.get("BR_P_PASS_AGAIN", str(P_PASS_FAILED)))
 P_PASS_REST = float(os.environ.get("BR_P_PASS_REST", "0"))
 # ... a test lighter than this many recorded seconds is not run on its own after a failure
 AGAIN_MIN = float(os.environ.get("BR_AGAIN_MIN", "1.0"))
+# ... but any test left is run when its estimated cost is under this share of its recorded time
+LIGHT_RATIO = float(os.environ.get("BR_LIGHT_RATIO", "0"))
 # ... and the same two when at least this many tests passed before the first failure
 MIXED_AFTER = int(os.environ.get("BR_MIXED_AFTER", "1000000"))
 P_PASS_AGAIN_MIXED = float(os.environ.get("BR_P_PASS_AGAIN_MIXED", str(P_PASS_AGAIN)))
@@ -1159,6 +1161,15 @@ class Selector:
                     if kept and sum(by[n][2] for n in kept) < p_rest * (current - cost_of(failed)):
                         again.extend(by[n] for n in kept)
                         kept = []
+                    elif kept and LIGHT_RATIO > 0:
+                        # ... and one by one, the ones whose run is estimated at a small share
+                        # of the seconds they add when left in (measured: over four in five of
+                        # those pass, and the estimate is on the high side)
+                        cheap_ones = [n for n in kept if by[n][2] < LIGHT_RATIO * ms[n]]
+                        if cheap_ones:
+                            again.extend(by[n] for n in cheap_ones)
+                            gone = set(cheap_ones)
+                            kept = [n for n in kept if n not in gone]
                     if again:
                         again.sort(key=lambda it: it[0])
                         f2, u2 = run(again, False)

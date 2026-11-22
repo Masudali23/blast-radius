@@ -333,13 +333,49 @@ def give_constant(path, names, attr, old_repr, new_repr):
 
 
 # --------------------------------------------------------------------------- running tests
+# A failing test is all we need to know.  unittest goes on to describe the failure: a diff of
+# the two values (difflib over their pretty-printed forms) inside the assert method, and a
+# formatted traceback (which reads the source files) when the result records it.  Nobody reads
+# either here ("0" keeps them; so does a failure log).
+QUIET = os.environ.get("BR_QUIET", "1") == "1" and not FAILLOG
+
+
+class QuietResult(unittest.TestResult):
+    """Records that a test failed without putting the text of the failure together."""
+
+    def _exc_info_to_string(self, err, test):
+        return ""
+
+
+def quiet_asserts():
+    """Make unittest's assert methods raise with a short message: the comparison itself, and
+    so whether a test fails, is untouched; only the text describing a difference is not built.
+    (These are names of unittest.case alone: sqlglot and its tests keep the real modules.)"""
+    import unittest.case as case
+
+    class _NoDiff:
+        @staticmethod
+        def ndiff(a, b, *args, **kwargs):
+            return ()
+
+    class _NoPretty:
+        @staticmethod
+        def pformat(obj, *args, **kwargs):
+            return ""
+
+    case.difflib = _NoDiff
+    case.pprint = _NoPretty
+    case.safe_repr = lambda obj, short=False: "..."
+    case._common_shorten_repr = lambda *args: tuple("..." for _ in args)
+
+
 class Runner:
     def __init__(self, out_fd):
         self.out = out_fd
         self.note = ""  # a word about the last test run, sent along with its outcome
         self.classes = dict(PRESET)
         self.modules = {}
-        self.result = unittest.TestResult()
+        self.result = QuietResult() if QUIET else unittest.TestResult()
         self.result._testRunEntered = True
         # a test with one failing subtest has failed: no need to finish its loop
         self.result.failfast = True
@@ -965,6 +1001,8 @@ def main():
     from br import inlinepool
 
     inlinepool.install()
+    if QUIET:
+        quiet_asserts()
     _mark("stdlib")
     for name in sys.argv[7:]:
         try:
