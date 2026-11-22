@@ -33,10 +33,15 @@ USE_READS = os.environ.get("BR_USE_READS", "1") == "1"
 PROBE_EXPR = os.environ.get("BR_PROBE_EXPR", "0") == "1"
 
 RUNNER_CONFIG = ("conftest.py", "pytest.ini", "tox.ini", "sitecustomize.py", "usercustomize.py")
+# Fixture files that the warm worker has read, but only inside the executor tests' class set-up
+# (run there before forking to save its cost): no module depends on them, so a child of the
+# warm worker that runs the set-up again on the patched file is where a fresh import would be.
+SETUP_FILES = ("tests/fixtures/optimizer/tpc-h/tpc-h.sql", "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql")
+HOT_SETUP = os.environ.get("BR_HOT_SETUP", "1") == "1"
 
 
 class Plan:
-    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts", "uses", "lean")
+    __slots__ = ("commit", "unknown", "cand", "sure", "fresh", "files", "swaps", "notes", "syntax", "data_only", "kinds", "parts", "probe", "imports", "wide", "code_files", "partner_swaps", "entry", "consts", "uses", "lean", "redo_setup")
 
     def __init__(self, commit):
         self.commit = commit
@@ -73,6 +78,7 @@ class Plan:
         # hot-swapped files whose change was read off reduced texts (br/lean.py): the worker
         # compiles the same two texts
         self.lean = []
+        self.redo_setup = False  # class set-ups run before the fork must run again (SETUP_FILES)
 
     def add(self, kind, rel, lo, hi, mask):
         if mask:
@@ -227,7 +233,11 @@ def _changed(plan, rel, old, new, base, maps, opts):
         return
     readers = maps.opened.get(rel, 0)
     if rel in maps.import_files:
-        plan.fresh = True  # the warm worker already consumed the old content
+        if HOT_SETUP and rel in SETUP_FILES:
+            # read by a class set-up alone: a child of the warm worker runs that set-up again
+            plan.redo_setup = True
+        else:
+            plan.fresh = True  # the warm worker already consumed the old content
     if not rel.endswith(".py"):
         plan.kinds.add("data")
         plan.add("data", rel, 0, 0, readers)

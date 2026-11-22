@@ -373,6 +373,7 @@ class Runner:
     def __init__(self, out_fd):
         self.out = out_fd
         self.note = ""  # a word about the last test run, sent along with its outcome
+        self.redone = False  # the set-ups made before the fork are being made again here
         self.classes = dict(PRESET)
         self.modules = {}
         self.result = QuietResult() if QUIET else unittest.TestResult()
@@ -435,7 +436,7 @@ class Runner:
             return "F"  # pytest would not find it: treat as failing, the caller selects it
         if getattr(cls, "__unittest_skip__", False):
             return "S"
-        if variant and variant.get("setup") and cls in PRESET:
+        if variant and variant.get("setup") and cls in PRESET and not self.redone:
             return "U"  # this set-up ran before the fork, on the pinned files
         state = self._class(cls)
         if state == "skip":
@@ -674,6 +675,10 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 return
         if job.get("consts"):
             runner.classes = {}  # class set-ups made before the fork saw the old value
+        if job.get("redo_setup"):
+            # ... or read a fixture file the patch edits: they run again here, on the new file
+            runner.classes = {}
+            runner.redone = True
         if PROBED[0]:
             infect.install()
             runner.emit("I %d" % PROBED[0])
