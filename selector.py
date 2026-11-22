@@ -79,6 +79,8 @@ RELATED_CAP = float(os.environ.get("BR_RELATED_CAP", "1000"))
 FIRST_LOOK = os.environ.get("BR_FIRST_LOOK", "1") == "1"
 # measuring only: let the slow test go as soon as that first part has passed
 FIRST_ONLY = os.environ.get("BR_FIRST_ONLY", "0") == "1"
+# ... and then that first part is no more than this many of its least expensive entries (0: all)
+FIRST_N = int(os.environ.get("BR_FIRST_N", "0"))
 # seconds to wait for the stand-alone import check of a patched module
 IMPORT_WAIT = 45.0
 # recognise unchanged hand-overs to the slow half of the executor's TPC-DS test
@@ -1053,7 +1055,12 @@ class Selector:
                         if sv is None or sv[1] >= P_PASS_SAMPLE * weight:
                             continue
                         st["planned"] += sv[1] / 1000.0
-                        f3, u3 = run([(n, sv[0][0][0], sv[0][0][1])], False, patience=1.8)
+                        look, look_est = sv[0][0]
+                        if FIRST_ONLY and 0 < FIRST_N < len(look.get("allow", ())):
+                            look_est *= float(FIRST_N) / len(look["allow"])
+                            look = dict(look)
+                            look["allow"] = look["allow"][:FIRST_N]
+                        f3, u3 = run([(n, look, look_est)], False, patience=1.8)
                         dbg.setdefault("first_part", []).append((n, st["note"].get(n, "")))
                         if f3:
                             failed.append(n)
