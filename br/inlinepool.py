@@ -6,7 +6,14 @@ pickle round trip of arguments and results that a real pool performs.
 """
 import pickle
 from concurrent.futures import Future
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures._base import BrokenExecutor
+
+
+class BrokenProcessPool(BrokenExecutor):
+    """What a real pool raises once it is broken.  (Defined here, with the name and the base of
+    the real one: importing concurrent.futures.process loads the whole multiprocessing
+    machinery, which nothing here uses.)"""
+
 
 # A real pool breaks for good when its parent cannot read what a worker sent back (an answer
 # or an exception that pickles but does not load again): the call in flight and every later
@@ -119,7 +126,11 @@ class LazyPool(InlinePool):
 
 def install():
     import concurrent.futures as cf
-    import concurrent.futures.process as cfp
+    import sys
 
+    # (set on the package, so `from concurrent.futures import ProcessPoolExecutor` finds it
+    # without loading the real module; if something has loaded that one already, there too)
     cf.ProcessPoolExecutor = InlinePool
-    cfp.ProcessPoolExecutor = InlinePool
+    cfp = sys.modules.get("concurrent.futures.process")
+    if cfp is not None:
+        cfp.ProcessPoolExecutor = InlinePool

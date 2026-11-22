@@ -141,6 +141,11 @@ SETUP_ONLY = os.environ.get("BR_SETUP_ONLY", "1") == "1"
 SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.2"))
 SAMPLE_ORDER = os.environ.get("BR_SAMPLE_ORDER", "cost")
 SAMPLE_PARTS = int(os.environ.get("BR_SAMPLE_PARTS", "4"))
+# After a failure, a sliced test recorded at this many seconds or more (and not a slow one, see
+# HEAVY) is settled by its sample instead of a whole run, when the sample is estimated at less
+# than MID_SHARE of the whole.  0: off.  Not exact.
+MID_LOOK = float(os.environ.get("BR_MID_LOOK", "0"))
+MID_SHARE = float(os.environ.get("BR_MID_SHARE", "0.6"))
 SAMPLE_EXTRA = frozenset(x.strip() for x in os.environ.get("BR_SAMPLE_EXTRA", "").split(",") if x.strip())
 # the sample looks at every entry's quick half first (br/memo.py): when few entries are handed
 # something new, all of those are run and the sample is the whole test
@@ -1227,10 +1232,31 @@ class Selector:
                             again.extend(by[n] for n in cheap_ones)
                             gone = set(cheap_ones)
                             kept = [n for n in kept if n not in gone]
+                    mid = []
+                    if MID_LOOK > 0:
+                        # A fixture-driven test of a couple of seconds, next to real failures:
+                        # its least expensive entries first (a share of its cost).  When such a
+                        # test fails it fails on most entries; if the sample passes it is let go.
+                        for it in list(again):
+                            n = it[0]
+                            if ms[n] < MID_LOOK * 1000 or ms[n] > HEAVY * 1000:
+                                continue
+                            sv = self.sample_variant(plan, n)
+                            if sv is not None and sv[1] < MID_SHARE * it[2]:
+                                mid.append((it, sv))
+                                again.remove(it)
                     if again:
                         again.sort(key=lambda it: it[0])
                         f2, u2 = run(again, False)
                         failed = failed + f2 + u2
+                    for it, sv in mid:
+                        verdict = settle(it[0], sv, weigh=False)
+                        dbg.setdefault("mid", []).append((it[0], verdict))
+                        if verdict == "U":
+                            f2, u2 = run([it], False)
+                            verdict = "F" if f2 or u2 else "P"
+                        if verdict == "F":
+                            failed.append(it[0])
                 kept = open_ + kept
             later = costly + deferred
             if later:
@@ -1240,13 +1266,18 @@ class Selector:
                     p_pass = min(p_pass, P_PASS_COLD)
                 base = failed + kept
                 run_list, keep = [], []
+                mid = []
                 for item in sorted(later, key=lambda it: it[2]):
                     n, v, est = item
                     keep_cost = cost_of(base + keep + [n]) - cost_of(base + keep)
                     if FIRST_ONLY and LOOK_FIRST and failed and ms[n] > HEAVY * 1000 and keep_cost >= DROP_MIN * 1000 and est >= LOOK_EST * 1000 and self.sample_variant(plan, n) is not None:
                         keep.append(n)  # settled below by a look at its first entries
                     elif est < min(p_pass, chance(n, failed)) * keep_cost and (failed or est <= CLEAN_RUN * 1000 or self.slice_probe(plan, n)[1] is None):
-                        run_list.append(item)
+                        sv = self.sample_variant(plan, n) if MID_LOOK > 0 and failed and MID_LOOK * 1000 <= ms[n] <= HEAVY * 1000 else None
+                        if sv is not None and sv[1] < MID_SHARE * est:
+                            mid.append((item, sv))  # (settled by its sample: see MID_LOOK)
+                        else:
+                            run_list.append(item)
                     else:
                         keep.append(n)
                 if run_list:
@@ -1254,6 +1285,14 @@ class Selector:
                     failed2, unseen2 = run(run_list, False)
                     failed = failed + failed2 + [n for n in unseen2 if n not in st["undecided"]]
                     keep = keep + [n for n in unseen2 if n in st["undecided"]]
+                for it, sv in mid:
+                    verdict = settle(it[0], sv, weigh=False)
+                    dbg.setdefault("mid", []).append((it[0], verdict))
+                    if verdict == "U":
+                        f2, u2 = run([it], False)
+                        verdict = "F" if f2 or u2 else "P"
+                    if verdict == "F":
+                        failed.append(it[0])
                 keep = kept + keep
                 looked = {}  # slow test -> (its sample, what the first part said) once that part passed
                 # (only while the worker that was stopped still answers: it is let go first)
