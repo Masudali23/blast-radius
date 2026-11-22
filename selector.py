@@ -161,7 +161,8 @@ CLEAN_SMALL = int(os.environ.get("BR_CLEAN_SMALL", "0"))
 # The shortcuts that are not exact (the early stop, a slow test settled by a look at its first
 # entries) only for patches that replace single lines; anything that adds or removes lines, or
 # touches a def, class, import, decorator or except line, is handled without them.
-FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0") == "1"
+# ("2": lines may be added or removed as well, as long as none of them is such a line)
+FAST_SIMPLE = os.environ.get("BR_FAST_SIMPLE", "0")
 STRUCTURAL = ("def ", "async def ", "class ", "import ", "from ", "@", "except")
 T0 = time.monotonic()
 
@@ -321,7 +322,7 @@ class Selector:
             if state["file"] and state["file"].endswith(".py"):
                 minus = [x for x in state["minus"] if x.strip() and not x.lstrip().startswith("#")]
                 plus = [x for x in state["plus"] if x.strip() and not x.lstrip().startswith("#")]
-                if len(minus) != len(plus):
+                if len(minus) != len(plus) and FAST_SIMPLE == "1":
                     state["ok"] = False
                 for x in minus + plus:
                     if x.strip().startswith(STRUCTURAL):
@@ -351,7 +352,7 @@ class Selector:
 
     def decide(self, commit, data):
         global CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
-        if not FAST_SIMPLE or self.simple_edit(data):
+        if FAST_SIMPLE not in ("1", "2") or self.simple_edit(data):
             return self.decide_as_set(commit, data)
         # not the kind of change the shortcuts were measured on: none of them here
         saved = CLEAN_STOP, FIRST_ONLY, LOOK_FIRST
