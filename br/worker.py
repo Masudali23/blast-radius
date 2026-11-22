@@ -209,7 +209,15 @@ def hot_swap(path, old_src, new_src, probe=False, base_path=None):
         except Exception as e:
             return "new does not compile: %r" % (e,)
     if _own_differs(old_top, new_top):
-        return "module or class body changed"
+        # (constants read back from stored bytecode can print differently from freshly
+        # compiled ones, a set of strings for one: compare with the old source compiled here
+        # before deciding that the module or class level changed)
+        try:
+            old_top = compile(old_src, path, "exec", dont_inherit=True)
+        except Exception as e:
+            return "old does not compile: %r" % (e,)
+        if _own_differs(old_top, new_top):
+            return "module or class body changed"
     pairs = []
     if not _pair(old_top, new_top, pairs, False):
         return "structure changed"
@@ -532,6 +540,7 @@ def _read_line(fd):
 
 def run_job(job, mode, overlay, base, out_fd, in_fd=0):
     """Runs inside the forked child."""
+    gc.enable()  # (off while the workers were importing, see main)
     if GC_YOUNG:
         # A child lives for one commit.  With the default thresholds the collector runs every
         # 700 allocations and keeps re-scanning the syntax trees the tests build; collecting
@@ -794,9 +803,9 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         ready += b" " + json.dumps(loaded_files(overlay)).encode()
     elif mode == "full":
         preload(overlay, skip=LAZY_MODULES)
-        gc.collect()
-        index_functions(overlay)
     gc.collect()
+    if mode == "full":
+        index_functions(overlay)
     gc.freeze()
     os.write(out_fd, ready + b"\n")
     while True:
@@ -840,16 +849,21 @@ def serve(mode, overlay, base, in_fd, out_fd, spares):
         signal.signal(signal.SIGALRM, _kill)
         signal.setitimer(signal.ITIMER_REAL, job.get("deadline", 60.0), 1.0)
         try:
-            _, status = os.waitpid(pid, 0)
+            _, status, used = os.wait4(pid, 0)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
-        os.write(out_fd, ("END %d\n" % (-9 if killed else status)).encode())
+        # (with the CPU the child used in all, for the caller's own accounts)
+        os.write(out_fd, ("END %d %d\n" % (-9 if killed else status, int((used.ru_utime + used.ru_stime) * 1000))).encode())
 
 
 def main():
     # usage: worker.py <overlay> <base> <core_in> <core_out> <full_in> <full_out> [modules...]
     overlay, base = sys.argv[1], sys.argv[2]
     spares = {"core": (int(sys.argv[3]), int(sys.argv[4])), "full": (int(sys.argv[5]), int(sys.argv[6]))}
+    # The workers only import; each stage collects once itself before it freezes its objects.
+    # Collections in between find nothing worth the time; a child that runs tests turns the
+    # collector on again (run_job).
+    gc.disable()
     out_fd = os.dup(1)
     in_fd = os.dup(0)
     # nothing imported below may write into the protocol channel

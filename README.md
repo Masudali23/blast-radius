@@ -22,7 +22,9 @@ selects the ones that actually fail. Anything it could not check cheaply stays s
    statement (or import the changed module, or open the changed fixture) are candidates.
 4. **Run them** (`br/worker.py`, `br/engine.py`): warm worker processes fork one child per
    commit. For a change inside functions the child swaps in the new code objects and runs the
-   candidate tests with `unittest`, in collection order. Module/class level changes are run from
+   candidate tests with `unittest`: first the tests named after a patched file (as in
+   `dialects/bigquery.py` and `tests/dialects/test_bigquery.py`), then the least expensive, so
+   that a failure shows as early as possible. Module/class level changes are run from
    a fresh import instead. Fixture edits are served through a symlink overlay in `/tmp` (the
    image is read-only).
 5. **Select** (`selector.py`): tests that fail are selected and packed onto 1–8 workers
@@ -160,7 +162,8 @@ CPU time is part of the score, so the selector avoids running what it can decide
   is first imported on its own; if that fails, every test that imports it is selected.
 - **Cost-based staging**: cheap candidates run first, up to the first failure. From then on the
   commit pays for a worker anyway, so a remaining candidate is run only when that is expected
-  to cost less than the seconds it adds if simply left selected. When a change reaches so many
+  to cost less than the seconds it adds if simply left selected: the light ones (under a
+  second of recorded time) stay selected unseen. When a change reaches so many
   tests that running them would cost more than selecting them, they are selected unseen.
 - **Slow tests**: a test too slow to run in full is selected, unless everything else passes
   (or, when something fails, the tests closest to it — same test file or same fixture — all

@@ -46,6 +46,17 @@ LIKELY = float(os.environ.get("BR_LIKELY", "0.25"))
 # chance that a not-yet-run candidate passes, when nothing / something has failed so far
 P_PASS_CLEAN = float(os.environ.get("BR_P_PASS_CLEAN", "0.9"))
 P_PASS_FAILED = float(os.environ.get("BR_P_PASS_FAILED", "0.7"))
+# ... for the cheap candidates left when the first one fails (one by one, and all together)
+P_PASS_AGAIN = float(os.environ.get("BR_P_PASS_AGAIN", str(P_PASS_FAILED)))
+P_PASS_REST = float(os.environ.get("BR_P_PASS_REST", "0"))
+# ... a test lighter than this many recorded seconds is not run on its own after a failure
+AGAIN_MIN = float(os.environ.get("BR_AGAIN_MIN", "1.0"))
+# ... and the same two when at least this many tests passed before the first failure
+MIXED_AFTER = int(os.environ.get("BR_MIXED_AFTER", "1000000"))
+P_PASS_AGAIN_MIXED = float(os.environ.get("BR_P_PASS_AGAIN_MIXED", str(P_PASS_AGAIN)))
+P_PASS_REST_MIXED = float(os.environ.get("BR_P_PASS_REST_MIXED", str(P_PASS_REST)))
+# ... and for the sample of a slow fixture-driven test next to real failures
+P_PASS_SAMPLE = float(os.environ.get("BR_P_PASS_SAMPLE", "0.7"))
 # CPU seconds one commit may spend running tests, whatever was planned
 COMMIT_CPU = float(os.environ.get("BR_COMMIT_CPU", "25"))
 # seconds of a slow sliced test to sample before deciding about it
@@ -61,6 +72,13 @@ MIN_RELATED = int(os.environ.get("BR_MIN_RELATED", "5"))
 # the slow test weighs in the selection
 RELATED_RUN = float(os.environ.get("BR_RELATED_RUN", "0.5"))
 MANY_FAILED = int(os.environ.get("BR_MANY_FAILED", "20"))
+# ... and never more than this many seconds of them: what they can save is the price of the
+# slow test's sample, not the slow test itself
+RELATED_CAP = float(os.environ.get("BR_RELATED_CAP", "1000"))
+# the first part of a slow test's sample is run before its related tests are
+FIRST_LOOK = os.environ.get("BR_FIRST_LOOK", "1") == "1"
+# measuring only: let the slow test go as soon as that first part has passed
+FIRST_ONLY = os.environ.get("BR_FIRST_ONLY", "0") == "1"
 # seconds to wait for the stand-alone import check of a patched module
 IMPORT_WAIT = 45.0
 # recognise unchanged hand-overs to the slow half of the executor's TPC-DS test
@@ -73,6 +91,9 @@ EXACT = os.environ.get("BR_EXACT", "0") == "1"
 EXACT_CAP = float(os.environ.get("BR_EXACT_CAP", "15"))
 # stop the cheap candidates at the first failure and weigh the rest: run or leave selected
 STOP_FIRST = os.environ.get("BR_STOP_FIRST", "1") == "1"
+# order of the first stage: "collection" (the suite's own), "cost" (least expensive first) or
+# "name" (tests named after a patched file first, then least expensive)
+ORDER = os.environ.get("BR_ORDER", "name")
 # a slow test whose sample passes is only let go when keeping it would add at least this many
 # seconds to the bill; a lighter one stays selected
 DROP_MIN = float(os.environ.get("BR_DROP_MIN", "8"))
@@ -98,7 +119,8 @@ SETUP_ONLY = os.environ.get("BR_SETUP_ONLY", "1") == "1"
 # unchecked next to real failures (0: never sample, keep it)
 SAMPLE_SHARE = float(os.environ.get("BR_SAMPLE_SHARE", "0.2"))
 SAMPLE_ORDER = os.environ.get("BR_SAMPLE_ORDER", "cost")
-SAMPLE_PARTS = 4
+SAMPLE_PARTS = int(os.environ.get("BR_SAMPLE_PARTS", "4"))
+SAMPLE_EXTRA = frozenset(x.strip() for x in os.environ.get("BR_SAMPLE_EXTRA", "").split(",") if x.strip())
 # the sample looks at every entry's quick half first (br/memo.py): when few entries are handed
 # something new, all of those are run and the sample is the whole test
 SETTLE = os.environ.get("BR_SETTLE", "1") == "1"
@@ -199,6 +221,28 @@ class Selector:
             except Exception:
                 cost[path] = 1e12
         return sorted(patches, key=lambda p: (cost[p], p))
+
+    def named_after(self, plan):
+        """A function telling whether a test is named after one of the patched files (0) or
+        not (1): its file or method name contains the file's name, as in
+        sqlglot/dialects/bigquery.py and tests/dialects/test_bigquery.py."""
+        stems = set()
+        for rel in plan.files:
+            head, tail = os.path.split(rel)
+            stem = tail.rsplit(".", 1)[0].lower()
+            if stem == "__init__":
+                stem = os.path.basename(head).lower()
+            if len(stem) >= 3 and stem not in ("core", "base", "helper", "helpers", "tests"):
+                stems.add(stem)
+        if not stems:
+            return lambda n: 1
+        ids = self.id_of
+
+        def near(n):
+            tid = ids[n].lower()
+            return 0 if any(stem in tid for stem in stems) else 1
+
+        return near
 
     def get_lane(self):
         if self.lane is None:
@@ -498,7 +542,9 @@ class Selector:
         if v is not None and "allow" not in v:
             return None
         allowed = set(v["allow"]) if v is not None else None
-        live = [i for i, k in enumerate(sm["keys"]) if sm["share"][i] > 0.0 and (allowed is None or k in allowed)]
+        # (an entry whose measured cost is nil is still parsed and handed to the pool by the
+        # test, so it belongs to the sample like any other; it comes first, at no cost)
+        live = [i for i, k in enumerate(sm["keys"]) if allowed is None or k in allowed]
         total = sum(sm["share"][i] for i in live)
         if not live or total <= 0.0:
             return None
@@ -527,6 +573,15 @@ class Selector:
             return parts
 
         parts = split_up(keys, SAMPLE_PARTS)
+        if SAMPLE_EXTRA:
+            # ... and, right after the first part, the entries that most often fail on their
+            # own when the optimizer or the engine is changed
+            taken = set(keys)
+            extra = [sm["keys"][i] for i in live if sm["keys"][i] not in taken and sm["keys"][i].rsplit("#", 1)[-1] in SAMPLE_EXTRA]
+            if extra:
+                load = sum(share_of[k] for k in extra)
+                parts.insert(1, (extra, load))
+                spent += load
         out = []
         for chunk, load in parts:
             variant = {"allow": chunk}
@@ -735,6 +790,12 @@ class Selector:
                 costly.append((n, v, est))
             else:
                 cheap.append((n, v, est))
+        if ORDER != "collection" and STOP_FIRST:
+            # The first stage ends at the first failure, so what matters is how soon one shows:
+            # the tests named after a patched file come first, and within each group the
+            # least expensive.  (Every test still runs on its own; only the order changes.)
+            near = self.named_after(plan) if ORDER == "name" else (lambda n: 1)
+            cheap.sort(key=lambda it: (near(it[0]), it[2], it[0]))
         total_est = sum(e for _, _, e in cheap) + sum(e for _, _, e in costly)
         dbg["est_ms"] = int(total_est)
         # "broad": running every candidate would cost about as much CPU as just selecting them all
@@ -813,25 +874,31 @@ class Selector:
         def cost_of(numbers):
             return split(numbers, ms)[1]
 
-        def settle(n, sv=None, weigh=True):
+        def settle(n, sv=None, weigh=True, first=None):
             """Run slow sliced test n in a few parts, its least expensive entries first, each
             part on a short leash: "F" when a part fails, "U" when one takes much longer than
-            it should or the test cannot be run this way, "P" when every part passed."""
+            it should or the test cannot be run this way, "P" when every part passed.
+            `first`: what the first part said, when it has been run (and passed) already."""
             sv = sv or self.sample_variant(plan, n)
             if sv is None:
                 return "U"
             parts, rest = sv[0], sv[2] if weigh else None
-            # (the child's CPU allowance follows what is planned: plan all of it now)
-            st["planned"] += sv[1] / 1000.0
+            if first is None:
+                # (the child's CPU allowance follows what is planned: plan all of it now)
+                st["planned"] += sv[1] / 1000.0
             for k, (variant, est) in enumerate(parts):
-                f3, u3 = run([(n, variant, est)], False, patience=1.8)
-                if f3:
-                    return "F"
-                if u3:
-                    return "U"
-                recognised, _, new = st["note"].get(n, "").partition("/")
-                if k == 0:
-                    dbg.setdefault("first_part", []).append((n, st["note"].get(n, "")))
+                if k == 0 and first is not None:
+                    note = first
+                else:
+                    f3, u3 = run([(n, variant, est)], False, patience=1.8)
+                    if f3:
+                        return "F"
+                    if u3:
+                        return "U"
+                    note = st["note"].get(n, "")
+                    if k == 0:
+                        dbg.setdefault("first_part", []).append((n, note))
+                recognised, _, new = note.partition("/")
                 if k == 0 and rest is not None and recognised.isdigit() and int(recognised) > 0 and (new == "0" or WEIGH_MIXED):
                     # every entry of the first part is handed what it was always handed, so
                     # the patch reaches the test through few entries and a sample of the
@@ -861,13 +928,21 @@ class Selector:
                     kept = list(rest)
                     again = []
                     current = cost_of(failed + kept)
+                    # How likely the tests that are left are to pass shows in what came before
+                    # the failure: when several tests passed first, the breakage is narrow and
+                    # the others mostly pass; when the very first test failed, mostly not.
+                    mixed = st["ran"] - len(failed) >= MIXED_AFTER
+                    p_again = P_PASS_AGAIN_MIXED if mixed else P_PASS_AGAIN
+                    p_rest = P_PASS_REST_MIXED if mixed else P_PASS_REST
                     for n in sorted(rest, key=lambda n: -ms[n])[:12]:
+                        if ms[n] < AGAIN_MIN * 1000:
+                            break  # too light to be worth a run of its own
                         without = cost_of(failed + [m for m in kept if m != n])
-                        if by[n][2] < P_PASS_FAILED * (current - without):
+                        if by[n][2] < p_again * (current - without):
                             again.append(by[n])
                             kept.remove(n)
                             current = without
-                    if kept and sum(by[n][2] for n in kept) < P_PASS_FAILED * (current - cost_of(failed)):
+                    if kept and sum(by[n][2] for n in kept) < p_rest * (current - cost_of(failed)):
                         again.extend(by[n] for n in kept)
                         kept = []
                     if again:
@@ -894,6 +969,37 @@ class Selector:
                     failed = failed + failed2 + [n for n in unseen2 if n not in st["undecided"]]
                     keep = keep + [n for n in unseen2 if n in st["undecided"]]
                 keep = kept + keep
+                looked = {}  # slow test -> (its sample, what the first part said) once that part passed
+                if keep and failed and FIRST_LOOK and not st["cut"] and SAMPLE_SHARE > 0:
+                    # A slow fixture-driven test that is still selected unchecked next to real
+                    # failures: the first part of its sample comes before anything else that
+                    # is done about it.  When such a test fails it mostly fails there, and
+                    # then nothing more need be run on its account.
+                    for n in list(keep):
+                        if ms[n] <= HEAVY * 1000 or n in st["undecided"]:
+                            continue
+                        weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
+                        if weight < DROP_MIN * 1000:
+                            continue
+                        sv = self.sample_variant(plan, n)
+                        if sv is None or sv[1] >= P_PASS_SAMPLE * weight:
+                            continue
+                        st["planned"] += sv[1] / 1000.0
+                        f3, u3 = run([(n, sv[0][0][0], sv[0][0][1])], False, patience=1.8)
+                        dbg.setdefault("first_part", []).append((n, st["note"].get(n, "")))
+                        if f3:
+                            failed.append(n)
+                            keep = [m for m in keep if m != n]
+                            dbg.setdefault("sampled", []).append((n, "F"))
+                        elif u3:
+                            looked[n] = None  # not settled this way: it stays
+                            dbg.setdefault("sampled", []).append((n, "U"))
+                        elif FIRST_ONLY:
+                            keep = [m for m in keep if m != n]
+                            dbg.setdefault("sampled", []).append((n, "P"))
+                            dbg.setdefault("sample_dropped", []).append(n)
+                        else:
+                            looked[n] = (sv, st["note"].get(n, ""))
                 if keep and not failed:
                     # nothing fails so far; look at a sample of each remaining slow test
                     probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in keep) if pv is not None]
@@ -936,13 +1042,15 @@ class Selector:
                     maybe = []
                     if len(failed) < MANY_FAILED:
                         for n in sorted((n for n in keep if n in slow), key=lambda n: -ms[n]):
+                            if n in looked and looked[n] is None:
+                                continue
                             rel_mask = self.related_mask(n)
                             pending = [m for m in keep if m != n and m not in slow and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1]
                             if pending:
                                 # related tests we kept without running: run them first, if that
                                 # costs clearly less than the slow test weighs
                                 weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
-                                if sum(by_n[m][2] for m in pending) > RELATED_RUN * weight:
+                                if sum(by_n[m][2] for m in pending) > min(RELATED_RUN * weight, RELATED_CAP * 1000):
                                     continue
                                 items = sorted((by_n[m] for m in pending), key=lambda it: it[0])
                                 f2, u2 = run(items, False)
@@ -955,13 +1063,16 @@ class Selector:
                             unrun = [m for m in keep if m != n and self.idx_of.get(m) is not None and (rel_mask >> self.idx_of[m]) & 1 and m not in st["outcome"] and m not in slow]
                             if rel_fail == 0 and rel_pass >= MIN_RELATED and not unrun:
                                 maybe.append(n)
-                    probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in maybe) if pv is not None]
-                    if probes:
-                        hit, unseen = run(probes, False)
+                    # (a test whose first sample part has passed needs no probe: that part
+                    # holds the probe's entries)
+                    seen = [n for n in maybe if looked.get(n)]
+                    probes = [(n, pv, pe) for n, pv, pe in (self.slice_probe(plan, n) for n in maybe if not looked.get(n)) if pv is not None]
+                    if probes or seen:
+                        hit, unseen = run(probes, False) if probes else ([], [])
                         hit = hit + unseen
                         # a sample that fails is a failure among the slow tests' own
                         # neighbours: then none of them is let go on the strength of a sample
-                        dropped = [] if hit else [n for n, _, _ in probes]
+                        dropped = [] if hit else seen + [n for n, _, _ in probes]
                         failed = failed + [m for m in hit if m not in failed]
                         dbg["related_dropped"] = dropped
                         keep = [n for n in keep if n not in dropped]
@@ -974,17 +1085,21 @@ class Selector:
                     # handed before the patch are recognised without running it: br/memo.py.)
                     sampled = []
                     for n in keep:
+                        if n in looked:
+                            if looked[n] is not None:
+                                sampled.append((n, looked[n][0], looked[n][1]))
+                            continue
                         if ms[n] <= HEAVY * 1000 or n in st["undecided"]:
                             continue
                         weight = cost_of(failed + keep) - cost_of(failed + [m for m in keep if m != n])
                         if weight < DROP_MIN * 1000:
                             continue
                         sv = self.sample_variant(plan, n)
-                        if sv is not None and sv[1] < P_PASS_FAILED * weight:
-                            sampled.append((n, sv))
+                        if sv is not None and sv[1] < P_PASS_SAMPLE * weight:
+                            sampled.append((n, sv, None))
                     passed = []
-                    for n, sv in sampled:
-                        verdict = settle(n, sv)
+                    for n, sv, first in sampled:
+                        verdict = settle(n, sv, first=first)
                         dbg.setdefault("sampled", []).append((n, verdict))
                         if verdict == "F" and n not in failed:
                             failed.append(n)
@@ -1145,14 +1260,16 @@ class Selector:
         v, share = self.variant_for(plan, n)
         allowed = set(v["allow"]) if v and "allow" in v else None
         order = sorted(range(len(sm["keys"])), key=lambda i: sm["share"][i])
-        keys, spent = [], 0.0
+        keys, spent, free = [], 0.0, []
         budget = SLICE_PROBE * 1000.0 / max(1.0, self.cpu[n])
         for i in order:
             k = sm["keys"][i]
             if allowed is not None and k not in allowed:
                 continue
             if sm["share"][i] <= 0.0:
-                continue  # entries the test skips tell us nothing
+                # nothing measurable, but the test still parses it: always part of the probe
+                free.append(k)
+                continue
             if keys and spent + sm["share"][i] > budget:
                 break
             keys.append(k)
@@ -1161,7 +1278,7 @@ class Selector:
                 break
         if not keys:
             return n, None, 0.0
-        return n, {"allow": keys}, self.cpu[n] * (spent + 0.02)
+        return n, {"allow": free + keys}, self.cpu[n] * (spent + 0.02)
 
     def run(self):
         patches = sorted(glob.glob(os.path.join(DATA, "commits", "*.patch")))
@@ -1177,7 +1294,10 @@ class Selector:
             try:
                 with open(path, "rb") as fh:
                     data = fh.read()
+                before = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None)
                 selected = self.decide(commit, data)
+                if DEBUG:
+                    self.debug[commit]["child_ms"] = sum(lane.child_ms for lane in (self.lane, self.lane2) if lane is not None) - before
             except Exception as e:  # never lose a commit: fall back to running everything
                 log("commit %s: %r -> selecting all" % (commit, e))
                 selected = list(self.all_numbers)
@@ -1215,3 +1335,9 @@ class Selector:
 
 if __name__ == "__main__":
     Selector().run()
+    # everything is written: leave without tearing the interpreter down (maps, syntax trees)
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(0)

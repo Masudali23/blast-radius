@@ -38,6 +38,7 @@ class Lane:
         self.proc = None
         self.core_loaded = None
         self.cut = None
+        self.child_ms = 0  # CPU of every child that has ended, all of it (not only its tests)
         self._deadline = 60.0
         self.log = log or (lambda *a: None)
 
@@ -184,7 +185,10 @@ class Lane:
             elif line.startswith(b"X "):
                 error = line[2:].decode("utf-8", "replace").strip()
             elif line.startswith(b"END"):
-                status = int(line.split()[1])
+                words = line.split()
+                status = int(words[1])
+                if len(words) > 2:
+                    self.child_ms += int(words[2])
                 if status != 0 and error is None:
                     error = "child exit status %d" % status
                 return results, error, False
@@ -227,15 +231,6 @@ class Lane:
                 self._collect(p, self._mode)
 
     def close(self):
-        for p in self.z.values():
-            try:
-                p.send(b"quit\n")
-            except Exception:
-                pass
-        proc = self.proc
-        if proc is not None:
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                pass
+        # (the workers hold nothing that has to be written: no orderly shutdown of interpreters
+        # that have pandas, DuckDB and the fixture tables loaded)
         self._kill()
