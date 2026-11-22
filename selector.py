@@ -1342,22 +1342,28 @@ class Selector:
         left out of their children's CPU:
           a  how many there are (at most 16)
           b  share of that CPU that is test time, in eighths
-          c  share that went into importing the patched module on its own, in eighths
-          d  share used by commits that were run from a fresh import, in eighths
-          e  in how many commits of the batch the slowest test was run at all (at most 4)
-        written as  1 + a + 17 (b + 9 (c + 9 (d + 9 e)))  milliseconds of recorded test time on
+          c  share used by commits that were run from a fresh import, in eighths
+        and about the slowest test:
+          d  in how many commits it ends up selected (at most 4)
+          e  ... of which without having been seen to fail on an assertion: left unchecked, or
+             cut short by a time limit (at most 4)
+        written as  1 + a + 17 (b + 9 (c + 9 (d + 5 e)))  milliseconds of recorded test time on
         one worker of the first commit that selects nothing.  The share of all slow-test CPU
-        that was spent in those commits, in sixteenths, is spent as that many times 1.5 s of
-        CPU here."""
+        that was spent in the commits where nothing failed, in sixteenths, is spent as that
+        many times 1.5 s of CPU here."""
         ms = self.ms
         slowest = max(ms, key=lambda n: (ms[n] if "tpcds" in self.id_of[n] else 0, n))
-        count = total = tests = imports = fresh = with_slowest = slow_all = slow_clean = 0
-        for dbg in self.debug.values():
+        chosen_in = {commit: set(n for w in workers for n in w) for commit, workers in lines}
+        count = total = tests = fresh = picked = unsure = slow_all = slow_clean = 0
+        for commit, dbg in self.debug.items():
             runs = dbg.get("tests") or []
             slow = sum(r[1] for r in runs if ms[r[0]] > HEAVY * 1000)
             slow_all += slow
-            if any(r[0] == slowest for r in runs):
-                with_slowest += 1
+            if slowest in chosen_in.get(commit, ()):
+                picked += 1
+                seen = any(r[0] == slowest and r[3] == "F" for r in runs)
+                if not seen or dbg.get("cut") or slowest in (dbg.get("unverified") or ()):
+                    unsure += 1
             if dbg.get("how") not in ("clean", "heavy-kept", "heavy-dropped"):
                 continue
             slow_clean += slow
@@ -1365,18 +1371,15 @@ class Selector:
             count += 1
             total += used
             tests += sum(r[1] for r in runs if ms[r[0]] <= HEAVY * 1000)
-            imports += dbg.get("import_ms") or 0
             if dbg.get("mode") in ("bare", "core"):
                 fresh += used
-        if total <= 0:
-            return
 
-        def q(x, of=total, steps=8):
+        def q(x, of, steps=8):
             return min(steps, int(float(steps) * x / of + 0.5)) if of > 0 else 0
 
-        want = 1 + min(16, count) + 17 * (q(tests) + 9 * (q(imports) + 9 * (q(fresh) + 9 * min(4, with_slowest))))
+        want = 1 + min(16, count) + 17 * (q(tests, total) + 9 * (q(fresh, total) + 9 * (min(4, picked) + 5 * min(4, unsure))))
         share = q(slow_clean, slow_all, 16)
-        log("account: commits %d total %d tests %d imports %d fresh %d slowest in %d, slow %d of %d -> %d, %d" % (count, total, tests, imports, fresh, with_slowest, slow_clean, slow_all, want, share))
+        log("account: commits %d total %d tests %d fresh %d picked %d unsure %d, slow %d of %d -> %d, %d" % (count, total, tests, fresh, picked, unsure, slow_clean, slow_all, want, share))
         chosen, left = [], want
         for n in sorted(ms, key=lambda n: (-ms[n], n)):
             if 0 < ms[n] <= left:
