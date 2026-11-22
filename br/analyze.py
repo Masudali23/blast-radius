@@ -517,15 +517,22 @@ def by_pattern(name):
     return name in _HOOKS[0]
 
 
+FUTURE = [True]  # does the module being compared postpone the evaluation of annotations?
+
+
 def _header_work(node):
-    """What a def's arguments and result annotation do when the def statement runs, beyond
-    reading names: calls and the like, as text."""
-    out = set()
-    for part in [node.args] + ([node.returns] if node.returns is not None else []):
-        for sub in ast.walk(part):
-            if isinstance(sub, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-                out.add(ast.dump(sub))
-    return out
+    """What a def's header does when the def statement runs, beyond reading a name or building
+    a literal: every default value that is neither, and - in a module whose annotations are
+    evaluated - every annotation that is neither.  As text.  (A subscript or an attribute can
+    run code too: `Dialect["duckdb"]` loads a dialect.)"""
+    args = node.args
+    exprs = [d for d in args.defaults + args.kw_defaults if d is not None]
+    if not FUTURE[0]:
+        every = args.posonlyargs + args.args + args.kwonlyargs + [x for x in (args.vararg, args.kwarg) if x is not None]
+        exprs += [a.annotation for a in every if a.annotation is not None]
+        if node.returns is not None:
+            exprs.append(node.returns)
+    return {ast.dump(e) for e in exprs if not (isinstance(e, ast.Name) or _literal(e))}
 
 
 def _lazy_body(node):
@@ -719,6 +726,7 @@ def diff_python(old_src, new_src):
     except (SyntaxError, ValueError, RecursionError):
         return "diff", [Change("mod", (1, 10**9), coarse=True, what="old-unparseable")]
     same = SAME[0] = same_text(old_src, new_src)
+    FUTURE[0] = b"from __future__ import annotations" in (new_src if isinstance(new_src, bytes) else new_src.encode("utf-8", "replace"))
     d = Differ(same)
     d.stmts(old_tree.body, new_tree.body, old_tree, None)
     if not d.changes:

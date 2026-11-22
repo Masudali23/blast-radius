@@ -19,6 +19,66 @@ REFINE_CLASS = os.environ.get("BR_REFINE_CLASS", "family")
 REFINE_RELATIONS = os.environ.get("BR_REFINE_RELATIONS", "1") == "1"
 # an edited literal default value of a function is in play only for tests that call the function
 REFINE_DEFAULTS = os.environ.get("BR_REFINE_DEFAULTS", "1") == "1"
+# Functions whose slow path runs only when a test before it in the same process cleared what
+# they fill (tests/test_dialect_entry_points.py empties the dialect registry and leaves it so):
+# traced one test at a time, nobody is seen on those lines.
+ORDER_SENSITIVE = {"sqlglot/dialects/dialect.py": ("_try_load",)}
+_ORDER_SPANS = {}
+
+
+def _order_sensitive(base, rel, lines):
+    names = ORDER_SENSITIVE.get(rel)
+    if not names:
+        return False
+    if rel not in _ORDER_SPANS:
+        spans = []
+        data = _read(base, rel)
+        try:
+            for node in ast.walk(ast.parse(data)) if data is not None else ():
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+                    # (the part that looks into the registry: `if key not in cls._classes: ...`)
+                    for sub in ast.walk(node):
+                        if isinstance(sub, ast.If) and any(isinstance(x, ast.Attribute) and x.attr == "_classes" for x in ast.walk(sub.test)):
+                            spans.append((sub.lineno, sub.end_lineno))
+        except (SyntaxError, ValueError, RecursionError):
+            spans = [(1, 10**9)]
+        _ORDER_SPANS[rel] = spans
+    return any(lo <= lines[1] and lines[0] <= hi for lo, hi in _ORDER_SPANS[rel])
+
+
+# test files that look at code objects or source text: their tests go with every change to the
+# library modules they name
+CODE_READERS = os.environ.get("BR_CODE_READERS", "1") == "1"
+_CODE_READERS = []
+
+
+def _code_readers(maps, base):
+    """[(file or directory of the library, tests)] for the test files that read `__code__`,
+    `co_code` or source text and name that module or package."""
+    if not _CODE_READERS:
+        out = []
+        for f in maps.files:
+            if not (f.startswith("tests/") and f.endswith(".py")):
+                continue
+            data = _read(base, f)
+            if data is None or not (b"__code__" in data or b"co_code" in data or b"getsource" in data):
+                continue
+            mask = maps.imports.get(f, 0) | maps.any_line(f)
+            seen = set()
+            for dotted in re.findall(r"\bsqlglot(?:\.[A-Za-z_]\w*)+", data.decode("utf-8", "replace")):
+                parts = dotted.split(".")
+                while len(parts) > 1:
+                    path = "/".join(parts)
+                    if os.path.isdir(os.path.join(base, path)):
+                        seen.add(path)
+                        break
+                    if os.path.isfile(os.path.join(base, path + ".py")):
+                        seen.add(path + ".py")
+                        break
+                    parts.pop()
+            out.extend((where, mask) for where in sorted(seen))
+        _CODE_READERS.append(out)
+    return _CODE_READERS[0]
 # a def whose decorators or name alone changed: the tests that enter the function (see _plan)
 REFINE_HEADERS = os.environ.get("BR_REFINE_HEADERS", "1") == "1"
 # narrow an edited class-level constant to the tests that read it from that class
@@ -336,6 +396,13 @@ def _changed(plan, rel, old, new, base, maps, opts):
 
     given = False  # the file's one change is a class constant handed to the warm worker
     plan.code_files += 1
+    if CODE_READERS and rel.startswith("sqlglot/"):
+        # A test that compares the code of functions (not what they do) sees a changed body
+        # without running a line of it: the tests of such files count for every module of the
+        # packages they name.
+        for where, mask in _code_readers(maps, base):
+            if rel == where or rel.startswith(where + "/"):
+                plan.add("mod", rel, 0, 0, mask)
     hot = True
     swap = regroup = operand = None
     if REFINE_RELATIONS and changes and all(c.level == "func" for c in changes) and analyze.TREES:
@@ -347,6 +414,12 @@ def _changed(plan, rel, old, new, base, maps, opts):
         if swap is None and regroup is None:
             operand = boolrel.one_operand(analyze.TREES[0], analyze.TREES[1], same)
     for c in changes:
+        if _order_sensitive(base, rel, c.lines):
+            # code that tests reach only after an earlier test of the same run emptied a
+            # registry: which tests those are depends on how the suite is run
+            plan.unknown = True
+            plan.notes.append("order-sensitive code in %s:%d" % (rel, c.lines[0]))
+            return
         if c.level == "func":
             plan.kinds.add("func")
             lo, hi = c.lines
@@ -466,6 +539,10 @@ def _changed(plan, rel, old, new, base, maps, opts):
                     callers = None if maps.ran_at_import(rel, flo, fhi) else maps.func(rel, flo, fhi)
                 if callers is not None and isinstance(c.header, tuple):
                     callers = _renamed_users(maps, base, rel, c, callers)
+                if callers and c.header not in ("annotations", "stub"):
+                    # (a test that starts a python of its own to look at the library as it
+                    # loads sees a def statement without calling anything)
+                    callers |= maps.spawn
                 if callers is not None and c.header == "wrapped":
                     # (`unsupported_args` can raise before the method is entered, when the
                     # generator is told to raise at once: whoever got such an error counts -

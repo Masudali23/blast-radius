@@ -449,7 +449,8 @@ class Selector:
             if late or bad:
                 dbg["how"] = "out-of-time" if late else "import-error"
                 dbg["unimportable"] = bad
-                return sorted(cand | sure | set(self.numbers(plan.wide)))
+                # (... and the tests the maps do not know, whatever was left of the candidates)
+                return sorted(cand | sure | set(self.numbers(plan.wide)) | set(self.unmapped))
         if not cand:
             dbg["how"] = "none" if not sure else "sure"
             return sorted(sure)
