@@ -23,7 +23,7 @@ import time
 import types
 import unittest
 
-from br import answers, infect, lean, memo, tables, variants
+from br import answers, infect, inlinepool, lean, memo, tables, variants
 
 FAILLOG = os.environ.get("BR_FAILLOG")
 SETUP_LIMIT = 60.0  # seconds allowed for importing a test module and setting up its class
@@ -640,6 +640,7 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
             except BaseException:
                 pass
             t0 = time.process_time()  # the test itself; imports and class set-up are not its cost
+            inlinepool.BROKE[0] = False
             arm(limit)
             timed_out = False
             try:
@@ -652,6 +653,8 @@ def run_job(job, mode, overlay, base, out_fd, in_fd=0):
                 outcome = "F"
             finally:
                 disarm()
+            if inlinepool.BROKE[0] and not runner.note:
+                runner.note = "pool"  # the test broke a process pool (br/inlinepool.py)
             runner.emit("T %d %s %d %d %d %s" % (index, outcome, int((time.process_time() - t0) * 1000), infect.STATS[0] - e0, infect.STATS[1] - i0, runner.note))
             runner.note = ""
             if timed_out:

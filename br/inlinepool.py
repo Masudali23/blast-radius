@@ -6,6 +6,15 @@ pickle round trip of arguments and results that a real pool performs.
 """
 import pickle
 from concurrent.futures import Future
+from concurrent.futures.process import BrokenProcessPool
+
+# A real pool breaks for good when its parent cannot read what a worker sent back (an answer
+# or an exception that pickles but does not load again): the call in flight and every later
+# one get BrokenProcessPool.  BROKE[0] says that this happened; whoever runs the tests one by
+# one sets it back before each (br/worker.py), since a pool that outlives a test, like the
+# optimizer tests' class-wide one, then fails the tests that come after in the real run.
+BROKE = [False]
+BROKEN = "A process in the process pool was terminated abruptly while the future was running or pending."
 
 
 class InlinePool:
@@ -22,18 +31,35 @@ class InlinePool:
         return False
 
     def submit(self, fn, /, *args, **kwargs):
+        if BROKE[0]:
+            raise BrokenProcessPool(BROKEN)
         future = Future()
         future.set_running_or_notify_cancel()
+        failed = False
         try:
             fn2, args2, kwargs2 = pickle.loads(pickle.dumps((fn, args, kwargs)))
             result = fn2(*args2, **kwargs2)
-            future.set_result(pickle.loads(pickle.dumps(result)))
+            sent = pickle.dumps(result)
         except Exception as e:  # noqa: BLE001 - a real pool also ships the exception back
+            failed = True
             try:
-                e = pickle.loads(pickle.dumps(e))
-            except Exception as pe:  # unpicklable exception: a real pool would break
-                e = pe
-            future.set_exception(e)
+                sent = pickle.dumps(e)
+            except Exception as pe:  # (a worker that cannot pickle its answer sends that error)
+                try:
+                    sent = pickle.dumps(pe)
+                except Exception:
+                    future.set_exception(pe)
+                    return future
+        try:
+            value = pickle.loads(sent)
+        except Exception:  # noqa: BLE001 - the parent cannot read the answer: the pool breaks
+            BROKE[0] = True
+            future.set_exception(BrokenProcessPool(BROKEN))
+            return future
+        if failed:
+            future.set_exception(value)
+        else:
+            future.set_result(value)
         return future
 
     def map(self, fn, *iterables, timeout=None, chunksize=1):

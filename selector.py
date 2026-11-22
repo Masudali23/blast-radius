@@ -202,6 +202,7 @@ class Selector:
         self.ms = {t["number"]: int(t["seconds"] * 1000 + 0.5) for t in tests}
         self.id_of = {t["number"]: t["id"] for t in tests}
         self.all_numbers = [t["number"] for t in tests]
+        self._pool_users = None  # tests that hand work to a class-wide process pool (lazily)
         self.maps = Maps(MAPS)
         num_by_id = {t["id"]: t["number"] for t in tests}
         # map index -> runtime test number (None when the run does not list that test)
@@ -408,7 +409,42 @@ class Selector:
         if ONLY_SEEN:
             unchecked = set(dbg.get("unverified") or ()) | set(dbg.get("unseen") or ())
             selected = [n for n in selected if n not in unchecked]
+        if dbg.get("pool"):
+            after = self.after_broken_pool(dbg["pool"])
+            dbg["pool_after"] = sorted(after - set(selected) - sure)
+            selected = set(selected) | after
         return sorted(set(selected) | sure)
+
+    def after_broken_pool(self, broke):
+        """The tests that fail because one of `broke` breaks a process pool that outlives it.
+
+        The optimizer tests share one pool for the whole class.  When a change makes a task's
+        answer unreadable for the parent, the pool is broken for good, and every test of the
+        class that hands work to it later in the run (tests of a class run in the order of
+        their names) fails with it, whatever the change does to that test itself."""
+        if self._pool_users is None:
+            users = {}
+            try:
+                rel = "tests/test_optimizer.py"
+                with open(os.path.join(BASE, rel), encoding="utf-8") as fh:
+                    lines = [i + 1 for i, text in enumerate(fh) if "self.pool.submit(" in text]
+                mask = 0
+                for line in lines:
+                    mask |= self.maps.func(rel, line, line)
+                for n in self.numbers(mask):
+                    test_id = self.id_of[n]
+                    users[n] = tuple(test_id.split("::")[:-1]), test_id.split("::")[-1]
+            except Exception:
+                users = {}
+            self._pool_users = users
+        users = self._pool_users
+        out = set()
+        for b in broke:
+            if b not in users:
+                continue
+            owner, name = users[b]
+            out.update(n for n, (o, m) in users.items() if o == owner and m > name)
+        return out
 
     def verify_all(self, plan, cand, dbg):
         """The plain policy, for reference: run every candidate and select exactly what fails.
@@ -980,6 +1016,8 @@ class Selector:
                     st["cpu"] += r[1]
                     st["outcome"][n] = r[0]
                     st["note"][n] = r[4] if len(r) > 4 else ""
+                    if st["note"][n] == "pool":
+                        dbg.setdefault("pool", []).append(n)
                     if DEBUG:
                         dbg.setdefault("tests", []).append((n, r[1], int(e), r[0], (len(v.get("allow", ())) if v and "allow" in v else -1), r[2], r[3]))
                     st["evals"] += r[2]
