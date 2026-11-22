@@ -5,7 +5,14 @@ FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf107
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    SKIP_INTEGRATION=0
+    SKIP_INTEGRATION=0 \
+    BR_CLEAN_STOP=0.4 \
+    BR_CLEAN_MIN=0.4 \
+    BR_CLEAN_FRAC=0 \
+    BR_CLEAN_ANY=1 \
+    BR_FIRST_ONLY=1 \
+    BR_FIRST_N=2 \
+    BR_LOOK_FIRST=1
 
 # The labelling environment's packages, from PyPI.
 COPY requirements.lock /app/requirements.lock
