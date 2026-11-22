@@ -136,6 +136,7 @@ def _ident_lines(base, name, maps):
     if cache is not None:
         return cache
     pat = re.compile(r"\b%s\b" % re.escape(name))
+    plain = bool(name) and (name[0] == "_" or name[0].isalnum()) and (name[-1] == "_" or name[-1].isalnum())
     res = {}
     for rel in maps.files:
         if not rel.endswith(".py"):
@@ -144,7 +145,30 @@ def _ident_lines(base, name, maps):
         if data is None or name.encode() not in data:
             continue
         text = data.decode("utf-8", "replace")
-        hits = [i for i, line in enumerate(text.split("\n"), 1) if pat.search(line)]
+        # The lines holding the name as a whole word.  For an identifier that is every place
+        # the text has it with no word character right before or after: found by plain search
+        # (the pattern has to be tried at every character).
+        hits = []
+        line, at = 1, 0
+        if plain:
+            size, end_of_text = len(name), len(text)
+            start = text.find(name)
+            while start >= 0:
+                end = start + size
+                before = text[start - 1] if start else " "
+                after = text[end] if end < end_of_text else " "
+                if not (before == "_" or before.isalnum() or after == "_" or after.isalnum()):
+                    line += text.count("\n", at, start)
+                    at = start
+                    if not hits or hits[-1] != line:
+                        hits.append(line)
+                start = text.find(name, start + 1)
+        else:
+            for found in pat.finditer(text):
+                line += text.count("\n", at, found.start())
+                at = found.start()
+                if not hits or hits[-1] != line:
+                    hits.append(line)
         if hits:
             res[rel] = hits
     _IDENT[name] = res
